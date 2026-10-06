@@ -92,8 +92,9 @@ case "$MODE" in
             fail 'Релиз или бинарник недоступен. Используйте --tag либо --file.' ;;
 esac
 chmod 755 "$WORK/new"
-MAGIC=$(od -An -tx1 -N4 "$WORK/new" | tr -d ' \n')
-[ "$MAGIC" = 7f454c46 ] || fail 'Файл не является ELF-бинарником.'
+# Minimal router BusyBox od supports -b, but may lack -A, -t and -N.
+MAGIC=$(dd if="$WORK/new" bs=4 count=1 2>/dev/null | od -b | awk 'NR == 1 { print $2 $3 $4 $5 }')
+[ "$MAGIC" = 177105114106 ] || fail 'Файл не является ELF-бинарником.'
 # Check both the architecture/loader and the CLI before stopping the panel.
 command -v timeout >/dev/null 2>&1 || fail 'Не найдена команда timeout.'
 timeout 15 "$WORK/new" --version || fail 'Бинарник не запускается на этом роутере.'
