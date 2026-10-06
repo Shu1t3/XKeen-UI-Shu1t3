@@ -119,13 +119,27 @@ pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), Str
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), command.status())
         .await.map_err(|_| format!("Таймаут init: {path}"))?;
     match result {
-        Ok(status) if status.success() => Ok(()),
+        Ok(status) if status.success() => {
+            if matches!(args.first(), Some(&"start") | Some(&"restart")) {
+                let core = state.core.read().unwrap().name.clone();
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let probe_core = core.clone();
+                let running = tokio::task::spawn_blocking(move || !get_pid(&probe_core).is_empty())
+                    .await.map_err(|e| e.to_string())?;
+                ensure_running(&core, running)?;
+            }
+            Ok(())
+        },
         Ok(status) => Err(format!("{path}: {status}")),
         Err(e) => {
             *state.init_file.write().unwrap() = None;
             Err(format!("{path}: {e}"))
         }
     }
+}
+
+fn ensure_running(core: &str, running: bool) -> Result<(), String> {
+    if running { Ok(()) } else { Err(format!("Init завершился успешно, но ядро {core} не запущено")) }
 }
 
 fn get_core_info(name: &str) -> CoreInfo {
@@ -323,11 +337,7 @@ async fn switch_core(state: &AppState, init_file: &str, old: &str, new: &str) ->
         |action, health| async move {
             let args: &[&str] = if action == "start" { &["start", "on"] } else { &["stop"] };
             run_init_command(state, args).await?;
-            if health {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                let core = state.core.read().unwrap().name.clone();
-                if get_pid(&core).is_empty() { return Err(format!("Ядро {core} не запущено")); }
-            } else if !get_pid("xray").is_empty() || !get_pid("mihomo").is_empty() {
+            if !health && (!get_pid("xray").is_empty() || !get_pid("mihomo").is_empty()) {
                 return Err("Ядро не остановлено".into());
             }
             Ok(())
@@ -638,4 +648,62 @@ mod tests {
         let _ = server.await;
         fs::remove_dir_all(temp).await.unwrap();
     }
+
+    fn fixture_state(init: &Path) -> AppState {
+        let (log_tx, _) = broadcast::channel(16);
+        AppState {
+            core: Arc::new(RwLock::new(get_core_info("mihomo"))),
+            settings: Arc::new(RwLock::new(AppSettings::default())),
+            init_file: Arc::new(RwLock::new(Some(init.to_string_lossy().into_owned()))),
+            http_client: reqwest::Client::new(),
+            update_checker: UpdateChecker::default(),
+            geo_cache: Arc::new(RwLock::new(Default::default())),
+            log_tx: Arc::new(log_tx),
+            log_watcher: Arc::new(Mutex::new(None)),
+            app_config_lock: Arc::new(Mutex::new(())),
+            debug: false, rci_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_api_reports_nonzero_init_exit_for_every_service_action() {
+        let temp = std::env::temp_dir().join(format!("xkeen-init-exit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temp).await.unwrap();
+        let init = temp.join("init");
+        fs::write(&init, "#!/bin/sh\nexit 7\n").await.unwrap();
+        set_permissions(&init, Permissions::from_mode(0o755)).await.unwrap();
+        let state = fixture_state(&init);
+        let app = Router::new().route("/api/control", post(post_control)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/control", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for action in ["start", "stop", "hardRestart"] {
+            let response: serde_json::Value = reqwest::Client::new().post(&url)
+                .json(&serde_json::json!({"action":action})).send().await.unwrap().json().await.unwrap();
+            assert_eq!(response["success"], false, "{action}");
+            assert!(response["error"].as_str().unwrap().contains("7"), "{response}");
+        }
+        server.abort();
+        fs::remove_dir_all(temp).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_init_exit_without_core_process_is_not_successful_start_or_restart() {
+        let temp = std::env::temp_dir().join(format!("xkeen-init-health-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temp).await.unwrap();
+        let init = temp.join("init");
+        fs::write(&init, "#!/bin/sh\nexit 0\n").await.unwrap();
+        set_permissions(&init, Permissions::from_mode(0o755)).await.unwrap();
+        let state = fixture_state(&init);
+        // Unique nonexistent comm makes the real /proc probe independent of installed cores.
+        state.core.write().unwrap().name = format!("fixture-{}", uuid::Uuid::new_v4());
+        for args in [["start", "on"], ["restart", "on"]] {
+            let error = run_init_command(&state, &args).await.unwrap_err();
+            assert!(error.contains("не запущено"), "{error}");
+        }
+        // Stop has no startup requirement; successful init exit remains accepted.
+        run_init_command(&state, &["stop"]).await.unwrap();
+        fs::remove_dir_all(temp).await.unwrap();
+    }
+
 }

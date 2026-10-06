@@ -8,6 +8,7 @@ mod api_relay;
 mod auth;
 mod backuper;
 mod configs;
+mod config_transaction;
 mod controller;
 mod core_switch;
 mod dns;

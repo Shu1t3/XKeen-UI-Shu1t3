@@ -126,7 +126,12 @@ pub async fn put_backup(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn post_backup(Json(req): Json<BackupReq>) -> impl IntoResponse {
     run_blocking(
-        tokio::task::spawn_blocking(move || restore_backup_sync(&req.name, req.contents).map(|_| None::<()>)),
+        tokio::spawn(async move {
+            crate::config_transaction::run(async move {
+                tokio::task::spawn_blocking(move || restore_backup_sync(&req.name, req.contents).map(|_| None::<()>))
+                    .await.map_err(|e| e.to_string())?
+            }).await.map_err(|e| e.to_string())?
+        }),
         "Не удалось восстановить бэкап",
     )
     .await

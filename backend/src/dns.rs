@@ -290,12 +290,17 @@ pub async fn post_dns(State(state): State<AppState>, Json(req): Json<DnsEnableRe
         }
     }
 
-    if let Some(config_path) = find_mihomo_config() {
-        if let Err(e) = tokio::fs::write(&config_path, &req.config_content).await {
-            log("ERROR", format!("Ошибка записи config.yaml: {e}"));
-        }
-    } else {
-        log("ERROR", "config.yaml не найден, конфигурация не записана".into());
+    let content = req.config_content;
+    let write_result = crate::config_transaction::run(async move {
+        let config_path = find_mihomo_config().ok_or_else(|| "config.yaml не найден, конфигурация не записана".to_string())?;
+        tokio::task::spawn_blocking(move || {
+            crate::config_transaction::write_atomic(std::path::Path::new(&config_path), content.as_bytes(), false)
+        }).await.map_err(|e| e.to_string())?
+    }).await;
+    match write_result {
+        Ok(Ok(())) => (),
+        Ok(Err(e)) => log("ERROR", format!("Ошибка записи config.yaml: {e}")),
+        Err(e) => log("ERROR", format!("Ошибка записи config.yaml: {e}")),
     }
 
     let message = if req.setup_filter {
