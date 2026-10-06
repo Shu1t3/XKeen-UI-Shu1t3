@@ -12,6 +12,7 @@ import { useRoutersStore } from '../../lib/multi-routers/store'
 import { useSettings } from '../../lib/store'
 import { cn } from '../../lib/utils'
 import { renderLogError } from '../../lib/log-html'
+import { appendLogLines, MAX_LOG_LINES } from '../../lib/log-buffer'
 import type { WsMessage } from '../../lib/websocket'
 import { useWebSocket } from '../../lib/websocket'
 import { AddRouterDialog } from './multi-routers/AddRouterDialog'
@@ -19,7 +20,6 @@ import { RoutersListPanel } from './multi-routers/RoutersListPanel'
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group'
 
 const LOG_FILES = ['error.log', 'access.log']
-const MAX_LINES = 1000
 
 export function LogPanel() {
   const timezone = useSettings((s) => s.timezone)
@@ -66,22 +66,11 @@ export function LogPanel() {
     if (el) el.scrollTop = el.scrollHeight
   }, [])
 
-  const trimToCap = useCallback(() => {
-    const el = logRef.current
-    if (!el) return
-    const overflow = linesRef.current.length - MAX_LINES
-    if (overflow <= 0) return
-    linesRef.current.splice(0, overflow)
-    for (let i = 0; i < overflow && el.firstChild; i++) {
-      el.removeChild(el.firstChild)
-    }
-  }, [])
-
   const renderAll = useCallback((lines: string[]) => {
     const el = logRef.current
     if (!el) return
 
-    const capped = lines.length > MAX_LINES ? lines.slice(lines.length - MAX_LINES) : lines
+    const capped = lines.length > MAX_LOG_LINES ? lines.slice(lines.length - MAX_LOG_LINES) : lines
     linesRef.current = capped
     const hasLines = capped.length > 0
 
@@ -100,15 +89,9 @@ export function LogPanel() {
       if (!el) return
 
       setIsEmpty(false)
-      linesRef.current.push(...newLines)
-      el.insertAdjacentHTML('beforeend', newLines.join(''))
-
-      if (autoScrollRef.current) {
-        trimToCap()
-        el.scrollTop = el.scrollHeight
-      }
+      linesRef.current = appendLogLines(el, linesRef.current, newLines, autoScrollRef.current)
     },
-    [trimToCap]
+    []
   )
 
   const handleMessage = useCallback(
@@ -172,7 +155,6 @@ export function LogPanel() {
   function handleScrollToBottom() {
     autoScrollRef.current = true
     setShowScrollBtn(false)
-    trimToCap()
     scrollToBottom()
   }
 
@@ -453,6 +435,7 @@ export function LogPanel() {
                 )}
                 <div
                   ref={logRef}
+                  style={{ overflowAnchor: 'none' }}
                   tabIndex={0}
                   className={cn(
                     'text-foreground scrollbar-width:thin h-full overflow-y-auto px-3 py-1.5 font-mono text-[13px] leading-[1.6] wrap-anywhere contain-content',
