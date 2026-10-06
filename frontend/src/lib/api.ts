@@ -1,4 +1,4 @@
-import { REMOTE_FETCH_TIMEOUT_MS } from './multi-routers/model'
+import { LOCAL_ROUTER_ID, REMOTE_FETCH_TIMEOUT_MS } from './multi-routers/model'
 
 const RETRY_DELAYS = [500, 1000, 2000, 4000, 8000]
 const RETRY_STATUSES = new Set([502, 503, 504])
@@ -117,9 +117,12 @@ export async function fanOutRouters(
   task: (id: string, baseUrl: string | null) => Promise<void>,
   getBaseUrl: (id: string) => string | null
 ): Promise<FanOutResult[]> {
+  if (targetIds.length === 0) throw new Error('Выберите хотя бы один роутер')
   const results = await Promise.allSettled(
     targetIds.map(async (id) => {
-      await task(id, getBaseUrl(id))
+      const baseUrl = getBaseUrl(id)
+      if (id !== LOCAL_ROUTER_ID && !baseUrl) throw new Error(`Не задан адрес роутера ${id}`)
+      await task(id, baseUrl)
       return id
     })
   )

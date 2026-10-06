@@ -41,9 +41,8 @@ import * as jsyaml from 'js-yaml'
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
 import { apiCall, capitalize, clashFetch, getFileLanguage } from '../../lib/api'
 import { LazyBoundary, lazyLoad, useLazyMount } from '../../lib/loader'
-import { runMassTask, summarizeFanOut, targetLabel, filterAuthBlockedTargets, REMOTE_AUTH_UNSUPPORTED } from '../../lib/multi-routers/actions'
+import { runMassTask, summarizeFanOut, snapshotMassTargets, type RouterTarget, filterAuthBlockedTargets, REMOTE_AUTH_UNSUPPORTED } from '../../lib/multi-routers/actions'
 import { LOCAL_ROUTER_ID } from '../../lib/multi-routers/model'
-import { useRoutersStore } from '../../lib/multi-routers/store'
 import { syncClashApiPort, useAppContext, useConnectionsSync, useModalContext, useSettings } from '../../lib/store'
 import type { Config } from '../../lib/types'
 import { cn } from '../../lib/utils'
@@ -290,11 +289,6 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   const guiRouting = useSettings((s) => s.guiRouting)
   const guiLog = useSettings((s) => s.guiLog)
   const multiRouter = useSettings((s) => s.multiRouter)
-  const applyTargets = useRoutersStore((s) => s.applyTargets)
-  const getMassTargets = () => {
-    if (!multiRouter) return [LOCAL_ROUTER_ID]
-    return applyTargets.length > 0 ? applyTargets : [LOCAL_ROUTER_ID]
-  }
 
   const isRunning = serviceStatus === 'running'
   const isPending = serviceStatus === 'pending'
@@ -513,7 +507,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     configActionsRef.current = { switchTab, getActiveIndex: () => activeIndexRef.current }
   }, [configActionsRef, switchTab])
 
-  async function executeSave(targets: string[], cfg: Config, content: string) {
+  async function executeSave(targets: readonly RouterTarget[], cfg: Config, content: string) {
     const results = await runMassTask(targets, async (_id, baseUrl) => {
       const result = await apiCall<{ success: boolean; error?: string }>(
         'PUT',
@@ -525,7 +519,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     })
 
     const localOk = results.find((r) => r.id === LOCAL_ROUTER_ID)?.ok
-    if (targets.includes(LOCAL_ROUTER_ID) ? localOk : results.some((r) => r.ok)) {
+    if (targets.some((target) => target.id === LOCAL_ROUTER_ID) ? localOk : results.some((r) => r.ok)) {
       editorRef.current?.setSavedContent(content)
       dispatch({ type: 'SAVE_CONFIG', index: activeIndexRef.current, content })
       saveViewState(cfg.file, false)
@@ -549,14 +543,20 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     }
   }
 
-  async function resolveMassTargets(): Promise<string[] | null> {
-    const selected = getMassTargets()
+  async function resolveMassTargets(): Promise<readonly RouterTarget[] | null> {
+    let selected: readonly RouterTarget[]
+    try {
+      selected = snapshotMassTargets(multiRouter)
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Ошибка выбора роутеров', 'error')
+      return null
+    }
     const { allowed, blocked } = await filterAuthBlockedTargets(selected)
     if (blocked.length > 0) {
       showToast(
         {
           title: 'Пропущены панели с авторизацией',
-          body: `${blocked.map(targetLabel).join(', ')}. ${REMOTE_AUTH_UNSUPPORTED}`,
+          body: `${blocked.map((target) => target.label).join(', ')}. ${REMOTE_AUTH_UNSUPPORTED}`,
         },
         'error'
       )
@@ -579,12 +579,12 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
 
     const targets = await resolveMassTargets()
     if (!targets) return
-    const hasRemote = targets.some((t) => t !== LOCAL_ROUTER_ID)
+    const hasRemote = targets.some((t) => t.id !== LOCAL_ROUTER_ID)
     if (hasRemote) {
       setMassConfirm({
         title: 'Массовое сохранение',
         description: 'Конфиг будет сохранён на выбранных роутерах:',
-        targets: targets.map(targetLabel),
+        targets: targets.map((target) => target.label),
         action: () => void executeSave(targets, cfg, content),
       })
       return
@@ -639,14 +639,14 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     if (!r?.success) throw new Error(r?.error || 'ошибка перезапуска')
   }
 
-  async function executeApply(targets: string[], cfg: Config, content: string) {
+  async function executeApply(targets: readonly RouterTarget[], cfg: Config, content: string) {
     dispatch({ type: 'SET_SERVICE_STATUS', status: 'pending', pendingText: 'Применение...' })
     const results = await runMassTask(targets, async (_id, baseUrl) => {
       await applyToHost(baseUrl, cfg, content)
     })
 
     const localOk = results.find((r) => r.id === LOCAL_ROUTER_ID)?.ok
-    if (targets.includes(LOCAL_ROUTER_ID) ? localOk : results.some((r) => r.ok)) {
+    if (targets.some((target) => target.id === LOCAL_ROUTER_ID) ? localOk : results.some((r) => r.ok)) {
       editorRef.current?.setSavedContent(content)
       dispatch({ type: 'SAVE_CONFIG', index: activeIndexRef.current, content })
       saveViewState(cfg.file, false)
@@ -668,7 +668,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       )
     }
 
-    if (targets.includes(LOCAL_ROUTER_ID)) {
+    if (targets.some((target) => target.id === LOCAL_ROUTER_ID)) {
       dispatch({
         type: 'SET_SERVICE_STATUS',
         status: localOk === false ? 'stopped' : isRunning || localOk ? 'running' : 'stopped',
@@ -693,12 +693,12 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
 
     const targets = await resolveMassTargets()
     if (!targets) return
-    const hasRemote = targets.some((t) => t !== LOCAL_ROUTER_ID)
+    const hasRemote = targets.some((t) => t.id !== LOCAL_ROUTER_ID)
     if (hasRemote) {
       setMassConfirm({
         title: 'Массовое применение',
         description: 'Конфиг будет сохранён и применён на выбранных роутерах:',
-        targets: targets.map(targetLabel),
+        targets: targets.map((target) => target.label),
         action: () => void executeApply(targets, cfg, content),
       })
       return
@@ -707,7 +707,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     await executeApply(targets, cfg, content)
   }
 
-  async function executeQuickBackup(targets: string[]) {
+  async function executeQuickBackup(targets: readonly RouterTarget[]) {
     const results = await runMassTask(targets, async (_id, baseUrl) => {
       const result = await apiCall<{ success: boolean; error?: string }>('PUT', 'backup', undefined, { baseUrl })
       if (!result.success) throw new Error(result.error || 'ошибка бэкапа')
@@ -732,12 +732,12 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   async function quickBackup() {
     const targets = await resolveMassTargets()
     if (!targets) return
-    const hasRemote = targets.some((t) => t !== LOCAL_ROUTER_ID)
+    const hasRemote = targets.some((t) => t.id !== LOCAL_ROUTER_ID)
     if (hasRemote) {
       setMassConfirm({
         title: 'Быстрый бэкап',
         description: 'Бэкап конфигураций будет создан на выбранных роутерах:',
-        targets: targets.map(targetLabel),
+        targets: targets.map((target) => target.label),
         action: () => void executeQuickBackup(targets),
       })
       return

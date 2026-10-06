@@ -38,7 +38,6 @@ export const useRoutersStore = create<RoutersState>((set, get) => ({
     set((state) => {
       const ids = new Set(routers.map(routerId))
       const applyTargets = state.applyTargets.filter((id) => id === LOCAL_ROUTER_ID || ids.has(id))
-      if (applyTargets.length === 0) applyTargets.push(LOCAL_ROUTER_ID)
       return { routers, applyTargets }
     }),
 
@@ -67,7 +66,8 @@ export const useRoutersStore = create<RoutersState>((set, get) => ({
   getBaseUrlForId: (id) => {
     if (id === LOCAL_ROUTER_ID) return null
     const router = findRouter(get().routers, id)
-    return router ? routerBaseUrl(router.host, router.port) : null
+    if (!router) throw new Error(`Роутер ${id} больше не существует`)
+    return routerBaseUrl(router.host, router.port)
   },
 }))
 
