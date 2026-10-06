@@ -30,9 +30,7 @@ export function LogPanel() {
   const setApplyTargets = useRoutersStore((s) => s.setApplyTargets)
   const [panelTab, setPanelTab] = useState<'journal' | 'routers'>('journal')
   const [addRouterOpen, setAddRouterOpen] = useState(false)
-  useEffect(() => {
-    if (!multiRouter && panelTab === 'routers') setPanelTab('journal')
-  }, [multiRouter, panelTab])
+  if (!multiRouter && panelTab === 'routers') setPanelTab('journal')
   const allRouterIds = [LOCAL_ROUTER_ID, ...routers.map(routerId)]
   const selectableRouterIds = allRouterIds.filter((id) => isRouterSelectable(id, online, auth))
   const allRoutersSelected = selectableRouterIds.length > 0 && selectableRouterIds.every((id) => applyTargets.includes(id))

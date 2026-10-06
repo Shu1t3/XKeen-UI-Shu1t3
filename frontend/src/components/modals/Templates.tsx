@@ -17,36 +17,47 @@ export function TemplateModal({ onImport }: { onImport: (url: string) => Promise
   const { state, showToast } = useAppContext()
   const { modals, dispatch } = useModalContext()
   const { currentCore } = state
-  const [templates, setTemplates] = useState<{ name: string; url: string }[]>([])
-  const [selectedUrl, setSelectedUrl] = useState('')
-  const [loading, setLoading] = useState(false)
+  const [templatesByCore, setTemplatesByCore] = useState(() => templatesCache)
+  const [selection, setSelection] = useState({ core: currentCore, url: '' })
+  const [loading, setLoading] = useState(!templatesCache)
   const [importing, setImporting] = useState(false)
+  const [wasOpen, setWasOpen] = useState(modals.showTemplateModal)
+  if (wasOpen !== modals.showTemplateModal) {
+    setWasOpen(modals.showTemplateModal)
+    if (modals.showTemplateModal) {
+      setSelection({ core: currentCore, url: '' })
+      if (!templatesByCore) setLoading(true)
+    }
+  }
+  if (selection.core !== currentCore) setSelection({ core: currentCore, url: '' })
 
   const close = () => dispatch({ type: 'SHOW_MODAL', modal: 'showTemplateModal', show: false })
 
-  useEffect(() => {
-    if (modals.showTemplateModal) loadTemplates()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modals.showTemplateModal, currentCore])
+  const templates = templatesByCore?.[currentCore] ?? []
+  const selectedUrl = selection.core === currentCore && templates.some((template) => template.url === selection.url)
+    ? selection.url
+    : (templates[0]?.url ?? '')
+  const setSelectedUrl = (url: string) => setSelection({ core: currentCore, url })
 
-  async function loadTemplates() {
-    if (!templatesCache) {
-      setLoading(true)
+  useEffect(() => {
+    if (!modals.showTemplateModal || templatesByCore) return
+    let cancelled = false
+    async function loadTemplates() {
       try {
         const res = await fetch(TEMPLATES_URL)
         if (!res.ok) throw new Error(res.statusText)
-        templatesCache = await res.json()
+        const data: NonNullable<typeof templatesCache> = await res.json()
+        templatesCache = data
+        if (!cancelled) setTemplatesByCore(data)
       } catch {
-        showToast('Не удалось загрузить шаблоны', 'error')
-        setLoading(false)
-        return
+        if (!cancelled) showToast('Не удалось загрузить шаблоны', 'error')
+      } finally {
+        if (!cancelled) setLoading(false)
       }
-      setLoading(false)
     }
-    const list = templatesCache?.[currentCore] ?? []
-    setTemplates(list)
-    if (list.length > 0) setSelectedUrl(list[0].url)
-  }
+    void loadTemplates()
+    return () => { cancelled = true }
+  }, [modals.showTemplateModal, templatesByCore, showToast])
 
   async function handleImport() {
     if (!selectedUrl) return

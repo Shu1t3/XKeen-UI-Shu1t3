@@ -50,8 +50,8 @@ function formatCounter(
 export function SearchPanel({ handle, replaceEnabled = true }: Props) {
   const { view } = handle
   const [state, setState] = useState<PanelState>(() => readPanelState(handle))
-  const matchIndexRef = useRef(new MatchIndex())
-  const [counts, setCounts] = useState(() => matchIndexRef.current.compute(view.state))
+  const [matchIndex] = useState(() => new MatchIndex())
+  const [counts, setCounts] = useState(() => matchIndex.compute(view.state))
 
   const searchInputRef = useRef<HTMLInputElement>(null)
   const replaceInputRef = useRef<HTMLInputElement>(null)
@@ -61,14 +61,14 @@ export function SearchPanel({ handle, replaceEnabled = true }: Props) {
     const sync = (update: ViewUpdate | null) => {
       const s = update?.state ?? handle.view.state
       setState({ query: getSearchQuery(s), replaceVisible: s.field(replaceVisibleField) })
-      setCounts(matchIndexRef.current.compute(s))
+      setCounts(matchIndex.compute(s))
     }
     sync(null)
     handle.listeners.add(sync)
     return () => {
       handle.listeners.delete(sync)
     }
-  }, [handle])
+  }, [handle, matchIndex])
 
   useLayoutEffect(() => {
     const input = searchInputRef.current

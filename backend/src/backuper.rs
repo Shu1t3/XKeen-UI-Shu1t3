@@ -26,7 +26,7 @@ fn mtime_string(time: Result<SystemTime, std::io::Error>, tz: i32) -> String {
     }
 }
 
-const BACKUP_DIR: &str = "/opt/backups";
+const BACKUP_DIR: &str = opt_path!("/backups");
 const BACKUP_SUFFIX: &str = "xkeen-ui.tar";
 const CONTENT_ORDER: [&str; 4] = ["xkeen", "xkeen-ui", "xray", "mihomo"];
 

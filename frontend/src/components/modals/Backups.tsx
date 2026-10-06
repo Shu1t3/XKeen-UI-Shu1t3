@@ -88,7 +88,7 @@ export function BackupsModal({ open, onOpenChange, onRefreshConfigs }: Props) {
   const { showToast } = useAppContext()
 
   const [backups, setBackups] = useState<BackupItem[]>([])
-  const [isLoading, setIsLoading] = useState(false)
+  const [isLoading, setIsLoading] = useState(open)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [keepLatestBackups, setKeepLatestBackups] = useState(() => localStorage.getItem(KEEP_LATEST_BACKUPS_KEY) === 'true')
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null)
@@ -117,24 +117,32 @@ export function BackupsModal({ open, onOpenChange, onRefreshConfigs }: Props) {
     [fetchBackups, showToast]
   )
 
+  const [wasOpen, setWasOpen] = useState(open)
+  if (wasOpen !== open) {
+    setWasOpen(open)
+    if (open) setIsLoading(true)
+    else {
+      setConfirmAction(null)
+      setDialogAction(null)
+    }
+  }
+  if (open && confirmAction && confirmAction !== dialogAction) setDialogAction(confirmAction)
+
   useEffect(() => {
-    if (open) void loadBackups()
-  }, [open, loadBackups])
+    if (!open) return
+    let cancelled = false
+    fetchBackups()
+      .then((items) => { if (!cancelled) setBackups(items) })
+      .catch((error: unknown) => {
+        if (!cancelled) showToast(error instanceof Error ? error.message : 'Не удалось загрузить бэкапы', 'error')
+      })
+      .finally(() => { if (!cancelled) setIsLoading(false) })
+    return () => { cancelled = true }
+  }, [open, fetchBackups, showToast])
 
   useEffect(() => {
     localStorage.setItem(KEEP_LATEST_BACKUPS_KEY, String(keepLatestBackups))
   }, [keepLatestBackups])
-
-  useEffect(() => {
-    if (!open) {
-      setConfirmAction(null)
-      setDialogAction(null)
-    }
-  }, [open])
-
-  useEffect(() => {
-    if (confirmAction) setDialogAction(confirmAction)
-  }, [confirmAction])
 
   const startRename = useCallback((name: string) => {
     setRenamingName(name)

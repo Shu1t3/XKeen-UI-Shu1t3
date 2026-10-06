@@ -1,3 +1,9 @@
+macro_rules! opt_path {
+    ($suffix:literal) => {
+        concat!(env!("XKEEN_OPT_ROOT"), $suffix)
+    };
+}
+
 mod api_relay;
 mod auth;
 mod backuper;
@@ -6,6 +12,7 @@ mod controller;
 mod dns;
 mod frontend_embedder;
 mod geo;
+mod local_dev;
 mod logger;
 mod route_test;
 mod ruleset_inspector;
@@ -46,7 +53,7 @@ struct Cli {
     #[arg(
         short = 'p',
         long = "port",
-        default_value = "1000",
+        default_value = if cfg!(feature = "local-dev") { "11000" } else { "1000" },
         help = "Запуск сервиса с указанием порта"
     )]
     port: String,
@@ -88,7 +95,7 @@ PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 . /opt/etc/init.d/rc.func
 "#;
 
-const XKEEN_UI_LOG_C: &[u8] = b"/opt/var/log/xkeen-ui.log\0";
+const XKEEN_UI_LOG_C: &[u8] = concat!(env!("XKEEN_OPT_ROOT"), "/var/log/xkeen-ui.log\0").as_bytes();
 
 fn create_init() -> std::io::Result<()> {
     if let Some(dir) = Path::new(S99XKEEN_UI).parent() {
@@ -292,6 +299,10 @@ async fn main() {
     let matches = command.get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
+    if cfg!(feature = "local-dev") && cli.command.is_some() {
+        eprintln!("Команды управления роутером недоступны в local-dev. Запускайте сервер без подкоманды.");
+        exit(1);
+    }
     if let Some(command) = cli.command {
         match command {
             Command::Setup => {
@@ -377,6 +388,9 @@ async fn main() {
         }
     }
 
+    if cfg!(feature = "local-dev") {
+        local_dev::prepare().unwrap_or_else(|e| report_process_error(&format!("Local environment: {e}")));
+    }
     setup_process_logging();
     println!("XKeen UI {} ({})", VERSION, get_arch());
 
@@ -402,7 +416,9 @@ async fn main() {
         .await
         .unwrap()
         .or_else(|| {
-            log("ERROR", "Не удалось найти файл инициализации XKeen".into());
+            if !cfg!(feature = "local-dev") {
+                log("ERROR", "Не удалось найти файл инициализации XKeen".into());
+            }
             None
         });
 
@@ -439,11 +455,13 @@ async fn main() {
         debug: cli.debug,
         rci_token,
     };
-    version::start_update_checker(state.clone());
+    if !cfg!(feature = "local-dev") {
+        version::start_update_checker(state.clone());
+    }
 
     if let Some(ref _token) = state.rci_token {
         log("INFO", "RCI токен успешно загружен".into());
-    } else {
+    } else if !cfg!(feature = "local-dev") {
         match state
             .http_client
             .get("http://127.0.0.1:79/rci/show/version")
@@ -528,10 +546,16 @@ async fn main() {
         .merge(insecure_api)
         .fallback(frontend_embedder::serve)
         .layer(CorsLayer::permissive())
-        .with_state(state);
-    let addr: SocketAddr = format!("0.0.0.0:{}", cli.port)
+        .with_state(state)
+        .layer(middleware::from_fn(local_dev::router_operations));
+    let host = if cfg!(feature = "local-dev") {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    let addr: SocketAddr = format!("{host}:{}", cli.port)
         .parse()
-        .unwrap_or_else(|e| report_process_error(&format!("Error listening on 0.0.0.0:{}: {}", cli.port, e)));
+        .unwrap_or_else(|e| report_process_error(&format!("Error listening on {host}:{}: {}", cli.port, e)));
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| report_process_error(&format!("Error listening on {}: {}", addr, e)));

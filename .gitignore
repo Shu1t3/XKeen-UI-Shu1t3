@@ -38,3 +38,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local backend development data
+.local/

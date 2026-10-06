@@ -96,18 +96,12 @@ export function GuiRouting({ editorRef, configs, activeConfigIndex }: Props) {
   const currentCoreRef = useRef(currentCore)
   const rulesRef = useRef<Rule[]>([])
   const cardRefs = useRef<(HTMLDivElement | null)[]>([])
-  const cardRefHandlersRef = useRef<Record<number, (el: HTMLDivElement | null) => void>>({})
   const scrollRef = useRef<HTMLDivElement>(null)
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null)
 
-  const getCardRef = useCallback((index: number) => {
-    if (!cardRefHandlersRef.current[index]) {
-      cardRefHandlersRef.current[index] = (el: HTMLDivElement | null) => {
-        cardRefs.current[index] = el
-      }
-    }
-    return cardRefHandlersRef.current[index]
+  const getCardRef = useCallback((index: number) => (el: HTMLDivElement | null) => {
+    cardRefs.current[index] = el
   }, [])
 
   function loadAvailable() {

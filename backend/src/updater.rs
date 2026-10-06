@@ -363,7 +363,7 @@ async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path
 
     log("INFO", format!("Загрузка yq: {}", url));
     let dl_res = download(client, &url, proxies, &tmp_dir.join("yq.tmp")).await?;
-    let target = "/opt/sbin/yq";
+    let target = opt_path!("/sbin/yq");
     if let Err(e) = save(dl_res, tmp_dir.join("yq.bin")).await {
         return Err(format!("Ошибка записи yq: {}", e));
     }
@@ -408,7 +408,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         ),
     );
 
-    let tmp_dir = Path::new("/opt/tmp");
+    let tmp_dir = Path::new(opt_path!("/tmp"));
     _ = fs::create_dir_all(tmp_dir).await;
     let arch = std::env::consts::ARCH;
 
@@ -460,7 +460,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
             return response(false, Some(e));
         }
 
-        let target = "/opt/sbin/xkeen-ui";
+        let target = opt_path!("/sbin/xkeen-ui");
         if let Err(e) = fs::rename(&source, target).await {
             return response(false, Some(format!("Ошибка установки: {}", e)));
         }
@@ -531,13 +531,13 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
     let url = format!("{}/{}/releases/download/{}/{}", GITHUB_RELEASE, repo, ver, asset);
 
     match req.core.as_str() {
-        "xray" if !Path::new("/opt/bin/jq").exists() => {
+        "xray" if !Path::new(opt_path!("/bin/jq")).exists() => {
             log("WARN", "Пакет jq не найден".into());
             if let Err(e) = install_jq().await {
                 return response(false, Some(e));
             }
         }
-        "mihomo" if !Path::new("/opt/sbin/yq").exists() => {
+        "mihomo" if !Path::new(opt_path!("/sbin/yq")).exists() => {
             log("WARN", "Пакет yq не найден".into());
             if let Err(e) = install_yq(&state.http_client, &proxies, tmp_dir).await {
                 return response(false, Some(e));
@@ -610,15 +610,15 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         return response(false, Some(format!("Ошибка распаковки: {}", e)));
     }
 
-    let target = format!("/opt/sbin/{}", req.core);
+    let target = format!(opt_path!("/sbin/{}"), req.core);
     if req.backup_core && Path::new(&target).exists() {
         let bk = format!(
-            "/opt/sbin/core-backup/{}-{}",
+            opt_path!("/sbin/core-backup/{}-{}"),
             req.core,
             (chrono::Utc::now() + chrono::Duration::hours(state.settings.read().unwrap().log.timezone as i64))
                 .format("%Y%m%d-%H%M%S")
         );
-        _ = fs::create_dir_all("/opt/sbin/core-backup").await;
+        _ = fs::create_dir_all(opt_path!("/sbin/core-backup")).await;
         log("INFO", format!("Создание бэкапа: {}", bk));
         _ = fs::copy(&target, &bk).await;
     }

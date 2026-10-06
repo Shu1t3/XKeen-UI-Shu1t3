@@ -3,6 +3,9 @@ name = "xkeen-ui"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+local-dev = []
+
 [dependencies]
 argon2 = { version = "0.6" }
 axum = { version = "0.8", features = ["ws"] }

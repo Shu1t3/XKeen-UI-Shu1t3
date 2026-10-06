@@ -214,7 +214,6 @@ export const DnsPanel = memo(function DnsPanel() {
   const [enableDialogOpen, setEnableDialogOpen] = useState(false)
   const [setupFilter, setSetupFilter] = useState(() => localStorage.getItem(SETUP_FILTER_STORAGE_KEY) !== 'false')
   const [disableOpen, setDisableOpen] = useState(false)
-  const [config, setConfig] = useState<DnsConfig>(DEFAULT_DNS_CONFIG)
   const [isApplying, setIsApplying] = useState(false)
 
   const yamlConfig = useMemo(() => configs.find((c: Config) => c.file.endsWith('/config.yaml')), [configs])
@@ -255,7 +254,7 @@ export const DnsPanel = memo(function DnsPanel() {
     fetchStatus()
   }, [fetchStatus, dnsRefreshToken])
 
-  useEffect(() => {
+  const parsedConfig = useMemo(() => {
     if (!yamlConfig) return
     const content = yamlConfig.savedContent || yamlConfig.content
 
@@ -299,7 +298,7 @@ export const DnsPanel = memo(function DnsPanel() {
       nameserverPolicy = entries.join('\n')
     }
 
-    setConfig({
+    return {
       enhancedMode,
       fakeIpFilterMode,
       fakeIpFilter,
@@ -308,8 +307,15 @@ export const DnsPanel = memo(function DnsPanel() {
       proxyServerNameserver,
       nameserverPolicy,
       fallback,
-    })
+    }
   }, [yamlConfig])
+
+  const [config, setConfig] = useState<DnsConfig>(() => parsedConfig ?? DEFAULT_DNS_CONFIG)
+  const [previousYamlConfig, setPreviousYamlConfig] = useState(yamlConfig)
+  if (previousYamlConfig !== yamlConfig) {
+    setPreviousYamlConfig(yamlConfig)
+    if (parsedConfig) setConfig(parsedConfig)
+  }
 
   const handleToggleEnable = useCallback((value: boolean) => {
     if (value) {
@@ -423,9 +429,9 @@ export const DnsPanel = memo(function DnsPanel() {
 
         const mihomoMessage = mihomoError instanceof Error ? mihomoError.message : String(mihomoError)
         if (!rollbackResult.success) {
-          throw new Error(`${mihomoMessage}. Не удалось откатить config.yaml: ${rollbackResult.error}`)
+          throw new Error(`${mihomoMessage}. Не удалось откатить config.yaml: ${rollbackResult.error}`, { cause: mihomoError })
         }
-        throw new Error(mihomoMessage)
+        throw new Error(mihomoMessage, { cause: mihomoError })
       }
 
       await refreshConfigs()

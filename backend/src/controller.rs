@@ -22,7 +22,7 @@ pub struct ControlReq {
 pub fn find_init_file(log_enabled: bool) -> Option<String> {
     let (mut path, mut source) = (None, "fallback");
 
-    if let Ok(content) = std::fs::read_to_string("/opt/sbin/.xkeen/01_info/01_info_variable.sh") {
+    if let Ok(content) = std::fs::read_to_string(opt_path!("/sbin/.xkeen/01_info/01_info_variable.sh")) {
         let (mut dir, mut file) = (None, None);
         for line in content.lines() {
             let clean = line.split('#').next().unwrap_or("").trim();
@@ -215,7 +215,7 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
 
     let ((xray_exists, xray_running), (mihomo_exists, mihomo_running)) = tokio::join!(
         async {
-            let exists = tokio::fs::metadata("/opt/sbin/xray").await.is_ok();
+            let exists = tokio::fs::metadata(opt_path!("/sbin/xray")).await.is_ok();
             let running = exists
                 && tokio::task::spawn_blocking(|| !get_pid("xray").is_empty())
                     .await
@@ -223,7 +223,7 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
             (exists, running)
         },
         async {
-            let exists = tokio::fs::metadata("/opt/sbin/mihomo").await.is_ok();
+            let exists = tokio::fs::metadata(opt_path!("/sbin/mihomo")).await.is_ok();
             let running = exists
                 && tokio::task::spawn_blocking(|| !get_pid("mihomo").is_empty())
                     .await

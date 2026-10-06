@@ -9,7 +9,7 @@ use yaml_rust2::{Yaml, YamlEmitter, YamlLoader};
 
 use crate::types::{ApiResponse, AppState, MIHOMO_CONF_DIR};
 
-const MIHOMO_CONF_DIRIG_PATH: &str = "/opt/etc/mihomo/config.yaml";
+const MIHOMO_CONF_DIRIG_PATH: &str = opt_path!("/etc/mihomo/config.yaml");
 
 static MIHOMO_YAML_CACHE: LazyLock<RwLock<Option<(SystemTime, Arc<Vec<Yaml>>)>>> = LazyLock::new(|| RwLock::new(None));
 
@@ -190,7 +190,7 @@ pub(crate) async fn convert_mrs(mrs_path: &str, behavior: &str) -> Result<String
     let behavior = behavior.to_ascii_lowercase();
     let tmp_path = format!("/tmp/convert-ruleset_{}", random_suffix());
 
-    let output = Command::new("/opt/sbin/mihomo")
+    let output = Command::new(opt_path!("/sbin/mihomo"))
         .args(["convert-ruleset", behavior.as_str(), "mrs", mrs_path, &tmp_path])
         .output()
         .await

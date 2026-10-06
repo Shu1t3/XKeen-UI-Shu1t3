@@ -56,6 +56,59 @@ sh /opt/tmp/switch-to-fork.sh --rollback /opt/var/backups/xkeen-ui-switch/ИМЯ
 прежнем адресе: проверка процесса не гарантирует работу всех функций.
 Новые сборки используют релизы форка для встроенного обновления панели.
 
+## Локальная разработка
+
+Нужны Rust (stable, Cargo) и Bun. На macOS также нужны Xcode Command Line Tools.
+
+Сначала установите зависимости и соберите frontend: backend встраивает `frontend/dist`.
+
+```sh
+cd frontend
+bun install --frozen-lockfile
+bun run build
+cd ../backend
+cargo run --features local-dev -- --debug
+```
+
+Во втором терминале из корня проекта:
+
+```sh
+cd frontend
+bun run dev
+```
+
+Откройте http://127.0.0.1:5173. Backend работает на http://127.0.0.1:11000.
+Режим `local-dev` хранит конфигурации, логи и резервные копии в `.local/opt`
+в корне проекта; директории создаются автоматически. Например, конфигурации
+Xray можно поместить в `.local/opt/etc/xray/configs`, а Mihomo — в
+`.local/opt/etc/mihomo`. Данные сохраняются между запусками и исключены из Git.
+Сборка без `--features local-dev` сохраняет штатные пути `/opt` и поведение роутера.
+
+Редактирование конфигураций, настройки, авторизация и тестирование правил доступны
+локально. Проверка конфигураций ядрами требует установленных `xray`/`mihomo` в `PATH`;
+Clash API требует запущенного Mihomo. Управление сервисами, установка обновлений,
+системные метрики RCI и список устройств требуют роутера и недоступны в `local-dev`.
+Локальный режим не запускает фоновую проверку обновлений.
+
+Для другого backend скопируйте `frontend/.env.example` в `frontend/.env.local`,
+задайте `XKEEN_BACKEND_URL` (например, `http://192.168.1.1:1000`) и перезапустите Vite.
+Для другого локального порта запустите backend с `--port 12000` и задайте
+`XKEEN_BACKEND_URL=http://127.0.0.1:12000`.
+
+Проверки:
+
+```sh
+cd backend
+cargo test --features local-dev
+cd ../frontend
+bun run build
+bun run lint
+```
+
+Сборка использует TypeScript 7; ESLint получает совместимый API TypeScript 6
+через отдельный npm alias. `bun run lint` должен завершаться без ошибок
+и предупреждений.
+
 ## ✨ Особенности
 
 - 🚀 Установка одной командой
@@ -104,17 +157,10 @@ curl https://raw.githubusercontent.com/Shu1t3/XKeen-UI-Shu1t3/main/setup.sh | sh
 > Открытие доступа к панели из интернета без должных мер безопасности может привести к взлому роутера или утечке данных.
 > За данные последствия автор проекта ответственность не несет.
 <br>
-  
-## 🪙 Понравился проект? Поддержи разработку
 
-- [**Cloudtips**](https://pay.cloudtips.ru/p/24b4c4b6)
-
-- Банковская карта: `2204 3203 4161 6409`
-  
-&nbsp;
 
 ## 🙏 Благодарности
 
-- [**Skrill0/XKeen**](https://github.com/Skrill0/XKeen)  
-- [**jameszeroX/XKeen**](https://github.com/jameszeroX/XKeen)  
+- [**Skrill0/XKeen**](https://github.com/Skrill0/XKeen)
+- [**jameszeroX/XKeen**](https://github.com/jameszeroX/XKeen)
 - [**Anonym-tsk/nfqws-keenetic**](https://github.com/Anonym-tsk/nfqws-keenetic)

@@ -11,7 +11,7 @@ const GITHUB_RELEASE: &str = "https://github.com";
 
 pub async fn get_local_core_version(core: &str) -> Option<String> {
     let arg = if core == "mihomo" { "-v" } else { "version" };
-    let mut cmd = Command::new(format!("/opt/sbin/{}", core));
+    let mut cmd = Command::new(format!(opt_path!("/sbin/{}"), core));
     cmd.arg(arg);
     let out = timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
 

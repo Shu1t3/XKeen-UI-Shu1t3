@@ -39,29 +39,20 @@ export function GeoScanModal() {
     setFileStatuses(Object.fromEntries(files.map((f) => [f, { categories: [], status: 'idle' as const }])))
   }
 
-  async function loadGeoFiles() {
-    setLoading(true)
-    try {
-      const res = await fetch('/api/geo')
-      const data = await res.json()
-      if (data.success) {
-        const files = {
-          domain: data.site_files || [],
-          ip: data.ip_files || [],
-        }
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/geo')
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled || !data.success) return
+        const files = { domain: data.site_files || [], ip: data.ip_files || [] }
         setGeoFiles(files)
         setSelectedFiles(files.domain)
-        initStatuses(files.domain)
-      }
-    } catch {
-      /* ignore */
-    }
-    setLoading(false)
-  }
-
-  useEffect(() => {
-    loadGeoFiles()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+        setFileStatuses(Object.fromEntries(files.domain.map((file: string) => [file, { categories: [], status: 'idle' as const }])))
+      })
+      .catch(() => { /* ignore */ })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
   }, [])
 
   function switchType(type: GeoType) {

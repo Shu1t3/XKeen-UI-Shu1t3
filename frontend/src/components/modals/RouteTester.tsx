@@ -208,6 +208,11 @@ export function RouteTesterModal() {
   const close = () => dispatch({ type: 'SHOW_MODAL', modal: 'showRouteTestModal', show: false })
 
   const [loadingInit, setLoadingInit] = useState(true)
+  const [wasOpen, setWasOpen] = useState(modals.showRouteTestModal)
+  if (wasOpen !== modals.showRouteTestModal) {
+    setWasOpen(modals.showRouteTestModal)
+    if (modals.showRouteTestModal) setLoadingInit(true)
+  }
   const [core, setCore] = useState<Core | null>(null)
   const [inboundTags, setInboundTags] = useState<string[]>([])
 
@@ -231,7 +236,6 @@ export function RouteTesterModal() {
   useEffect(() => {
     if (!modals.showRouteTestModal) return
     let cancelled = false
-    setLoadingInit(true)
     apiCall<RouteTestInitResponse>('GET', 'route-test')
       .then((data) => {
         if (cancelled) return
@@ -370,7 +374,7 @@ export function RouteTesterModal() {
     if (uniqueOutbounds.length === 0) return
     let cancelled = false
       ; (async () => {
-        let data: { proxies?: Record<string, ProxyLite> } | null = null
+        let data: { proxies?: Record<string, ProxyLite> } | null
         try {
           data = await clashFetch<{ proxies?: Record<string, ProxyLite> }>(clashApiPort ?? '', 'proxies', {
             secret: clashApiSecret,

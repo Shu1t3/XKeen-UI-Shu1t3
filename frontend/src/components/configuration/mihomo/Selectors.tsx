@@ -597,13 +597,7 @@ const SelectorRow = memo(function SelectorRow({
     return currentName ? (s.proxies[currentName] as ProxyInfo | undefined) : undefined
   })
 
-  if (!selector) return null
-
-  const allProxies = selector.all ?? []
-  const autoPolicy = AUTO_POLICY_TYPES.has(selector.type)
-  const lockSelection = selector.type === 'LoadBalance'
-  const selectedDelay = selectedProxy ? getLastDelay(selectedProxy) : null
-  const showSelectedDelay = !!selectedProxy && selectedDelay !== null && selectedDelay > 0
+  const allProxies = useMemo(() => selector?.all ?? [], [selector?.all])
 
   const hideUnavailable = useSettings((s) => s.hideUnavailableProxies)
   const hideCounter = useSettings((s) => s.hideUnavailableProxiesCounter)
@@ -620,6 +614,13 @@ const SelectorRow = memo(function SelectorRow({
     }
     return result
   }, [allProxies, hideUnavailable, hideCounter, sortOrder, allProxiesMap])
+
+  if (!selector) return null
+
+  const autoPolicy = AUTO_POLICY_TYPES.has(selector.type)
+  const lockSelection = selector.type === 'LoadBalance'
+  const selectedDelay = selectedProxy ? getLastDelay(selectedProxy) : null
+  const showSelectedDelay = !!selectedProxy && selectedDelay !== null && selectedDelay > 0
 
   return (
     <div className="border-border bg-input-background rounded-xl border p-4">
