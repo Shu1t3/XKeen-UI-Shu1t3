@@ -10,8 +10,8 @@ BACKUP_ROOT=/opt/var/backups/xkeen-ui-switch
 usage() {
     cat <<'HELP'
 Usage: sh switch-to-fork.sh [--tag TAG | --file /path/to/binary | --rollback BACKUP_DIR]
-Without arguments, download the latest stable release of Shu1t3/XKeen-UI-Shu1t3.
-For a prerelease, specify its exact tag with --tag.
+Without arguments, download the newest published fork release, including prereleases (requires jq).
+Use --tag to select an exact release.
 HELP
 }
 fail() { printf '%s\n' "Ошибка: $*" >&2; exit 1; }
@@ -33,6 +33,9 @@ check_version() (
     wait "$watchdog_pid" 2>/dev/null || :
     exit "$result"
 )
+select_published_tag() {
+    jq -er '[.[] | select(.draft != true)] | first | .tag_name | select(type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$"))' "$@"
+}
 MODE=release
 TAG=latest
 SOURCE=
@@ -101,10 +104,13 @@ case "$MODE" in
     release)
         command -v curl >/dev/null 2>&1 || fail 'Не найден curl.'
         if [ "$TAG" = latest ]; then
-            URL="https://github.com/$REPO/releases/latest/download/xkeen-ui-$ARCH"
-        else
-            URL="https://github.com/$REPO/releases/download/$TAG/xkeen-ui-$ARCH"
+            command -v jq >/dev/null 2>&1 || fail 'Для выбора самого нового релиза нужен jq; либо укажите --tag.'
+            curl -fL --connect-timeout 20 --max-time 300 \
+                -o "$WORK/releases.json" "https://api.github.com/repos/$REPO/releases?per_page=100" ||
+                fail 'Не удалось получить релизы форка. Используйте --tag либо --file.'
+            TAG=$(select_published_tag "$WORK/releases.json") || fail 'Нет опубликованного релиза форка.'
         fi
+        URL="https://github.com/$REPO/releases/download/$TAG/xkeen-ui-$ARCH"
         printf '%s\n' "Загрузка $URL"
         curl -fL --connect-timeout 20 --max-time 300 -o "$WORK/new" "$URL" ||
             fail 'Релиз или бинарник недоступен. Используйте --tag либо --file.' ;;

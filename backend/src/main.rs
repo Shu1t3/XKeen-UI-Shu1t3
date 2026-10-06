@@ -14,6 +14,7 @@ mod frontend_embedder;
 mod geo;
 mod local_dev;
 mod logger;
+mod release_source;
 mod route_test;
 mod ruleset_inspector;
 mod settings;
@@ -308,10 +309,7 @@ async fn main() {
             Command::Setup => {
                 use std::os::unix::process::CommandExt;
                 let err = std::process::Command::new("sh")
-                    .args([
-                        "-c",
-                        "curl -L https://raw.githubusercontent.com/Shu1t3/XKeen-UI-Shu1t3/main/setup.sh | sh",
-                    ])
+                    .args(["-c", &release_source::setup_command()])
                     .exec();
                 eprintln!(" {} {}", " Ошибка запуска setup:".red().bold(), err);
                 exit(1);

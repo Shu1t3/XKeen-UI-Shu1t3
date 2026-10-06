@@ -21,9 +21,14 @@ LIGHTTPD_INIT="/opt/etc/init.d/S80lighttpd"
 LIGHTTPD_DIR="/opt/etc/lighttpd"
 LIGHTTPD_CONF="$LIGHTTPD_DIR/conf.d/90-xkeenui.conf"
 
-BETA=false
+# Standalone mirror of backend/release-source.json; checked by backend tests.
+UI_REPOSITORY='Shu1t3/XKeen-UI-Shu1t3'
+RELEASE_CHANNEL=latest
 LOCAL=false
-[ "$1" = "beta" ] && BETA=true
+case "${1:-latest}" in
+  latest|stable|beta) RELEASE_CHANNEL="${1:-latest}" ;;
+  *) printf 'Неизвестный канал: %s (latest, stable, beta)\n' "$1" >&2; exit 1 ;;
+esac
 
 spinner() {
   local pid=$1 msg=$2
@@ -49,18 +54,22 @@ get_arch() {
   esac
 }
 
+select_release_tag() {
+  jq -er --arg channel "$RELEASE_CHANNEL" '[.[] | select(.draft != true) | select($channel == "latest" or ($channel == "beta" and .prerelease == true) or ($channel == "stable" and .prerelease != true))] | first | .tag_name | select(type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$"))'
+}
+
 download_files() {
-  local base_url="https://github.com/Shu1t3/XKeen-UI-Shu1t3/releases"
+  local base_url="https://github.com/$UI_REPOSITORY/releases"
   local download_url="$base_url/latest/download"
   local bin_name="xkeen-ui-$ARCH"
 
-  if [ "$BETA" = true ]; then
+  if [ "$LOCAL" != true ] && [ "$RELEASE_CHANNEL" != stable ]; then
     local beta_tag="/tmp/xkeen_beta"
     trap "rm -f $beta_tag" EXIT
-    (curl -s https://api.github.com/repos/Shu1t3/XKeen-UI-Shu1t3/releases | \
-  jq -re '.[0] | select(.prerelease == true) | .tag_name' > $beta_tag) &
-    if ! spinner $! "Поиск бета-релиза..."; then
-      printf "${RED_BOLD}\n Нет актуального бета-релиза${NCN}"
+    (curl -fsS "https://api.github.com/repos/$UI_REPOSITORY/releases?per_page=100" | \
+  select_release_tag > $beta_tag) &
+    if ! spinner $! "Поиск релиза ($RELEASE_CHANNEL)..."; then
+      printf "${RED_BOLD}\n Нет опубликованного релиза канала $RELEASE_CHANNEL${NCN}"
       $XKEENUI_INIT start &>/dev/null || :
       exit 1
     fi

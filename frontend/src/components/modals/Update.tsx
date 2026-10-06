@@ -13,6 +13,7 @@ import remarkGfm from 'remark-gfm'
 import { apiCall, capitalize } from '../../lib/api'
 import { useAppContext, useModalContext, useSettings } from '../../lib/store'
 import type { Release } from '../../lib/types'
+import releaseSource from '../../../../backend/release-source.json'
 import { cn, repoSlug } from '../../lib/utils'
 
 const GITHUB_API = 'https://api.github.com/repos'
@@ -21,7 +22,7 @@ const FETCH_TIMEOUT_MS = 5000
 const CORE_REPOS = {
   xray: 'XTLS/Xray-core',
   mihomo: 'MetaCubeX/mihomo',
-  self: 'Shu1t3/XKeen-UI-Shu1t3',
+  self: releaseSource.repository,
 } as const
 
 const mdClass = `
@@ -103,10 +104,12 @@ export function UpdateModal({ onInstalled }: { onInstalled: () => void }) {
           name?: string
           published_at?: string
           prerelease?: boolean
+          draft?: boolean
           body?: string | null
           assets?: Array<{ name: string; browser_download_url: string }>
         }>
         const parsed = (rels ?? [])
+          .filter((r) => !r.draft)
           .map((r) => ({
             version: (r.tag_name ?? '').replace(/^v/i, ''),
             name: r.name ?? '',
@@ -126,6 +129,9 @@ export function UpdateModal({ onInstalled }: { onInstalled: () => void }) {
           return
         }
       }
+
+      // Tags from jsDelivr do not prove that a panel release with binaries was published.
+      if (updateModalCore === 'self') throw new Error('NO_RELEASES')
 
       const jsdRes = await fetchWithTimeout(`${JSDELIVR_API}/${repo}`).catch(() => null)
       if (jsdRes?.ok) {

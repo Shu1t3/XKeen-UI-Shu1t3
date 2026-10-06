@@ -34,6 +34,8 @@ struct GhRelease {
     #[serde(default)]
     prerelease: bool,
     #[serde(default)]
+    draft: bool,
+    #[serde(default)]
     assets: Vec<GhAsset>,
 }
 
@@ -69,7 +71,7 @@ pub fn get_repo(updater: &UpdaterSettings, core: &str) -> Option<String> {
     let (url, fallback) = match core {
         "xray" => (&updater.xray_repo, "XTLS/Xray-core"),
         "mihomo" => (&updater.mihomo_repo, "MetaCubeX/mihomo"),
-        "self" => return Some("Shu1t3/XKeen-UI-Shu1t3".into()),
+        "self" => return Some(crate::release_source::UI_RELEASE_SOURCE.repository.clone()),
         _ => return None,
     };
     Some(if valid_repo_url(url) {
@@ -135,6 +137,11 @@ async fn fetch_release_assets(client: &reqwest::Client, proxies: &[String], repo
 pub async fn fetch_latest_version(
     client: &reqwest::Client, repo: &str, core: &str, proxies: &[String], current_ver: Option<&str>,
 ) -> Option<(String, String)> {
+    let repo = if core == "self" {
+        &crate::release_source::UI_RELEASE_SOURCE.repository
+    } else {
+        repo
+    };
     let url = format!("{}/{}/releases?per_page=10", GITHUB_API, repo);
     let list = std::iter::once(url.clone()).chain(
         proxies
@@ -143,8 +150,6 @@ pub async fn fetch_latest_version(
             .filter(|p| !p.is_empty())
             .map(|p| format!("{}/{}", p.trim_end_matches('/'), url)),
     );
-
-    let is_alpha = current_ver.map_or(false, |v| v.contains("alpha"));
 
     for u in list {
         let res = match client
@@ -169,24 +174,33 @@ pub async fn fetch_latest_version(
             Err(_) => continue,
         };
 
-        if is_alpha && core == "mihomo" {
-            if let Some(r) = rels.iter().find(|r| r.tag_name == "Prerelease-Alpha") {
-                for asset in &r.assets {
-                    if let Some(hash) = asset
-                        .name
-                        .find("alpha-")
-                        .and_then(|index| asset.name[index..].split('.').next())
-                    {
-                        return Some((hash.to_string(), "Prerelease-Alpha".into()));
-                    }
+        if let Some(release) = select_latest_release(rels, core, current_ver) {
+            return Some(release);
+        }
+    }
+    None
+}
+
+fn select_latest_release(rels: Vec<GhRelease>, core: &str, current_ver: Option<&str>) -> Option<(String, String)> {
+    if current_ver.map_or(false, |v| v.contains("alpha")) && core == "mihomo" {
+        if let Some(r) = rels.iter().find(|r| !r.draft && r.tag_name == "Prerelease-Alpha") {
+            for asset in &r.assets {
+                if let Some(hash) = asset
+                    .name
+                    .find("alpha-")
+                    .and_then(|index| asset.name[index..].split('.').next())
+                {
+                    return Some((hash.to_string(), "Prerelease-Alpha".into()));
                 }
             }
         }
+    }
 
-        if let Some(r) = rels.into_iter().find(|r| !r.prerelease) {
-            let tag = r.tag_name.clone();
-            return Some((tag.trim_start_matches('v').to_string(), tag));
-        }
+    // Panel updates offer the newest published fork release, including prereleases.
+    // Core release-channel behaviour remains unchanged.
+    if let Some(r) = rels.into_iter().find(|r| !r.draft && (core == "self" || !r.prerelease)) {
+        let tag = r.tag_name.clone();
+        return Some((tag.trim_start_matches('v').to_string(), tag));
     }
     None
 }
@@ -766,6 +780,59 @@ mod tests {
         proxy.await.unwrap();
         stalled.abort();
         let _ = stalled.await;
+    }
+
+    #[test]
+    fn panel_offers_newest_published_release_including_prereleases() {
+        let releases = r#"[
+            {"tag_name":"v9.0.0", "draft":true},
+            {"tag_name":"v0.0.1-fork.6", "prerelease":true},
+            {"tag_name":"v1.0.0", "prerelease":false}
+        ]"#;
+        for current in [Some("1.0.0"), Some("0.0.1-fork.5"), None] {
+            assert_eq!(
+                select_latest_release(serde_json::from_str(releases).unwrap(), "self", current),
+                Some(("0.0.1-fork.6".into(), "v0.0.1-fork.6".into()))
+            );
+        }
+        let releases = r#"[{"tag_name":"v1.0.1"}, {"tag_name":"v0.0.1-fork.5", "prerelease":true}]"#;
+        assert_eq!(
+            select_latest_release(serde_json::from_str(releases).unwrap(), "self", Some("0.0.1-fork.5")),
+            Some(("1.0.1".into(), "v1.0.1".into()))
+        );
+    }
+
+    #[test]
+    fn missing_published_panel_releases_do_not_fall_back() {
+        assert_eq!(select_latest_release(vec![], "self", Some("0.0.1-fork.5")), None);
+        let draft = serde_json::from_str(r#"[{"tag_name":"v9.0.0", "draft":true}]"#).unwrap();
+        assert_eq!(select_latest_release(draft, "self", None), None);
+        let mut settings = UpdaterSettings::default();
+        settings.xray_repo = "https://github.com/zxc-rv/XKeen-UI".into();
+        settings.mihomo_repo = "https://github.com/zxc-rv/XKeen-UI".into();
+        assert_eq!(
+            get_repo(&settings, "self").unwrap(),
+            crate::release_source::UI_RELEASE_SOURCE.repository
+        );
+    }
+
+    #[test]
+    fn core_selection_keeps_stable_and_mihomo_alpha_behaviour() {
+        let releases = r#"[
+            {"tag_name":"v9.0.0", "draft":true},
+            {"tag_name":"Prerelease-Alpha", "prerelease":true, "assets":[{"name":"mihomo-linux-arm64-alpha-abc123.gz"}]},
+            {"tag_name":"v1.0.0"}
+        ]"#;
+        for core in ["xray", "mihomo"] {
+            assert_eq!(
+                select_latest_release(serde_json::from_str(releases).unwrap(), core, Some("1.0.0")),
+                Some(("1.0.0".into(), "v1.0.0".into()))
+            );
+        }
+        assert_eq!(
+            select_latest_release(serde_json::from_str(releases).unwrap(), "mihomo", Some("alpha-old")),
+            Some(("alpha-abc123".into(), "Prerelease-Alpha".into()))
+        );
     }
 
     #[test]

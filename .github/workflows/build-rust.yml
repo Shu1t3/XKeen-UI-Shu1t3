@@ -20,6 +20,8 @@ jobs:
           test -s "$notes" || { echo "Missing release notes: $notes"; exit 1; }
           grep -q '^## Исправления$' "$notes" || { echo "Release notes must describe fixes"; exit 1; }
           grep -q '^- ' "$notes" || { echo "Release notes must contain changes"; exit 1; }
+      - name: Test installer release selection
+        run: sh scripts/test-release-source.sh
       - uses: oven-sh/setup-bun@v2
       - name: Build frontend
         working-directory: frontend
