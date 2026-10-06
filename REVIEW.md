@@ -850,23 +850,49 @@ frontend/src/components/modals/AddOutbound.tsx:201,317.
 - **Минимальная рекомендация:** единый Rust release pipeline, убрать obsolete Go jobs,
   явный выбор production/beta и smoke-check устанавливаемых артефактов.
 
-### R33 — MEDIUM — Release не воспроизводим и не проходит обязательные проверки
+~~### R33 — MEDIUM — Release не воспроизводим и не проходит обязательные проверки~~
 
-**Статус:** Confirmed. **Категория:** dependency control / regression gates.
-**Локация:** .gitignore:12; backend/Cargo.toml; backend/Cross.toml:2,6;
-.github/workflows/build-rust.yml:17,31,34,38,60,68,101.
+~~**Статус:** Confirmed. **Категория:** dependency control / regression gates.~~
+~~**Локация:** .gitignore:12; backend/Cargo.toml; backend/Cross.toml:2,6;~~
+~~.github/workflows/build-rust.yml:17,31,34,38,60,68,101.~~
 
-- **Сценарий:** пересборка того же commit позднее или отдельно для разных архитектур.
-- **Влияние:** может получиться другой набор Rust dependencies/toolchain/build image;
-  регрессии auth/control/storage могут попасть в release без тестов.
-- **Доказательство:** Cargo.lock исключён и не хранится; Cargo commands без --locked;
-  stable/nightly и cross edge/git не закреплены; bun install без frozen.
-  В workflows нет cargo test/clippy, frontend lint и meaningful integration gates.
-  Наличие unit tests диагностики в репозитории не заменяет их запуск.
-- **Минимальная рекомендация:** хранить Cargo.lock для executable и применять --locked,
-  frozen Bun lock, закрепить toolchain/image/action revisions;
-  обязательные checks auth/control/config/update и проверка release каждой архитектуры.
-  Назначение lockfile описано в [Cargo Book](https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html).
+~~- **Сценарий:** пересборка того же commit позднее или отдельно для разных архитектур.~~
+~~- **Влияние:** может получиться другой набор Rust dependencies/toolchain/build image;~~
+~~  регрессии auth/control/storage могут попасть в release без тестов.~~
+~~- **Доказательство:** Cargo.lock исключён и не хранится; Cargo commands без --locked;~~
+~~  stable/nightly и cross edge/git не закреплены; bun install без frozen.~~
+~~  В workflows нет cargo test/clippy, frontend lint и meaningful integration gates.~~
+~~  Наличие unit tests диагностики в репозитории не заменяет их запуск.~~
+~~- **Минимальная рекомендация:** хранить Cargo.lock для executable и применять --locked,~~
+~~  frozen Bun lock, закрепить toolchain/image/action revisions;~~
+~~  обязательные checks auth/control/config/update и проверка release каждой архитектуры.~~
+~~  Назначение lockfile описано в [Cargo Book](https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html).~~
+
+**Исправлено:** Cargo.lock executable хранится в Git; Rust metadata,
+Clippy, tests и cross-сборки выполняются с --locked. Frozen Bun install,
+frontend lint/build/tests и shell-регрессии, добавленные ранее, сохранены.
+Закреплены Rust 1.99.0, nightly-2026-10-06, Bun 1.4.2, Node 26.7.0, commit cross,
+SHA Actions release workflow и digest образов ARM64/MIPS/MIPSel. Cross
+устанавливается в отдельный каталог из закреплённого commit с его lockfile,
+а не берётся из ранее восстановленного cache. Версия панели передаётся через
+build env без изменения Cargo.toml/Cargo.lock; embedded frontend использует
+deterministic timestamps.
+Push/PR запускают обязательные проверки и все три release-сборки без local-dev.
+Строгий Clippy всех targets с -D warnings работает в двух режимах; существующие
+замечания устранены без подавлений и изменения HTTP/файловых контрактов.
+Каждая архитектура запускается через runner cross с проверкой версии;
+изменение Cargo.lock запрещено. Публикация отделена от проверочного запуска,
+зависит от всех checks/builds и сохраняет prerelease. Процесс описан в docs/builds.md.
+Закреплены входы сборки; побайтовая идентичность независимых пересборок
+не доказана, host GitHub runner и инфраструктура остаются внешними.
+
+~~**Проверка:** actionlint и разбор YAML; несовместимый manifest отклонён~~
+~~с --locked без изменения исходного lockfile. Локально и в CI строгий Clippy~~
+~~и backend tests в обоих режимах: по 252 passed, 2 ignored; frontend frozen~~
+~~install, 25 passed, build и ESLint --max-warnings 0. CI run 37532326389~~
+~~на commit 11d9228 успешно собрал и запустил --version для ARM64, MIPS~~
+~~и MIPSel с закреплёнными входами; публикация штатно пропущена.~~
+~~QEMU smoke-test не заменяет испытания на реальном роутере.~~
 
 ### ~~R34 — MEDIUM — Текущий lint не запускается с зафиксированным TypeScript~~
 
@@ -987,8 +1013,8 @@ shadcn → @shadcn/registry → fast-glob → micromatch → braces.
 
 ## Приоритет исправлений и допуска
 
-Прогресс исправлений на 7 октября 2026 года: **17 из 36 подтверждённых пунктов закрыты**
-(R01, R04, R05, R06, R07, R10, R11, R12, R13, R14, R15, R16, R17, R26, R27, R28, R34), **19 остаются открытыми**. H01–H05 остаются без изменения статуса.
+Прогресс исправлений на 7 октября 2026 года: **18 из 36 подтверждённых пунктов закрыты**
+(R01, R04, R05, R06, R07, R10, R11, R12, R13, R14, R15, R16, R17, R26, R27, R28, R33, R34), **18 остаются открытыми**. H01–H05 остаются без изменения статуса.
 Исторические результаты первоначального аудита выше сохранены; актуальные результаты
 повторных проверок приведены у исправленных пунктов.
 
