@@ -1,0 +1,717 @@
+# Аудит XKeen UI для корпоративного парка роутеров
+
+Дата: 6 октября 2026 года. Проверенный commit: d6216d58a833e02561c97d06aea6d9f7ddd924e4.
+Репозиторий: Shu1t3/XKeen-UI-Shu1t3. Рабочий каталог: /Users/shu1t3/Documents/XKeen-UI-Shu1t3.
+Все позиции файлов ниже указаны относительно корня, номера строк относятся к этому commit.
+
+## Решение для эксплуатации
+
+**Массовое развёртывание текущей версии на сотнях корпоративных роутеров не рекомендовано.**
+Обнаружены пути исполнения произвольных команд, обхода сетевых границ и авторизации,
+ошибочной записи на другое устройство, потери конфигов и отключения работающего DNS/ядра.
+Отдельный существенный риск форка: установка и самообновление продолжают получать upstream-панель.
+
+Это техническое ревью локального исходного кода. Оно не заменяет внутреннее согласование компании,
+проверку настроек сети или приёмочные испытания на реальных устройствах. Участие автора форка
+в команде кибербезопасности не требуется для чтения кода и работы с этим отчётом;
+порядок допуска в эксплуатацию определяется компанией.
+
+В ходе исходного аудита реализация не изменялась: был создан только этот отчёт.
+Последующие исправления и проверки отмечены ниже. Реальные роутеры, сервисы /opt
+и публикация релизов не затрагивались.
+
+## Область и доказательства
+
+Проверены серверные маршруты, auth, управление процессами, настройки, конфиги, DNS, relay,
+WebSocket, установка, обновления, бэкапы, диагностические движки Xray/Mihomo и их кэши.
+На frontend проверены API/store, массовые операции, редактор, GUI конфигурации, генератор
+аутбаундов, импорт, обновления, провайдеры и журналы; также release workflows, manifests и lockfile.
+Визуальные компоненты рассматривались преимущественно как вызывающий контекст этих операций.
+
+Статусы:
+
+- **Confirmed** — дефект подтверждён воспроизведением, результатом проверки либо строгой цепочкой кода.
+  Это не означает, что каждый дефект эксплуатировался через запущенный Rust-сервер.
+- **Probable** — существенное подозрение с установленными предпосылками, но неполным подтверждением.
+- **Hypothesis** — требуется дополнительная проверка. Такие пункты вынесены отдельно.
+
+Severity учитывает корпоративную эксплуатацию: CRITICAL — исполнение команд/захват устройства;
+HIGH — серьёзная компрометация или потеря сервиса/целостности; MEDIUM — ограниченный отказ,
+ошибочное состояние или существенный пробел контроля; LOW — локальный дефект диагностики.
+Для сетевых находок необходим доступ к порту панели. Доступность порта из Интернета не предполагалась.
+Root-права следуют из обычного запуска через Entware init без смены пользователя;
+если конкретная установка снижает UID, последствия исполнения команд ограничиваются этим UID.
+
+### Выполненные проверки
+
+Зависимости и сборка запускались в отдельной временной копии frontend, без node_modules или
+генерируемых файлов в репозитории. Использован Bun 1.4.2 через npx, Node 26.7.0.
+
+| Проверка | Результат и предел доказательства |
+| --- | --- |
+| sh -n setup.sh | PASS, синтаксическая проверка; совместимость со всеми вариантами BusyBox ash этим не доказана |
+| bun install --frozen-lockfile | PASS, установлены 595 пакетов из текущего frontend/bun.lock |
+| bun run build | PASS: TypeScript и Vite 8.3.3 завершились успешно |
+| bun run lint | FAIL, exit 2: typescript-eslint does not support TS 7.0; R34 |
+| bun audit | FAIL, exit 1: одно high advisory для braces 3.0.3 в цепочке shadcn; применимость к runtime отдельно ниже |
+| cargo test --manifest-path backend/Cargo.toml | Не выполнено: cargo отсутствует, exit 127 |
+| Извлечённая функция download_files с подставным curl | PASS воспроизведения дефекта: обрыв загрузки заменил прежний рабочий файл текстом PARTIAL; R14 |
+| Точная подстановка name_client в безопасный временный init-скрипт | PASS воспроизведения дефекта: shell создал только временный marker с текстом audited; R01 |
+| Извлечённые getMassTargets и remote resolver | PASS воспроизведения дефекта: пустые цели дают local, неизвестный remote даёт null; R07 |
+| Извлечённый reducer SAVE_CONFIG | PASS воспроизведения дефекта: завершение сохранения A заменяет правки B содержимым A; R08 |
+| Извлечённые WebSocket cleanup/onclose | PASS воспроизведения дефекта: после cleanup остаётся новый reconnect timer; R27 |
+| Разбор URL relay в Node | PASS: строка порта 80@example.invalid создаёт hostname example.invalid; полный reqwest-запрос не выполнялся; R05 |
+| Реальный outboundParser.js и YAML parser | PASS воспроизведения дефекта: пароль с переводом строки добавляет skip-cert-verify: true, числовой пароль становится number; R31 |
+| Extracted appendLines с DOM stub | PASS воспроизведения дефекта: 1100 строк при cap=1000 и autoscroll=false, trim не вызван; R28 |
+| Модель точного string-prefix условия tar validator | PASS: принимаются /opt/etc/xkeen-extra.json, /opt/etc/xray/configs-extra.json, /opt/etc/mihomo-extra.yaml; Rust restore не запускался; R22 |
+
+Промежуточные npm install без обхода peer-проверок также завершились ERESOLVE:
+typescript-eslint 8.71.1 требует TypeScript ниже 6.1, проект фиксирует 7.0.2.
+Основной менеджер проекта — Bun; успешная установка Bun и успешная сборка отдельно подтверждены.
+
+Не подтверждены: сборка Rust, прохождение Rust unit tests, cross-build ARM/MIPS,
+реальная работа Entware/RCI, время восстановления после сбоя, ресурсные лимиты устройств,
+полные браузерные интеграционные сценарии и нагрузка сотен устройств.
+Изолированные PoC проверяют соответствующие функции/преобразования, а не весь deployed endpoint.
+
+## Находки
+
+### R01 — CRITICAL — Произвольная команда через выбор ядра
+
+**Статус:** Fixed (6 октября 2026 года; исходная находка Confirmed). **Категория:** command injection / управление процессами.
+**Локация:** backend/src/controller.rs:267,292,319; дополнительно :124,129,146; setup.sh:198.
+
+- **Сценарий:** POST /api/control с action=switchCore и core, содержащим shell command substitution.
+  Значение вставляется в name_client="..." и init-скрипт запускается. При auth=false сессия не требуется.
+- **Влияние:** исполнение команд с правами панели, в типичной Entware-установке root.
+  softRestart также допускает произвольный executable/path и SIGKILL процессов с произвольным comm;
+  setgid(11111) не снижает UID.
+- **Доказательство:** отсутствует allowlist; content.replace использует req.core непосредственно.
+  Безопасный временный PoC с core=$(printf audited > временный_marker) подтвердил исполнение
+  при shell assignment. check_core_config пропускает неизвестные имена.
+- **Минимальная рекомендация:** типизированный enum Xray/Mihomo на входе до любых stop/write/kill/spawn;
+  использовать фиксированные пути команд и не формировать shell-код из внешних значений.
+
+**Исправление:** `ControlReq.core` десериализуется в enum Xray/Mihomo. Неизвестное,
+пустое или некорректное значение отклоняется JSON extractor с HTTP 422; отсутствующее
+или null-ядро для switchCore/softRestart возвращает success=false до stop/write/kill/spawn.
+В init-скрипт подставляется только фиксированное имя из enum. softRestart использует
+фиксированные пути `/opt/sbin/xray` и `/opt/sbin/mihomo` (в local-dev — соответствующий
+локальный корень); внутренний строковый вызов также проверяется до поиска PID.
+check_core_config больше не пропускает неизвестные ядра. UID/GID-политика не изменена:
+это исправление ввода и выбора команд, а не внедрение privilege separation.
+
+**Проверка:** добавлены 3 регрессионных теста, включая настоящий HTTP endpoint без
+local-dev blocker. Проверены shell substitutions `$()`/backticks, разрыв кавычек,
+пути `/bin/sh`/`../xray`, имя постороннего процесса, Unicode, неверный регистр,
+перевод строки, пустое/отсутствующее/null-значение; init-файл, его permissions и
+состояние остаются неизменными, stop-скрипт и injected marker не запускаются.
+Допустимые имена сохраняют совместимость; no-op переключение проверено для обоих ядер.
+`cargo test` и `cargo test --features local-dev`: в каждом 177 passed, 0 failed,
+2 ignored (имеющиеся тесты с внешними MMDB-файлами). Проверка запуска настоящих ядер
+и cross-build ARM/MIPS на роутере не выполнялась. Связанные дефекты R09/R10 остаются открытыми.
+
+### R02 — HIGH — Открытая авторизация по умолчанию и fail-open при ошибке настроек
+
+**Статус:** Confirmed. **Категория:** authentication / insecure defaults.
+**Локация:** backend/src/types.rs:202; backend/src/auth.rs:280; backend/src/main.rs:530,532,573.
+
+- **Сценарий:** первая установка либо нечитаемый/повреждённый xkeen-ui.json после сбоя.
+  load_settings возвращает Default, auth.enabled=false, middleware пропускает административные запросы.
+- **Влияние:** доступный сетевой клиент получает конфиги, управление процессами, обновления,
+  бэкапы и очистку логов без входа. Повреждение настроек после перезапуска снимает ранее включённую защиту.
+- **Доказательство:** Default для bool равен false; ошибки чтения/десериализации приводят к default.
+  Сервер слушает 0.0.0.0, CORS permissive.
+- **Минимальная рекомендация:** защищённый first-run enrollment; ошибки существующего auth config
+  должны закрывать доступ или останавливать запуск, а не отключать защиту. Явная настройка management bind.
+
+### R03 — HIGH — Массовое управление требует отключения auth и использует HTTP
+
+**Статус:** Confirmed. **Категория:** fleet authentication / transport.
+**Локация:** frontend/src/lib/multi-routers/actions.ts:5,37; model.ts:29,42; frontend/src/lib/api.ts:38.
+
+- **Сценарий:** администратор добавляет удалённые панели для массового применения.
+  Панели с auth исключаются; UI предлагает отключить auth в LAN. Все endpoints строятся как http://host:port.
+- **Влияние:** fleet-функция опирается на открытые административные API, конфиги передаются незашифрованно.
+  Любой клиент с сетевым доступом к этим панелям может ими управлять.
+- **Доказательство:** isRouterSelectable блокирует remote с auth=true; межхостовая аутентификация отсутствует;
+  routerBaseUrl жёстко использует HTTP. Из HTTPS-панели эти запросы также попадают под mixed-content ограничения.
+- **Минимальная рекомендация:** аутентификация каждого устройства и HTTPS, либо защищённый management gateway.
+  Не использовать отключённую авторизацию как корпоративный режим массового управления.
+
+### R04 — HIGH — HTML из журналов исполняется в origin панели
+
+**Статус:** Confirmed. **Категория:** stored XSS.
+**Локация:** backend/src/logger.rs:39,97; backend/src/api_relay.rs:287,294;
+backend/src/configs.rs:237; frontend/src/components/log/LogPanel.tsx:90,105.
+
+- **Сценарий:** в отображаемую строку попадает HTML с обработчиком события, например img/onerror.
+  Конкретный источник — тело ошибки upstream relay либо вывод валидатора импортированного конфига.
+- **Влияние:** произвольный JavaScript может отправлять административные запросы с сессией открывшего
+  журнал пользователя и обращаться к сохранённым удалённым панелям. HttpOnly не блокирует такие запросы.
+- **Доказательство:** logger сохраняет исходные угловые скобки, добавляет HTML-обёртку;
+  WebSocket передаёт результат, frontend вставляет innerHTML/insertAdjacentHTML без sanitization.
+  Требуется возможность влиять на строку лога; это не утверждение, что любой сетевой пакет даст XSS.
+- **Минимальная рекомендация:** structured plain text и безопасный React-render;
+  при сохранении HTML-формата экранировать весь исходный текст до добавления доверенной разметки.
+
+### R05 — HIGH — Поле порта relay выводит запрос за loopback и передаёт cookie
+
+**Статус:** Confirmed. **Категория:** SSRF / credential forwarding.
+**Локация:** backend/src/api_relay.rs:209,260,309,340.
+
+- **Сценарий:** X-Clash-Port содержит 80@example.invalid.
+  build_url формирует http://127.0.0.1:80@example.invalid/proxies: 127.0.0.1:80 становится userinfo,
+  фактический hostname — example.invalid. Аналогичная строка порта применяется в WS relay.
+- **Влияние:** сетевой запрос к произвольному upstream вместо loopback; Cookie панели пересылается,
+  поскольку отсутствует в фильтре. Числовой порт дополнительно открывает доступ к произвольным локальным HTTP-сервисам.
+- **Доказательство:** resolve_clash_target принимает String без разбора порта; URL собирается format;
+  should_forward_header пропускает cookie. URL-семантика подтверждена Node-проверкой;
+  end-to-end reqwest-тест ограничен отсутствием Rust.
+- **Минимальная рекомендация:** parse u16 с запретом 0, фиксированный host через URL builder,
+  допустимые management ports, ограниченная redirect policy; не пересылать UI Cookie и upstream Set-Cookie.
+
+### R06 — HIGH — Обход ограничения попыток входа
+
+**Статус:** Confirmed. **Категория:** authentication / resource exhaustion.
+**Локация:** backend/src/auth.rs:33,153,157,194,198.
+
+- **Сценарий:** прямой клиент меняет X-Real-IP/X-Forwarded-For для каждой попытки.
+  Параллельные запросы также проходят проверку до увеличения счётчика.
+- **Влияние:** заявленное ограничение пяти попыток не защищает от перебора;
+  неконтролируемая параллельность Argon2 нагружает память/CPU слабого роутера.
+- **Доказательство:** заголовок без проверки trusted proxy становится ключом BRUTE_CACHE;
+  счётчик увеличивается только после spawn_blocking verify_password.
+- **Минимальная рекомендация:** peer IP по умолчанию; forwarded headers только от configured trusted proxy;
+  резервировать попытку до хеширования и ограничивать concurrency парольных операций.
+
+### R07 — HIGH — Пустая или исчезнувшая remote-цель превращается в локальный роутер
+
+**Статус:** Confirmed. **Категория:** fleet target integrity.
+**Локация:** frontend/src/components/configuration/ConfigPanel.tsx:294,552;
+frontend/src/lib/multi-routers/store.ts:67; actions.ts:84; frontend/src/lib/api.ts:18,115.
+
+- **Сценарий:** выбраны только remote, они стали offline и refreshAllOnline очистил выбор.
+  getMassTargets возвращает local. Другой вариант: remote удалён после получения списка целей,
+  но до выполнения подтверждённого запроса; неизвестный ID разрешается в null.
+- **Влияние:** запись/перезапуск локального роутера, хотя он не был выбран;
+  результат может учитываться как успешная операция удалённого устройства.
+- **Доказательство:** null означает /api, а не ошибку. Извлечённые функции воспроизвели обе подмены.
+- **Минимальная рекомендация:** пустой выбор запрещает операцию, неизвестный ID вызывает ошибку;
+  фиксировать immutable список id+URL до подтверждения, затем проверять идентичность устройства.
+
+### R08 — HIGH — Завершение Save/Apply повреждает другую вкладку и неверно снимает dirty
+
+**Статус:** Confirmed. **Категория:** asynchronous state / data integrity.
+**Локация:** frontend/src/components/configuration/ConfigPanel.tsx:516,527,642,648;
+frontend/src/lib/store.ts:109.
+
+- **Сценарий:** сохранение A ожидает сеть, пользователь переходит на B; ответ A применён
+  через текущие activeIndexRef/editorRef. Также успешное сохранение только на remote помечает
+  локальный исходный конфиг сохранённым, хотя локальный файл не записывался.
+- **Влияние:** содержимое и savedContent B заменяются A, правки B теряются;
+  следующий save может распространить неправильное содержимое. Remote-only save создаёт ложный локальный baseline.
+- **Доказательство:** cfg захвачен до await, индекс читается после; reducer заменяет content/savedContent
+  и isDirty=false. Извлечённый reducer подтвердил потерю B. Для remote-only достаточно results.some(ok).
+- **Минимальная рекомендация:** завершать по стабильному file ID и revision; сохранить новые правки;
+  отдельно учитывать сохранение на каждом устройстве; локальный baseline менять только после local commit.
+
+### R09 — HIGH — Системный DNS сохраняется до готовности Mihomo
+
+**Статус:** Confirmed. **Категория:** DNS state transition / availability.
+**Локация:** backend/src/dns.rs:213,226,280,293,307;
+frontend/src/components/configuration/mihomo/DnsPanel.tsx:360.
+
+- **Сценарий:** setup_filter=true: удаляются DoH/DoT и name-server, задаётся br0:53,
+  включается override, конфигурация роутера сохраняется. Затем YAML не записался либо frontend не смог reload Mihomo.
+- **Влияние:** устойчивое нарушение DNS, внутренних доменов и, в зависимости от канала управления, удалённого доступа.
+- **Доказательство:** RCI шаги выполнены перед записью YAML; ошибка записи только логируется,
+  ответ success=true. Активация выполняется отдельным последующим браузерным запросом, rollback отсутствует.
+- **Минимальная рекомендация:** snapshot исходных DNS-настроек, validate/write/reload Mihomo и
+  проверка DNS listener до изменения системного DNS; rollback на любой неуспешной стадии.
+
+### R10 — HIGH — Переключение ядра выключает рабочий сервис до предварительной проверки
+
+**Статус:** Confirmed. **Категория:** service state transition.
+**Локация:** backend/src/controller.rs:269,289,300,302,319.
+
+- **Сценарий:** рабочий Mihomo переключается на установленный Xray без JSON-конфигов.
+- **Влияние:** старое ядро остановлено, новое не запускается; ранее рабочая маршрутизация потеряна.
+- **Доказательство:** stop, запись init и замена state.core предшествуют check_core_config.
+  Проверка возвращает ошибку, восстановление прежнего init/state/start не выполняется.
+- **Минимальная рекомендация:** проверить binary и полный config нового ядра до stop;
+  сериализовать переключение и восстанавливать прошлое рабочее состояние при ошибке.
+
+### R11 — HIGH — Установка и самообновление форка получают upstream
+
+**Статус:** Confirmed. **Категория:** release ownership / fleet integrity.
+**Локация:** README.md; setup.sh:53,60; backend/src/main.rs:302;
+backend/src/updater.rs:64,68; frontend/src/components/modals/Update.tsx:21.
+
+- **Сценарий:** использовать опубликованную установочную команду, CLI setup или самообновление панели.
+- **Влияние:** устанавливается zxc-rv/XKeen-UI, а не корпоративный форк;
+  последующее обновление может удалить внесённые в форк исправления на всех устройствах.
+- **Доказательство:** owner/repository жёстко задан в README, installer, CLI, backend и frontend.
+  Настройки позволяют менять репозитории ядер, но не self.
+- **Минимальная рекомендация:** единый release source форка для всех путей;
+  явно разделить production/beta и запретить тихий fallback панели на другой owner.
+
+### R12 — HIGH — Бинарники от сторонних прокси не имеют независимой проверки подлинности
+
+**Статус:** Confirmed. **Категория:** supply chain / update trust boundary.
+**Локация:** backend/src/types.rs:151; backend/src/updater.rs:196,261,437,558;
+setup.sh:78; .github/workflows/build-rust.yml:121.
+
+- **Сценарий:** прямой GitHub недоступен, обновление приходит через один из default HTTP download gateways;
+  gateway подменяет бинарник/архив либо отдаёт неправильный артефакт.
+- **Влияние:** установка чужого executable с правами панели/ядра на корпоративных устройствах.
+- **Доказательство:** сертификат HTTPS подтверждает gateway, но не автора артефакта.
+  Self проверяет только размер и ELF magic; ядра распаковываются без подписи/доверенного digest;
+  release workflow не выпускает подписанный manifest. Факт компрометации gateway не утверждается.
+- **Минимальная рекомендация:** подписанный manifest с версией, архитектурой и хешами,
+  закреплённый verification key; проверять до замены. Хеш, полученный через тот же недоверенный gateway,
+  не является независимым подтверждением.
+
+### R13 — HIGH — Обновление не восстанавливает рабочую версию после отказа запуска
+
+**Статус:** Confirmed. **Категория:** update transaction / rollback.
+**Локация:** backend/src/updater.rs:558,613,623,630,634,640,652.
+
+- **Сценарий:** скачанный архив распаковывается, но новое ядро несовместимо с устройством/конфигом;
+  либо fallback-копирование не удалось после stop.
+- **Влияние:** рабочий бинарник заменён, старый процесс остановлен, устройство остаётся без ядра.
+  В fallback ошибка start игнорируется и возможен success=true.
+- **Доказательство:** распаковка принимает любые bytes, backup copy errors игнорируются;
+  после failed soft_restart старый binary не восстанавливается. Fallback stop/start results игнорируются.
+  Update mutex и отдельные уникальные work dirs отсутствуют; одновременные запросы делят temp names.
+- **Минимальная рекомендация:** lock на update, уникальная staging directory, проверка architecture/version/config,
+  гарантированный backup, проверка старта и rollback. Для self нужен аналогичный механизм восстановления.
+
+### R14 — HIGH — Обрыв загрузки установщика уничтожает прежний бинарник
+
+**Статус:** Confirmed. **Категория:** installer availability / non-atomic replacement.
+**Локация:** setup.sh:78,109,124,132,137.
+
+- **Сценарий:** update останавливает панель, curl начинает писать прямо в /opt/sbin/xkeen-ui
+  и завершается с ошибкой сети/диска.
+- **Влияние:** рабочая версия потеряна; панель остановлена и не может запуститься без внешнего восстановления.
+- **Доказательство:** прямой curl -o live target, нет backup/staging/rollback.
+  Извлечённая download_files с mock curl, пишущим PARTIAL и возвращающим 18, завершилась exit 1;
+  старое содержимое исчезло.
+- **Минимальная рекомендация:** скачать/проверить во временный файл на том же filesystem до stop;
+  atomic replace с резервной копией и восстановлением при любой ошибке.
+
+### R15 — HIGH — Циклический classical provider вызывает неограниченную рекурсию
+
+**Статус:** Confirmed. **Категория:** input handling / process availability.
+**Локация:** backend/src/route_test/providers.rs:423,495;
+backend/src/route_test/mihomo.rs:704,752,861; backend/src/route_test/mod.rs:435.
+
+- **Сценарий:** provider A с behavior=classical содержит RULE-SET,A;
+  верхнее правило RULE-SET,A,PROXY запускается при диагностике маршрута.
+- **Влияние:** синхронная рекурсивная обработка без границ истощает стек/ресурсы процесса панели.
+  Timeout не прерывает путь, который не отдаёт управление scheduler.
+- **Доказательство:** parse_predicate принимает вложенный RuleSet, затем цикл
+  eval_predicate → eval_ruleset → ClassicalProvider.matches → eval_predicate; visited/depth guard отсутствует.
+  Полный crash-test Rust не запускался. [Classical parser Mihomo](https://raw.githubusercontent.com/MetaCubeX/mihomo/Alpha/rules/provider/classical_strategy.go)
+  отклоняет MATCH/RULE-SET/SUB-RULE, поэтому поведение тестера расходится с ядром.
+- **Минимальная рекомендация:** ограничения parser как у ядра, плюс cycle/depth guard для вложенной оценки.
+
+### R16 — MEDIUM — Live-конфигурации записываются через truncate без атомарного commit
+
+**Статус:** Confirmed. **Категория:** storage integrity / concurrency.
+**Локация:** backend/src/configs.rs:197,247,284.
+
+- **Сценарий:** ENOSPC, ошибка I/O или отключение питания после открытия существующего файла;
+  либо две операции одновременно валидируют общий набор Xray-конфигов и затем изменяют разные части.
+- **Влияние:** потеря рабочей версии/частичный файл; отдельно корректные validation snapshots
+  не гарантируют корректность конечного сочетания конфигов.
+- **Доказательство:** fs::write непосредственно в target; validation+commit не сериализованы.
+- **Минимальная рекомендация:** общий lock на snapshot/validation/commit,
+  staged write+sync+atomic rename и сохранение предыдущей рабочей версии.
+
+### R17 — MEDIUM — Ненулевой exit status init-команды учитывается как успех
+
+**Статус:** Confirmed. **Категория:** error handling / fleet result accuracy.
+**Локация:** backend/src/controller.rs:72,88,92.
+
+- **Сценарий:** start/restart/stop выполнен, но init-скрипт завершился с ненулевым кодом.
+- **Влияние:** API и массовая операция показывают успех при реально неработающем сервисе.
+- **Доказательство:** Command.status возвращает Ok(ExitStatus), код проверяет только Err и возвращает Ok.
+- **Минимальная рекомендация:** проверить status.success(), сообщить exit code и
+  после start/restart проверить состояние процесса/готовность сервиса.
+
+### R18 — MEDIUM — GUI Xray игнорирует неудачную запись конфигурации
+
+**Статус:** Confirmed. **Категория:** API contract / false acknowledgement.
+**Локация:** frontend/src/components/configuration/xray/GuiRouting.tsx:182,187,201,206;
+GuiLog.tsx:108,112,123,128.
+
+- **Сценарий:** autoApply включён; PUT configs возвращает success=false, например при ошибке диска.
+- **Влияние:** UI снимает dirty и выполняет restart со старым файлом; может сообщить
+  «Изменения применены». Даже failed restart заканчивается serviceStatus=running.
+- **Доказательство:** результат PUT не проверяется перед SAVE_CONFIG; состояние running выставляется независимо от r.success.
+- **Минимальная рекомендация:** проверять save response до baseline/restart; сохранять dirty при ошибке;
+  получать фактический статус после управления.
+
+### R19 — MEDIUM — Auth и настройки публикуются до подтверждённого сохранения
+
+**Статус:** Confirmed. **Категория:** persistence / state consistency.
+**Локация:** backend/src/settings.rs:66,68,74;
+backend/src/auth.rs:311,328,339.
+
+- **Сценарий:** PATCH settings или setup/login/reset столкнулся с I/O-ошибкой.
+- **Влияние:** при settings API возвращает ошибку, но live auth/settings уже изменены;
+  auth helpers вообще подавляют ошибку сохранения. После рестарта возвращается старое состояние,
+  включая пароль/сессии, о которых пользователь получил другое подтверждение.
+- **Доказательство:** изменение state предшествует write/rename; save_auth_to_config возвращает (),
+  write/rename errors не передаются вызывающему.
+- **Минимальная рекомендация:** сначала commit validated/normalized state на диск, затем publish в память;
+  возвращать ошибку caller и не выдавать подтверждение успешной auth-операции без persistence.
+
+### R20 — MEDIUM — Restore бэкапа не возвращает согласованный снимок состояния
+
+**Статус:** Confirmed. **Категория:** recovery / storage contract.
+**Локация:** backend/src/backuper.rs:127,249,279,283,295;
+backend/src/auth.rs:328; backend/src/main.rs:424.
+
+- **Сценарий:** после бэкапа добавлен Xray JSON с ошибкой; restore перезаписал старые файлы,
+  но новый JSON остался. Либо восстанавливается xkeen-ui.json с другими auth/settings.
+- **Влияние:** «восстановленный» набор остаётся нерабочим/отличается от snapshot;
+  UI продолжает использовать прежние settings и rci_token. Последующее сохранение auth может
+  перезаписать восстановленный auth. Ошибка в середине restore оставляет смесь версий.
+- **Доказательство:** только File::create/io::copy по entries, отсутствует удаление лишних managed files,
+  staging, app_config_lock и reload state; missing requested categories проверяются после записей.
+- **Минимальная рекомендация:** определить snapshot/merge контракт; для recovery использовать manifest,
+  preflight всех категорий, staged commit с rollback, синхронизацию live state и безопасную активацию.
+
+### R21 — MEDIUM — Параллельные бэкапы используют один temporary archive
+
+**Статус:** Confirmed. **Категория:** backup concurrency.
+**Локация:** backend/src/backuper.rs:118,214,220,229,612.
+
+- **Сценарий:** две вкладки/клиента запускают backup в одну секунду, пока итоговый tar ещё не создан.
+- **Влияние:** архив может быть повреждён или одна операция публикует inode, который другая продолжает менять;
+  ответ первой операции не гарантирует целостность опубликованного backup.
+- **Доказательство:** next_backup_name проверяет только exists конечного имени;
+  оба spawn_blocking могут выбрать одинаковые final_path/temp_path, File::create truncate общий файл.
+- **Минимальная рекомендация:** уникальный temporary file с create_new и UUID,
+  атомарная резервация конечного имени либо backup mutex; проверка готового tar до публикации.
+
+### R22 — MEDIUM — Tar allowlist проверяет строковый префикс без границы каталога
+
+**Статус:** Confirmed. **Категория:** archive path boundary.
+**Локация:** backend/src/backuper.rs:424,471,475,480.
+
+- **Сценарий:** на устройство помещён специально подготовленный backup с записью
+  opt/etc/xkeen-extra.json или opt/etc/mihomo-extra.yaml; затем выполняется restore.
+- **Влияние:** запись вне заявленных каталогов восстановления.
+  Это условный путь через уже доступный на диске архив, upload endpoint в приложении не найден.
+- **Доказательство:** strip_prefix("opt/etc/xkeen") принимает также "opt/etc/xkeen-extra.json";
+  остаток не содержит '/', extension проходит; target становится абсолютным путём исходной записи.
+  Изолированная модель точных условий подтвердила три примера.
+- **Минимальная рекомендация:** Path.strip_prefix с проверкой компонентов и ровно одного filename,
+  либо строгое требование prefix+"/"; проверять symlink и конечный resolved target.
+
+### R23 — MEDIUM — DNS пишет первый YAML вместо фактически используемого конфига
+
+**Статус:** Confirmed. **Категория:** configuration targeting.
+**Локация:** backend/src/dns.rs:187,293.
+
+- **Сценарий:** рядом с config.yaml в /opt/etc/mihomo находится provider.yaml или другой YAML.
+- **Влияние:** возможна перезапись provider-файла полной конфигурацией;
+  основной runtime config остаётся прежним. Порядок read_dir не задаёт выбора config.yaml.
+- **Доказательство:** find_mihomo_config возвращает первую запись с extension=yaml без проверки имени.
+- **Минимальная рекомендация:** единый явный путь active config для read/validate/write/reload.
+
+### R24 — MEDIUM — Отключение DNS уничтожает корпоративные resolver-настройки
+
+**Статус:** Confirmed. **Категория:** DNS recovery / configuration preservation.
+**Локация:** backend/src/dns.rs:241,330,338,351.
+
+- **Сценарий:** включить DNS с setup_filter, затем отключить функцию.
+- **Влияние:** исходные корпоративные name-server/DoH/DoT не возвращаются;
+  все name-server заменяются на 77.88.8.8, внутренние домены могут перестать разрешаться.
+- **Доказательство:** enable удаляет исходные настройки без snapshot; disable использует hardcoded public resolver.
+- **Минимальная рекомендация:** восстановление исходного snapshot либо явно настроенный corporate fallback.
+
+### R25 — MEDIUM — Две setup-заявки одновременно получают действующие сессии
+
+**Статус:** Confirmed. **Категория:** enrollment race.
+**Локация:** backend/src/auth.rs:109,112,125,132.
+
+- **Сценарий:** две заявки проходят password_hash.is_none до завершения Argon2.
+- **Влияние:** последняя меняет пароль, сессии обеих заявок остаются; первый enrollment
+  не гарантирует единственного владельца.
+- **Доказательство:** проверка до await, повторной проверки внутри update_auth нет.
+- **Минимальная рекомендация:** атомарное enrollment состояние/lock и повторная проверка перед commit;
+  только победитель получает сессию.
+
+### R26 — MEDIUM — Logout/reset/expiration не отзывают открытые WebSocket
+
+**Статус:** Confirmed. **Категория:** session revocation.
+**Локация:** backend/src/main.rs:512; backend/src/auth.rs:246,264;
+backend/src/websocket.rs:156,185; backend/src/api_relay.rs:129.
+
+- **Сценарий:** клиент держит /ws или /clash-ws открытым, сессия отозвана/истекла.
+- **Влияние:** прежняя сессия продолжает получать данные и выполнять доступные WS команды,
+  в частности очистку журналов.
+- **Доказательство:** auth проверяется при HTTP upgrade; loops не связаны с дальнейшим состоянием сессии.
+- **Минимальная рекомендация:** session-bound connections с cancellation/revocation,
+  закрытие при logout/reset и достижении expiration.
+
+### R27 — MEDIUM — Некорректный lifecycle WebSocket вызывает reconnect и теряет watcher
+
+**Статус:** Confirmed. **Категория:** resource lifecycle / concurrency.
+**Локация:** frontend/src/lib/websocket.ts:48,73;
+backend/src/websocket.rs:91,152,223,236.
+
+- **Сценарий:** frontend cleanup вызывает close после очистки timer, onclose создаёт новый reconnect.
+  На backend failed initial send выходит без decrement; последний disconnect может остановить
+  watcher после подключения нового клиента.
+- **Влияние:** обращения и соединения после unmount/logout, лишняя нагрузка;
+  постоянно живущий watcher либо отсутствие live log updates у подключённого клиента.
+- **Доказательство:** извлечённые callbacks подтвердили новый timer после cleanup.
+  Backend interleaving: fetch_sub=1 → новый fetch_add/проверка existing watcher → старый take/abort.
+- **Минимальная рекомендация:** frontend active flag, снять handlers до close, отменять timers;
+  backend RAII cleanup на всех выходах и единый lifecycle lock для счётчика и watcher.
+
+### R28 — MEDIUM — Лог растёт без cap после прокрутки вверх
+
+**Статус:** Confirmed. **Категория:** browser memory lifecycle.
+**Локация:** frontend/src/components/log/LogPanel.tsx:97,104,107,160.
+
+- **Сценарий:** пользователь прокручивает журнал вверх, пока продолжается поток сообщений.
+- **Влияние:** linesRef и DOM неограниченно увеличиваются; длительная сессия может зависнуть/исчерпать память браузера.
+- **Доказательство:** trimToCap вызывается только при autoScroll=true.
+  Callback replay: 1100 cached/DOM lines при MAX_LINES=1000, trimCalls=0.
+- **Минимальная рекомендация:** bounded buffer независимо от autoscroll,
+  сохранение viewport отдельно от retention.
+
+### R29 — MEDIUM — Тестер Mihomo игнорирует режимы direct/global
+
+**Статус:** Confirmed. **Категория:** diagnostic routing semantics.
+**Локация:** backend/src/route_test/mihomo.rs:1308,1338,1477.
+
+- **Сценарий:** mode=direct и правило DOMAIN,example.com,PROXY.
+- **Влияние:** тестер показывает PROXY, хотя режим требует DIRECT;
+  диагностика может направить администратора к неправильным изменениям политик.
+- **Доказательство:** Engine не содержит mode, build_engine его не читает,
+  evaluate всегда обходит rules. [Семантика режимов Mihomo](https://wiki.metacubex.one/en/config/general/)
+  различает direct/global/rule. Runtime mode может также изменяться через API.
+- **Минимальная рекомендация:** учитывать эффективный mode, при наличии API читать live состояние;
+  явно показывать ограничения snapshot-диагностики.
+
+### R30 — MEDIUM — Provider cache не учитывает behavior и format
+
+**Статус:** Confirmed. **Категория:** cache correctness.
+**Локация:** backend/src/route_test/providers.rs:642,651,658,660,671.
+
+- **Сценарий:** два provider definitions используют один path с разным behavior,
+  либо behavior/format меняется при неизменном файле.
+- **Влияние:** диагностика использует matcher/декодирование прежнего типа.
+- **Доказательство:** cache key=(path,mtime); hit возвращается до использования
+  behavior/mrs_behavior. Обращения продлевают idle TTL.
+- **Минимальная рекомендация:** включить все параметры интерпретации в ключ и инвалидировать кэш при смене конфигурации.
+
+### R31 — MEDIUM — Ручной YAML serializer меняет пароль и допускает внедрение полей
+
+**Статус:** Confirmed. **Категория:** import integrity / configuration injection.
+**Локация:** frontend/src/lib/outboundParser.js:9,139,254,357;
+frontend/src/components/modals/AddOutbound.tsx:201,317.
+
+- **Сценарий:** импорт hysteria2 ссылки с percent-encoded переводом строки в пароле,
+  например пароль из двух строк: a и skip-cert-verify: true.
+- **Влияние:** пароль меняется на a, новая строка становится самостоятельным YAML полем,
+  отключающим TLS verification. Чисто числовой пароль теряет тип string.
+- **Доказательство:** реальные generateConfigForCore и YAML parser воспроизвели оба результата.
+  toYaml интерполирует strings без безопасного quoting; quotes применяются только к name,
+  второй serializer формы подписки также не экранирует keys/scalars.
+- **Минимальная рекомендация:** штатный YAML serializer с сохранением типов и безопасным quoting,
+  validation parsed generated object перед добавлением в конфиг.
+
+### R32 — MEDIUM — Tag pipeline всё ещё собирает отсутствующий Go-проект
+
+**Статус:** Confirmed. **Категория:** release automation.
+**Локация:** .github/workflows/build-go.yml:3,39,53,58;
+.github/workflows/build-rust.yml:3,123; setup.sh:54.
+
+- **Сценарий:** публикация обычного v* tag в форке или ожидание latest после ручной Rust-сборки.
+- **Влияние:** автоматическая tag-сборка падает на отсутствующих main.go/version.js/root static files;
+  рабочие Rust jobs запускаются только вручную и всегда отмечают release prerelease.
+- **Доказательство:** перечисленные Go/static inputs отсутствуют в git inventory;
+  Rust trigger только workflow_dispatch, prerelease=true. Default installer ищет latest.
+  [GitHub Releases](https://docs.github.com/en/rest/releases/releases#create-a-release)
+  не допускает prerelease в latest.
+- **Минимальная рекомендация:** единый Rust release pipeline, убрать obsolete Go jobs,
+  явный выбор production/beta и smoke-check устанавливаемых артефактов.
+
+### R33 — MEDIUM — Release не воспроизводим и не проходит обязательные проверки
+
+**Статус:** Confirmed. **Категория:** dependency control / regression gates.
+**Локация:** .gitignore:12; backend/Cargo.toml; backend/Cross.toml:2,6;
+.github/workflows/build-rust.yml:17,31,34,38,60,68,101.
+
+- **Сценарий:** пересборка того же commit позднее или отдельно для разных архитектур.
+- **Влияние:** может получиться другой набор Rust dependencies/toolchain/build image;
+  регрессии auth/control/storage могут попасть в release без тестов.
+- **Доказательство:** Cargo.lock исключён и не хранится; Cargo commands без --locked;
+  stable/nightly и cross edge/git не закреплены; bun install без frozen.
+  В workflows нет cargo test/clippy, frontend lint и meaningful integration gates.
+  Наличие unit tests диагностики в репозитории не заменяет их запуск.
+- **Минимальная рекомендация:** хранить Cargo.lock для executable и применять --locked,
+  frozen Bun lock, закрепить toolchain/image/action revisions;
+  обязательные checks auth/control/config/update и проверка release каждой архитектуры.
+  Назначение lockfile описано в [Cargo Book](https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html).
+
+### R34 — MEDIUM — Текущий lint не запускается с зафиксированным TypeScript
+
+**Статус:** Fixed (6 октября 2026 года; исходная находка Confirmed). **Категория:** verification tooling.
+**Локация:** frontend/package.json:9,64,65; frontend/eslint.config.js.
+
+- **Сценарий:** чистая установка frontend по bun.lock и bun run lint.
+- **Влияние:** статические проверки прекращаются до анализа кода.
+- **Доказательство:** воспроизведён exit 2, typescript-eslint does not support TS 7.0.
+  npm также сообщает несовместимый peer range. Build при этом успешно проходит.
+- **Минимальная рекомендация:** согласовать версии API TypeScript и typescript-eslint;
+  закрепить рабочий lint в CI. Текущий статус поддержки отражён в
+  [трекере typescript-eslint](https://github.com/typescript-eslint/typescript-eslint/issues/10940).
+
+**Исправление и проверка:** сохранены подготовленные изменения npm aliases:
+TypeScript 7 для сборки, совместимый TypeScript 6 API для ESLint. По дополнительному
+указанию пользователя исправлены все 19 ошибок и 1 предупреждение правил в исходниках:
+порядок hooks, чтение refs, пересинхронизация состояния, async callbacks после закрытия
+модальных окон, cause ошибок и передача tooltip timeout. Правила не отключались.
+`bun install --frozen-lockfile`, `bun run build`, `bun run lint` и
+`bunx eslint . --max-warnings 0` завершились успешно. Проверено открытие/повторное
+открытие шаблонов, открытие бэкапов, геофайлов и route tester в локальном браузере;
+ошибок/предупреждений в browser console нет. Добавление CI gates остаётся областью R33.
+
+### R35 — MEDIUM — Миграция/удаление панели затрагивает общий lighttpd
+
+**Статус:** Confirmed. **Категория:** installer scope / shared services.
+**Локация:** setup.sh:155,158,159,184,186,192,193.
+
+- **Сценарий:** lighttpd используется панелью и другим сервисом; выполняется legacy migration.
+  Даже ответ «не удалять» следует после остановки общего сервера.
+- **Влияние:** другой сервис остаётся выключенным; при удалении принудительно удаляются
+  dependent packages и весь /opt/etc/lighttpd, включая чужую конфигурацию.
+- **Доказательство:** stop до вопроса, ветка N возвращает без restart;
+  opkg --force-removal-of-dependent-packages и rm -rf всего общего каталога.
+- **Минимальная рекомендация:** удалять только owned config; сохранить/восстановить исходный статус сервера;
+  shared package не удалять принудительно без отдельного точного scope.
+
+### R36 — LOW — Обновление всех провайдеров оставляет старый viewer cache
+
+**Статус:** Confirmed. **Категория:** diagnostic frontend cache.
+**Локация:** frontend/src/components/modals/Providers.tsx:333,342,358,369.
+
+- **Сценарий:** открыть provider content, обновить всех, открыть тот же provider.
+- **Влияние:** пользователь видит старые правила/прокси до reload страницы.
+- **Доказательство:** individual update удаляет cache key, updateAllProviders этого не делает;
+  viewProviderContent отдаёт module cache раньше backend fetch.
+- **Минимальная рекомендация:** инвалидировать successfully updated keys либо использовать revision в cache key.
+
+## Требуют дальнейшего доказательства
+
+Эти пункты не входят в число подтверждённых находок и не являются доказанными incident-сценариями.
+
+### H01 — HIGH — Возможное истощение памяти на роутерах при загрузке обновлений
+
+**Статус:** Probable. **Категория:** resource limits.
+**Локация:** backend/src/updater.rs:199,200,210,223,558.
+**Сценарий:** download без Content-Length либо размером до 50 MiB остаётся в RAM;
+параллельные updates и распаковка не имеют общего byte/concurrency budget.
+**Влияние:** потенциальный OOM панели или соседнего proxy-процесса.
+**Доказательство:** growable Vec без лимита и выбор disk только по исходному Content-Length подтверждены;
+RSS и запас памяти конкретных ARM/MIPS моделей не измерялись.
+**Рекомендация:** streaming на диск, предел compressed/unpacked bytes, admission limit;
+измерить peak RSS/latency вместе с работающим ядром на самых слабых устройствах.
+
+### H02 — MEDIUM — Зависший валидатор/конвертер может пережить отмену запроса
+
+**Статус:** Probable. **Категория:** subprocess lifecycle.
+**Локация:** backend/src/configs.rs:377,392;
+backend/src/ruleset_inspector.rs:193; backend/src/route_test/mod.rs:430,435.
+**Сценарий:** xray/mihomo validation или MRS conversion не завершается.
+**Влияние:** зависшие subprocesses, temporary files и занятые handlers.
+**Доказательство:** deadline диагностики создаётся после engine/provider load;
+для subprocess paths отсутствуют явные deadline/kill_on_drop.
+Воспроизведение зависания конкретного ядра не выполнялось.
+[Tokio Command](https://docs.rs/tokio/latest/tokio/process/struct.Command.html#method.kill_on_drop)
+по умолчанию не убивает child при drop.
+**Рекомендация:** deadline на весь запрос, kill-and-wait при timeout/cancel, RAII cleanup и semaphore.
+
+### H03 — MEDIUM — Symlink внутри разрешённого каталога может нарушить file boundary
+
+**Статус:** Probable. **Категория:** filesystem boundary.
+**Локация:** backend/src/configs.rs:154,166,247; backend/src/backuper.rs:283.
+**Сценарий:** сторонний компонент/локальный субъект уже создал symlink в managed directory.
+**Влияние:** read/write следует на файл вне allowlist.
+**Доказательство:** lexical Path.starts_with и обычные fs open/write; проверка inode/resolved path отсутствует.
+API создания symlink в приложении не обнаружен; удалённая эксплуатация без дополнительных предпосылок не доказана.
+**Рекомендация:** определить поддержку symlink, использовать безопасное открытие без follow/TOCTOU
+или явно проверять разрешённый resolved target; тестировать с локальными mock files.
+
+### H04 — MEDIUM — Суммарные бюджеты geo/cache/fleet не проверены под нагрузкой
+
+**Статус:** Hypothesis. **Категория:** fleet scalability / resource budgets.
+**Локация:** backend/src/geo.rs; backend/src/route_test/idle_cache.rs;
+frontend/src/lib/api.ts:115; frontend/src/lib/multi-routers/actions.ts:68.
+**Сценарий:** множество одновременных geo-запросов, изменяемые geo/provider версии,
+массовый save и polling сотен устройств.
+**Влияние:** потенциальная деградация памяти, responsiveness и управления.
+**Доказательство:** fan-out запускается Promise.allSettled без configured concurrency;
+route caches ограничены idle TTL, но не суммарными bytes; глобальный geo admission limit не найден.
+Сам факт этих конструкций не доказывает OOM или непригодность для сотен устройств.
+**Рекомендация:** измерить максимум RSS/CPU/FD, p95 latency, browser memory и failed/offline handling;
+по результатам задать bounded concurrency/cache budgets.
+
+### H05 — LOW — Advisory braces в цепочке frontend tooling
+
+**Статус:** Hypothesis для эксплуатации приложения; наличие affected dependency подтверждено.
+**Категория:** dependency advisory applicability.
+**Локация:** frontend/package.json:43; frontend/bun.lock.
+**Сценарий:** attacker-controlled глубоко вложенные brace patterns достигают braces через tooling.
+**Влияние:** потенциальный DoS Node tooling; исполнение этого пакета в роутерном Rust/browser runtime не установлено.
+**Доказательство:** bun audit обнаружил braces 3.0.3:
+shadcn → @shadcn/registry → fast-glob → micromatch → braces.
+[GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) отмечает affected <=3.0.3.
+Импорт shadcn в runtime исходниках не найден; severity advisory не переносится автоматически на deployed панель.
+**Рекомендация:** установить фактическую достижимость; убрать неиспользуемый runtime dependency
+либо изолировать tooling и применить доступное upstream исправление после проверки.
+
+## Приоритет исправлений и допуска
+
+Прогресс исправлений на 6 октября 2026 года: **2 из 36 подтверждённых пунктов закрыты**
+(R01, R34), **34 остаются открытыми**. H01–H05 остаются без изменения статуса.
+Исторические результаты первоначального аудита выше сохранены; актуальные результаты
+повторных проверок приведены у исправленных пунктов.
+
+Подтверждённые находки: **1 CRITICAL, 14 HIGH, 20 MEDIUM, 1 LOW**. Отдельно: H01–H05,
+где не хватает runtime/нагрузочного подтверждения. Число найденных дефектов не является метрикой полноты аудита.
+
+1. **Закрыть захват устройств:** R01, R02, R04, R05, R06.
+   Критерий: negative tests на значения core/relay, неподдельный rate limit,
+   защищённый first run и startup failure, логи не исполняют HTML.
+2. **Определить защищённую модель управления парком:** R03, R07, R08.
+   Критерий: auth на каждом устройстве, secure transport, пустая/устаревшая цель никогда не означает local,
+   completion привязан к file revision и конкретному device.
+3. **Сохранить доступность при изменениях:** R09, R10, R13, R14, R16–R24.
+   Критерий: preflight, атомарный commit, достоверный результат, rollback после failed start/DNS/write;
+   restore действительно восстанавливает согласованный рабочий snapshot.
+4. **Перевести релизы под контроль форка:** R11, R12, R32–R35.
+   Критерий: собственные проверяемые artifacts, подпись, воспроизводимый toolchain/lock,
+   стабильный release channel и проходящие build/lint/backend tests.
+5. **Довести lifecycle и диагностику:** R15, R25–R31, R36.
+   Критерий: bounds/cycle guards, session revocation, корректное завершение WS,
+   bounded logs, совпадение режимов маршрутизации и безопасный импорт YAML.
+6. **Провести испытания на целевых ARM/MIPS устройствах перед расширением парка.**
+   Проверить H01–H05, потерю питания/диска/сети, несовместимый бинарник, offline hosts,
+   параллельных администраторов и управление неоднородными конфигами.
+   Отдельно проверить device-specific поля xkeen.json/RCI token: текущий fan-out копирует содержимое
+   исходного файла целиком; одинаковость этих полей между устройствами не подтверждена.
+
+Технический аудит кода выполнен в обозначенных пределах. Доказательств готовности текущей версии
+к массовой корпоративной эксплуатации нет; перечисленные блокирующие пути требуют исправления
+и проверки до такого развёртывания.
