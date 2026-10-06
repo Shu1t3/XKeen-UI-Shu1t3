@@ -11,10 +11,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Require release notes
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "Invalid release version"; exit 1; }
+          notes="docs/releases/$RELEASE_VERSION.md"
+          test -s "$notes" || { echo "Missing release notes: $notes"; exit 1; }
+          grep -q '^## Исправления$' "$notes" || { echo "Release notes must describe fixes"; exit 1; }
+          grep -q '^- ' "$notes" || { echo "Release notes must contain changes"; exit 1; }
       - uses: oven-sh/setup-bun@v2
       - name: Build frontend
         working-directory: frontend
-        run: bun install && bun run build
+        run: bun install --frozen-lockfile && bunx eslint . --max-warnings 0 && bun run build
+      - name: Install Rust for tests
+        run: rustup toolchain install stable --profile minimal
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          key: tests
+      - name: Test backend
+        working-directory: backend
+        run: cargo +stable test && cargo +stable test --features local-dev
       - uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
@@ -121,5 +139,8 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: docs/releases/${{ inputs.version }}.md
+          fail_on_unmatched_files: true
           prerelease: true
           files: artifacts/xkeen-ui-*/*
