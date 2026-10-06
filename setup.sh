@@ -50,14 +50,14 @@ get_arch() {
 }
 
 download_files() {
-  local base_url="https://github.com/zxc-rv/XKeen-UI/releases"
+  local base_url="https://github.com/Shu1t3/XKeen-UI-Shu1t3/releases"
   local download_url="$base_url/latest/download"
   local bin_name="xkeen-ui-$ARCH"
 
   if [ "$BETA" = true ]; then
     local beta_tag="/tmp/xkeen_beta"
     trap "rm -f $beta_tag" EXIT
-    (curl -s https://api.github.com/repos/zxc-rv/XKeen-UI/releases | \
+    (curl -s https://api.github.com/repos/Shu1t3/XKeen-UI-Shu1t3/releases | \
   jq -re '.[0] | select(.prerelease == true) | .tag_name' > $beta_tag) &
     if ! spinner $! "Поиск бета-релиза..."; then
       printf "${RED_BOLD}\n Нет актуального бета-релиза${NCN}"

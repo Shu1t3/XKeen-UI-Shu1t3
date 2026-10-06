@@ -16,6 +16,46 @@
 </div>
 <br>  
   
+## Переход с апстрима на форк
+
+На роутере с установленной панелью выполните от root:
+
+```sh
+curl -fL https://raw.githubusercontent.com/Shu1t3/XKeen-UI-Shu1t3/main/scripts/switch-to-fork.sh -o /opt/tmp/switch-to-fork.sh
+sh /opt/tmp/switch-to-fork.sh --tag v0.0.1-fork.1
+```
+
+Указанный тег — пример: сначала опубликуйте релиз форка с бинарником для вашего
+роутера. Для prerelease нужен точный `--tag`; без аргументов скрипт ищет latest
+стабильный релиз. Сборку запускайте workflow **Build Rust binaries** в Actions
+форка, задав версию релиза. Сборка должна быть без `local-dev`.
+
+Для тестирования локальной сборки загрузите её на роутер (например, через SCP)
+и укажите путь:
+
+```sh
+sh /opt/tmp/switch-to-fork.sh --file /opt/tmp/xkeen-ui-arm64-v8a
+```
+
+Имена артефактов: `xkeen-ui-arm64-v8a` (aarch64), `xkeen-ui-mips32le`
+(mipsel), `xkeen-ui-mips32` (mips). Скрипт определяет архитектуру через Entware,
+проверяет ELF и запуск `--version`, затем сохраняет старый бинарник, init-скрипт
+и настройки панели в закрытую директорию `/opt/var/backups/xkeen-ui-switch`.
+Скачивание и проверки проходят до остановки панели. Ошибка замены или запуска
+вызывает автоматический откат; настройки и init-скрипт не заменяются.
+Конфигурации Xray/Mihomo и сервис XKeen не затрагиваются.
+
+Путь к резервной копии и команду ручного отката скрипт выводит на экран:
+
+```sh
+sh /opt/tmp/switch-to-fork.sh --rollback /opt/var/backups/xkeen-ui-switch/ИМЯ_КОПИИ
+```
+
+Откат восстанавливает только бинарник. Копии настроек сохранены отдельно для
+ручного восстановления при необходимости. После перехода проверьте панель на
+прежнем адресе: проверка процесса не гарантирует работу всех функций.
+Новые сборки используют релизы форка для встроенного обновления панели.
+
 ## ✨ Особенности
 
 - 🚀 Установка одной командой
@@ -45,13 +85,13 @@
 ### Cтабильная/Latest версия
 
 ```SH
-curl https://raw.githubusercontent.com/zxc-rv/XKeen-UI/main/setup.sh | sh
+curl https://raw.githubusercontent.com/Shu1t3/XKeen-UI-Shu1t3/main/setup.sh | sh
 ```
 
 ### Бета/Pre-release версия
 
 ```SH
-curl https://raw.githubusercontent.com/zxc-rv/XKeen-UI/main/setup.sh | sh -s -- beta
+curl https://raw.githubusercontent.com/Shu1t3/XKeen-UI-Shu1t3/main/setup.sh | sh -s -- beta
 ```
 
 <br>

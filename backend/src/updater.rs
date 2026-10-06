@@ -65,7 +65,7 @@ pub fn get_repo(updater: &UpdaterSettings, core: &str) -> Option<String> {
     let (url, fallback) = match core {
         "xray" => (&updater.xray_repo, "XTLS/Xray-core"),
         "mihomo" => (&updater.mihomo_repo, "MetaCubeX/mihomo"),
-        "self" => return Some("zxc-rv/XKeen-UI".into()),
+        "self" => return Some("Shu1t3/XKeen-UI-Shu1t3".into()),
         _ => return None,
     };
     Some(if valid_repo_url(url) {
@@ -675,7 +675,7 @@ mod tests {
     fn slug_from_repo_url() {
         assert_eq!(repo_slug("https://github.com/XTLS/Xray-core"), "XTLS/Xray-core");
         assert_eq!(repo_slug("https://github.com/MetaCubeX/mihomo/"), "MetaCubeX/mihomo");
-        assert_eq!(repo_slug("github.com/zxc-rv/XKeen-UI"), "zxc-rv/XKeen-UI");
+        assert_eq!(repo_slug("github.com/Shu1t3/XKeen-UI-Shu1t3"), "Shu1t3/XKeen-UI-Shu1t3");
         assert_eq!(repo_slug("XTLS/Xray-core"), "XTLS/Xray-core");
         assert_eq!(repo_slug("https://github.com/owner/repo.git"), "owner/repo");
     }
@@ -694,7 +694,7 @@ mod tests {
         let mut s = UpdaterSettings::default();
         assert_eq!(get_repo(&s, "xray").as_deref(), Some("XTLS/Xray-core"));
         assert_eq!(get_repo(&s, "mihomo").as_deref(), Some("MetaCubeX/mihomo"));
-        assert_eq!(get_repo(&s, "self").as_deref(), Some("zxc-rv/XKeen-UI"));
+        assert_eq!(get_repo(&s, "self").as_deref(), Some("Shu1t3/XKeen-UI-Shu1t3"));
 
         s.xray_repo = "https://github.com/someone/xray-fork".into();
         assert_eq!(get_repo(&s, "xray").as_deref(), Some("someone/xray-fork"));
