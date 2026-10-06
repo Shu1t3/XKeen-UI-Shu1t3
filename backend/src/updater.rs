@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -431,6 +430,14 @@ async fn install_yq(proxies: &[String], tmp_dir: &Path) -> Result<(), String> {
 }
 
 pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateReq>) -> impl IntoResponse {
+    // A disconnected request must not cancel replacement or recovery halfway through.
+    match crate::update_transaction::run_to_completion(async move { perform_update(state, req).await }).await {
+        Ok(result) => result,
+        Err(e) => response(false, Some(format!("Ошибка обновления: {e}"))),
+    }
+}
+
+async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Value>) {
     let (repo, proxies) = {
         let s = state.settings.read().unwrap();
         (get_repo(&s.updater, &req.core), s.updater.github_proxy.clone())
@@ -457,8 +464,12 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         ),
     );
 
-    let tmp_dir = Path::new(opt_path!("/tmp"));
-    _ = fs::create_dir_all(tmp_dir).await;
+    let mut work = match crate::update_transaction::Workspace::create(Path::new(opt_path!("/sbin"))) {
+        Ok(work) => work,
+        Err(e) => return response(false, Some(e)),
+    };
+    let tmp_path = work.path.clone();
+    let tmp_dir = tmp_path.as_path();
     let arch = std::env::consts::ARCH;
 
     if req.core == "self" {
@@ -476,64 +487,51 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
             Err(e) => return response(false, Some(e)),
         };
 
-        log("INFO", "Установка обновления...".into());
-
-        let source = tmp_dir.join(format!("xkeen-ui_{}", ver));
+        let source = tmp_dir.join("new");
         if let Err(e) = save(bin_d, source.clone()).await {
-            return response(false, Some(format!("Ошибка сохранения: {}", e)));
+            return response(false, Some(format!("Ошибка сохранения: {e}")));
         }
-
-        let integrity_check = tokio::task::spawn_blocking({
-            let source = source.clone();
-            move || -> Result<(), String> {
-                let meta = std::fs::metadata(&source).map_err(|e| format!("Ошибка проверки файла: {}", e))?;
-                if meta.len() < 1024 * 1024 {
-                    return Err("Файл меньше 1МБ — повреждённый артефакт".into());
-                }
-                let mut f = std::fs::File::open(&source).map_err(|e| format!("Ошибка открытия файла: {}", e))?;
-                let mut magic = [0u8; 4];
-                f.read_exact(&mut magic)
-                    .map_err(|e| format!("Ошибка чтения файла: {}", e))?;
-                if magic != [0x7F, b'E', b'L', b'F'] {
-                    return Err("Файл не является ELF-бинарём — отменено".into());
-                }
-                Ok(())
-            }
-        })
-        .await
-        .map_err(|e| format!("Ошибка проверки: {}", e))
-        .and_then(|r| r);
-
-        if let Err(e) = integrity_check {
-            _ = std::fs::remove_file(&source);
+        if let Err(e) = crate::update_transaction::preflight(&source, "self", &ver).await {
             return response(false, Some(e));
         }
-
-        let target = opt_path!("/sbin/xkeen-ui");
-        if let Err(e) = fs::rename(&source, target).await {
-            return response(false, Some(format!("Ошибка установки: {}", e)));
+        let init = Path::new(S99XKEEN_UI);
+        // Respect the saved init script's panel port; never use a request-supplied address.
+        let init_text = fs::read_to_string(init).await.unwrap_or_default();
+        let args = init_text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ARGS="))
+            .unwrap_or("");
+        let words: Vec<_> = args
+            .split([' ', '\t', '\r', '"', '\''])
+            .filter(|v| !v.is_empty())
+            .collect();
+        let port = words
+            .windows(2)
+            .find_map(|w| (w[0] == "-p").then_some(w[1]))
+            .filter(|p| p.parse::<u16>().is_ok_and(|p| p != 0))
+            .unwrap_or("1000");
+        match crate::update_transaction::start_self_update(
+            &mut work,
+            Path::new(opt_path!("/sbin/xkeen-ui")),
+            init,
+            port,
+        )
+        .await
+        {
+            Ok(id) => {
+                log("INFO", format!("Обновление панели передано supervisor, job={id}"));
+                let (headers, _) = response(true, None);
+                // Old browser bundles must not mistake job acceptance for completed installation.
+                return (
+                    headers,
+                    Json(json!({"success":false, "pending":true, "job_id":id,
+                    "error":"Обновление запущено; ожидается подтверждение запуска"})),
+                );
+            }
+            Err(e) => return response(false, Some(e)),
         }
-
-        _ = fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
-        _ = tokio::task::spawn_blocking(rustix::fs::sync).await;
-
-        log("INFO", format!("Обновление XKeen UI до {} завершено", ver));
-
-        if Path::new(S99XKEEN_UI).exists() {
-            log("INFO", "Перезапуск...".into());
-            _ = Command::new(S99XKEEN_UI)
-                .arg("restart")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-        } else {
-            log(
-                "WARN",
-                "Init скрипт панели не найден, требуется ручной перезапуск".into(),
-            );
-        }
-        return response(true, None);
     }
+
     let assets = if req.assets.is_empty() {
         log("INFO", format!("Получение списка ассетов релиза {}...", ver));
         fetch_release_assets(&state.http_client, &proxies, &repo, &ver).await
@@ -641,9 +639,10 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         Ok(())
     }
 
-    let tmp_name = format!("{}_{}", core_name, ver);
+    let tmp_name = "new".to_string();
+    let unpack_dir = tmp_dir.to_path_buf();
     let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let bin = tmp_dir.join(&tmp_name);
+        let bin = unpack_dir.join(&tmp_name);
         match dl_res {
             DownloadResult::RAM(d) => unpack(Cursor::new(d), &bin, &core_name, is_zip)?,
             DownloadResult::Disk(p) => {
@@ -659,47 +658,37 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         return response(false, Some(format!("Ошибка распаковки: {}", e)));
     }
 
-    let target = format!(opt_path!("/sbin/{}"), req.core);
-    if req.backup_core && Path::new(&target).exists() {
-        let bk = format!(
-            opt_path!("/sbin/core-backup/{}-{}"),
-            req.core,
-            (chrono::Utc::now() + chrono::Duration::hours(state.settings.read().unwrap().log.timezone as i64))
-                .format("%Y%m%d-%H%M%S")
-        );
-        _ = fs::create_dir_all(opt_path!("/sbin/core-backup")).await;
-        log("INFO", format!("Создание бэкапа: {}", bk));
-        _ = fs::copy(&target, &bk).await;
+    let target = PathBuf::from(format!(opt_path!("/sbin/{}"), req.core));
+    let source = tmp_dir.join("new");
+    if let Err(e) = crate::update_transaction::preflight(&source, &req.core, &ver).await {
+        return response(false, Some(e));
     }
-
-    let (run, source) = (
-        !crate::controller::get_pid(&req.core).is_empty(),
-        tmp_dir.join(format!("{}_{}", req.core, ver)),
-    );
-    if fs::rename(&source, &target).await.is_ok() {
-        _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
-        if run {
-            log("INFO", format!("Перезапуск {}...", core_cap));
-            if let Err(e) = crate::controller::soft_restart(&req.core).await {
-                log("ERROR", format!("{}", e));
-                return response(false, Some(format!("{}", e)));
-            }
+    if req.backup_core && target.exists() {
+        let backup_dir = Path::new(opt_path!("/sbin/core-backup"));
+        let backup_file = backup_dir.join(format!(
+            "{}-{}-{}",
+            req.core,
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(e) = async {
+            fs::create_dir_all(backup_dir).await?;
+            fs::copy(&target, &backup_file).await?;
+            fs::File::open(&backup_file).await?.sync_all().await
         }
-    } else {
-        log("WARN", "Атомарная замена не удалась, фолбек на копирование...".into());
-        if run {
-            log("INFO", "Остановка XKeen...".into());
-            _ = crate::controller::run_init_command(&state, &["stop"]).await;
+        .await
+        {
+            return response(false, Some(format!("Ошибка архивной резервной копии: {e}")));
         }
-        if let Err(e) = fs::copy(&source, &target).await {
-            return response(false, Some(format!("Ошибка установки: {}", e)));
-        }
-        _ = fs::remove_file(&source).await;
-        _ = fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).await;
-        if run {
-            log("INFO", "Запуск XKeen...".into());
-            _ = crate::controller::run_init_command(&state, &["start", "on"]).await;
-        }
+    }
+    let running = !crate::controller::get_pid(&req.core).is_empty();
+    if let Err(e) = crate::update_transaction::replace_core(&mut work, &target, running, || {
+        crate::controller::soft_restart(&req.core)
+    })
+    .await
+    {
+        log("ERROR", e.clone());
+        return response(false, Some(e));
     }
 
     log("INFO", format!("Обновление {} до {} завершено", core_cap, ver));

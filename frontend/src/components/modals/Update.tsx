@@ -13,6 +13,7 @@ import remarkGfm from 'remark-gfm'
 import { apiCall, capitalize } from '../../lib/api'
 import { useAppContext, useModalContext, useSettings } from '../../lib/store'
 import type { Release } from '../../lib/types'
+import { waitForPanelUpdate } from '../../lib/update-job'
 import releaseSource from '../../../../backend/release-source.json'
 import { cn, repoSlug } from '../../lib/utils'
 
@@ -172,6 +173,7 @@ export function UpdateModal({ onInstalled }: { onInstalled: () => void }) {
       status: 'pending',
       pendingText: 'Обновление...',
     })
+    let installed = false
     try {
       const selectedRelease = releases.find((r) => r.version === selectedVersion)
       const res = await fetch('/api/update', {
@@ -185,7 +187,13 @@ export function UpdateModal({ onInstalled }: { onInstalled: () => void }) {
         }),
       })
       const data = await res.json()
-      if (data.success) {
+      if (data.success || (updateModalCore === 'self' && data.pending)) {
+        if (updateModalCore === 'self' && data.pending) {
+          if (typeof data.job_id !== 'string') throw new Error('Нет идентификатора обновления')
+          showToast('Обновление начато. Проверяем запуск новой версии...')
+          await waitForPanelUpdate(data.job_id, selectedVersion, fetchWithTimeout)
+        }
+        installed = true
         showToast(`Установлен ${coreLabel} ${selectedVersion}`)
         if (updateModalCore === 'self') {
           setTimeout(() => location.reload(), 100)
@@ -195,10 +203,10 @@ export function UpdateModal({ onInstalled }: { onInstalled: () => void }) {
       } else {
         showToast(data.error || 'Ошибка установки', 'error')
       }
-    } catch {
-      showToast('Ошибка установки', 'error')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Ошибка установки', 'error')
     } finally {
-      if (updateModalCore !== 'self') {
+      if (updateModalCore !== 'self' || !installed) {
         setInstalling(false)
         apiCall<any>('GET', 'control')
           .then((data) => {

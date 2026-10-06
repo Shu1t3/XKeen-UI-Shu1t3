@@ -20,6 +20,7 @@ mod ruleset_inspector;
 mod settings;
 mod system;
 mod types;
+mod update_transaction;
 mod updater;
 mod version;
 mod websocket;
@@ -503,6 +504,7 @@ async fn main() {
             get(settings::get_settings).patch(settings::patch_settings),
         )
         .route("/api/version", get(version::version_handler))
+        .route("/api/update/status", get(update_transaction::update_status))
         .route("/api/system", get(system::get_system_stats))
         .route("/api/ruleset", get(ruleset_inspector::get_ruleset_content))
         .route(

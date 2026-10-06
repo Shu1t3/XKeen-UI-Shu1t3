@@ -58,96 +58,153 @@ select_release_tag() {
   jq -er --arg channel "$RELEASE_CHANNEL" '[.[] | select(.draft != true) | select($channel == "latest" or ($channel == "beta" and .prerelease == true) or ($channel == "stable" and .prerelease != true))] | first | .tag_name | select(type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$"))'
 }
 
+# Transaction helpers run in a subshell so traps cannot leak into the menu.
+# The stage and backup live beside the installed binary: rename is atomic.
+validate_candidate() {
+  local header
+  header=$(dd if="$1" bs=20 count=1 2>/dev/null | od -b | awk 'NF > 1 {for (i=2;i<=NF;i++) printf "%s ", $i}') || return 1
+  set -- $header
+  [ "$#" -eq 20 ] || return 1
+  [ "$1 $2 $3 $4" = '177 105 114 106' ] || return 1
+  [ "$7" = 001 ] || return 1
+  local class=$5 endian=$6
+  shift 18
+  case "$ARCH:$class:$endian:$1:$2" in
+    arm64-v8a:002:001:267:000|mips32:001:002:000:010|mips32le:001:001:010:000) ;;
+    *) printf 'Неверная архитектура ELF\n' >&2; return 1 ;;
+  esac
+  chmod 755 "$CANDIDATE" || return 1
+  run_version_probe "$CANDIDATE"
+}
+
+run_version_probe() {
+  "$1" --version > "$STAGE/version" 2>&1 &
+  local probe=$!
+  (
+    sleeper=''
+    trap 'kill "$sleeper" 2>/dev/null || :; exit' TERM INT HUP
+    sleep 10 & sleeper=$!
+    wait "$sleeper"
+    kill -KILL "$probe" 2>/dev/null || :
+  ) &
+  local watchdog=$!
+  wait "$probe"
+  local result=$?
+  kill "$watchdog" 2>/dev/null || :
+  wait "$watchdog" 2>/dev/null || :
+  [ "$result" -eq 0 ] && [ -s "$STAGE/version" ]
+}
+
 download_files() {
   local base_url="https://github.com/$UI_REPOSITORY/releases"
   local download_url="$base_url/latest/download"
   local bin_name="xkeen-ui-$ARCH"
-
   if [ "$LOCAL" != true ] && [ "$RELEASE_CHANNEL" != stable ]; then
-    local beta_tag="/tmp/xkeen_beta"
-    trap "rm -f $beta_tag" EXIT
-    (curl -fsS "https://api.github.com/repos/$UI_REPOSITORY/releases?per_page=100" | \
-  select_release_tag > $beta_tag) &
-    if ! spinner $! "Поиск релиза ($RELEASE_CHANNEL)..."; then
-      printf "${RED_BOLD}\n Нет опубликованного релиза канала $RELEASE_CHANNEL${NCN}"
-      $XKEENUI_INIT start &>/dev/null || :
-      exit 1
-    fi
-    beta_tag=$(cat $beta_tag)
-    download_url="$base_url/download/$beta_tag"
+    curl -fsS --connect-timeout 20 --max-time 60 "https://api.github.com/repos/$UI_REPOSITORY/releases?per_page=100" > "$STAGE/releases" || return 1
+    local tag
+    tag=$(select_release_tag < "$STAGE/releases") || return 1
+    download_url="$base_url/download/$tag"
   fi
-
   if [ "$LOCAL" = true ] && [ -f "/opt/tmp/$bin_name" ]; then
-    ( set -e; mv "/opt/tmp/$bin_name" $XKEENUI_BIN && chmod +x $XKEENUI_BIN ) &
-    if ! spinner $! "Локальная установка бинарника..."; then
-      printf "${RED_BOLD}\n Не удалось переместить бинарник.${NCN}"
-      exit 1
-    fi
+    cp "/opt/tmp/$bin_name" "$CANDIDATE" || return 1
   else
-    ( set -e; curl -Lsfo $XKEENUI_BIN $download_url/$bin_name && chmod +x $XKEENUI_BIN ) &
-    if ! spinner $! "Загрузка бинарника..."; then
-      printf "${RED_BOLD}\n Не удалось загрузить бинарник.${NCN}"
-      exit 1
-    fi
+    curl -fLsS --connect-timeout 20 --max-time 300 -o "$CANDIDATE" "$download_url/$bin_name" || return 1
   fi
+  validate_candidate "$CANDIDATE"
 }
 
+service_healthy() {
+  sleep 2
+  "$XKEENUI_INIT" status >/dev/null 2>&1 && pidof xkeen-ui >/dev/null 2>&1
+}
+
+transaction_cleanup() {
+  local result=$?
+  trap - EXIT HUP INT TERM
+  if [ "$COMMITTED" != true ] && [ "$TOUCHED" = true ]; then
+    "$XKEENUI_INIT" stop >/dev/null 2>&1 || :
+    killall -q -9 xkeen-ui >/dev/null 2>&1 || :
+    local restored=true
+    if [ "$HAD_BIN" = true ]; then
+      cp -p "$STAGE/previous" "$STAGE/restore" && mv -f "$STAGE/restore" "$XKEENUI_BIN" || restored=false
+    else
+      rm -f "$XKEENUI_BIN" || restored=false
+    fi
+    if [ "$HAD_INIT" = true ]; then
+      cp -p "$STAGE/previous-init" "$INIT_STAGE" && mv -f "$INIT_STAGE" "$XKEENUI_INIT" || restored=false
+    else
+      rm -f "$XKEENUI_INIT" || restored=false
+    fi
+    if [ "$restored" = true ] && [ "$WAS_RUNNING" = true ]; then
+      "$XKEENUI_INIT" start >/dev/null 2>&1 && service_healthy || restored=false
+    fi
+    if [ "$restored" != true ]; then
+      printf 'Восстановление требует вмешательства; резервные файлы: %s\n' "$STAGE" >&2
+      KEEP_STAGE=true
+    fi
+  fi
+  [ -z "$INIT_STAGE" ] || rm -f "$INIT_STAGE"
+  [ "$KEEP_STAGE" = true ] || [ -z "$STAGE" ] || rm -rf "$STAGE"
+  if [ "$KEEP_STAGE" != true ] && { [ ! -f "$LOCK/owner" ] || [ "$(cat "$LOCK/owner" 2>/dev/null)" = "$STAGE" ]; }; then
+    rm -f "$LOCK/owner"
+    rmdir "$LOCK" 2>/dev/null || :
+  fi
+  exit "$result"
+}
+
+replace_xkeenui() (
+  local LOCK="$(dirname "$XKEENUI_BIN")/.xkeen-ui-update.lock" STAGE='' INIT_STAGE=''
+  local COMMITTED=false TOUCHED=false KEEP_STAGE=false
+  local HAD_BIN=false HAD_INIT=false WAS_RUNNING=false
+  mkdir "$LOCK" 2>/dev/null || { printf 'Другая установка уже выполняется: %s\n' "$LOCK" >&2; exit 1; }
+  trap transaction_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  STAGE=$(mktemp -d "${XKEENUI_BIN}.stage.XXXXXX") || exit 1
+  printf '%s\n' "$STAGE" > "$LOCK/owner" || exit 1
+  CANDIDATE="$STAGE/candidate"
+  download_files || { printf 'Подготовка нового бинарника не удалась; текущая установка сохранена\n' >&2; exit 1; }
+  if [ -f "$XKEENUI_BIN" ]; then
+    cp -p "$XKEENUI_BIN" "$STAGE/previous" || exit 1
+    HAD_BIN=true
+  fi
+  if [ -f "$XKEENUI_INIT" ]; then
+    cp -p "$XKEENUI_INIT" "$STAGE/previous-init" || exit 1
+    HAD_INIT=true
+  fi
+  INIT_STAGE=$(mktemp "${XKEENUI_INIT}.stage.XXXXXX") || exit 1
+  if [ "$HAD_INIT" = true ]; then
+    sed 's|^PROCS=/opt/sbin/xkeen-ui$|PROCS=xkeen-ui|' "$XKEENUI_INIT" > "$INIT_STAGE" || exit 1
+    chmod 755 "$INIT_STAGE" || exit 1
+  else
+    create_xkeenui_init "$INIT_STAGE" || exit 1
+  fi
+  pidof xkeen-ui >/dev/null 2>&1 && WAS_RUNNING=true
+  sync || exit 1
+  TOUCHED=true
+  if [ "$WAS_RUNNING" = true ]; then
+    if [ "$HAD_INIT" = true ]; then
+      "$XKEENUI_INIT" stop >/dev/null 2>&1 || exit 1
+    fi
+    killall -q -9 xkeen-ui >/dev/null 2>&1 || :
+    pidof xkeen-ui >/dev/null 2>&1 && exit 1
+  fi
+  mv -f "$CANDIDATE" "$XKEENUI_BIN" || exit 1
+  mv -f "$INIT_STAGE" "$XKEENUI_INIT" || exit 1
+  sync || exit 1
+  "$XKEENUI_INIT" start >/dev/null 2>&1 && service_healthy || exit 1
+  COMMITTED=true
+)
+
 install_xkeenui() {
-  if [[ -d $STATIC_DIR || -f $XKEENUI_BIN || -f $XKEENUI_INIT || -f $LIGHTTPD_CONF ]]; then
-    printf "${YELLOW}\n Обнаружены файлы XKeen UI, запуск переустановки...\n${NC}"
-    uninstall_xkeenui
-  fi
-
-  printf "${INFO} Начинаем установку...${NCN}"
-
   [ -f "/opt/tmp/xkeen-ui-$ARCH" ] && LOCAL=true
-
-  download_files; create_xkeenui_init
-
-  sync & spinner $! "Запись данных..."
-
-  $XKEENUI_INIT start &>/dev/null &
-  if ! spinner $! "Запуск XKeen UI..."; then
-    printf "${RED_BOLD}\n Не удалось запустить XKeen UI.${NCN}"
-    exit 1
-  fi
-
+  replace_xkeenui || return 1
   finish_setup "установлен"
 }
 
 update_xkeenui() {
-  [ -f "$XKEENUI_BIN" ] || { printf "${ERROR} Ошибка: XKeen UI не установлен!${NCN}"; exit 1; }
-
-  printf "${INFO} Начинаем обновление...${NCN}"
-
-  if [ ! -f $XKEENUI_INIT ]; then
-    (
-      set -e
-      killall -q -9 xkeen-ui &>/dev/null || :
-      create_xkeenui_init
-    ) &
-    spinner $! "Создание скрипта запуска..."
-  elif pidof xkeen-ui &>/dev/null; then
-    (
-      sed -i 's|^PROCS=/opt/sbin/xkeen-ui$|PROCS=xkeen-ui|' /opt/etc/init.d/S99xkeen-ui
-      $XKEENUI_INIT stop &>/dev/null || :
-      killall -q -9 xkeen-ui || :
-    ) &
-    spinner $! "Остановка XKeen UI..."
-  else
-    sed -i 's|^PROCS=/opt/sbin/xkeen-ui$|PROCS=xkeen-ui|' /opt/etc/init.d/S99xkeen-ui
-  fi
-
-  legacy_installation_check; download_files
-
-  sync & spinner $! "Запись данных..."
-
-  $XKEENUI_INIT start &>/dev/null &
-  if ! spinner $! "Запуск XKeen UI..."; then
-    printf "${RED_BOLD}\n Не удалось запустить XKeen UI.${NCN}"
-    exit 1
-  fi
-
+  [ -f "$XKEENUI_BIN" ] || { printf "${ERROR} Ошибка: XKeen UI не установлен!${NCN}"; return 1; }
+  replace_xkeenui || return 1
   finish_setup "обновлен"
 }
 
@@ -205,7 +262,7 @@ legacy_installation_check() {
 }
 
 create_xkeenui_init() {
-  cat << EOF > $XKEENUI_INIT
+  cat << EOF > "${1:-$XKEENUI_INIT}" || return 1
 #!/bin/sh
 
 ENABLED=yes
@@ -217,7 +274,7 @@ PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 
 . /opt/etc/init.d/rc.func
 EOF
-  chmod +x $XKEENUI_INIT
+  chmod 755 "${1:-$XKEENUI_INIT}"
 }
 
 get_status() {

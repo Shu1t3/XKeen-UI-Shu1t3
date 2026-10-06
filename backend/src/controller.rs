@@ -122,11 +122,14 @@ pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), Str
     } else {
         Command::new(&path).args(args).status().await
     };
-    if let Err(e) = result {
-        *state.init_file.write().unwrap() = None;
-        return Err(format!("{}: {}", path, e));
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{path}: {status}")),
+        Err(e) => {
+            *state.init_file.write().unwrap() = None;
+            Err(format!("{path}: {e}"))
+        }
     }
-    Ok(())
 }
 
 fn get_core_info(name: &str) -> CoreInfo {
@@ -195,23 +198,26 @@ async fn soft_restart_core(core: Core) -> Result<(), String> {
         .create(true)
         .open(error_log_path())
     {
-        cmd.stdout(f.try_clone().unwrap()).stderr(f);
+        cmd.stdout(f.try_clone().map_err(|e| e.to_string())?).stderr(f);
     }
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    match child.try_wait() {
-        Ok(Some(status)) if !status.success() => {
-            return Err(format!("Не удалось перезапустить {}: {}", core.name(), status));
-        }
-        _ => {
-            tokio::spawn(async move {
-                _ = child.wait().await;
-            });
-        }
-    }
-
+    confirm_started(&mut child, core.name(), std::time::Duration::from_secs(3)).await?;
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     Ok(())
+}
+
+async fn confirm_started(
+    child: &mut tokio::process::Child, name: &str, window: std::time::Duration,
+) -> Result<(), String> {
+    tokio::time::sleep(window).await;
+    match child.try_wait() {
+        Ok(Some(status)) => Err(format!("Не удалось перезапустить {name}: {status}")),
+        Err(e) => Err(format!("Не удалось проверить процесс {name}: {e}")),
+        Ok(None) => Ok(()),
+    }
 }
 
 pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
@@ -471,6 +477,29 @@ mod tests {
             .unwrap();
             assert_eq!(req.requested_core().unwrap(), core);
         }
+    }
+
+    #[tokio::test]
+    async fn startup_confirmation_rejects_any_early_exit_including_success() {
+        for exit in [0, 7] {
+            let mut child = Command::new("sh")
+                .args(["-c", &format!("exit {exit}")])
+                .spawn()
+                .unwrap();
+            assert!(
+                confirm_started(&mut child, "fixture", std::time::Duration::from_millis(50))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut child = Command::new("sh").args(["-c", "exec sleep 10"]).spawn().unwrap();
+        assert!(
+            confirm_started(&mut child, "fixture", std::time::Duration::from_millis(50))
+                .await
+                .is_ok()
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
     }
 
     #[tokio::test]

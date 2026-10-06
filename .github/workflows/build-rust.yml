@@ -21,11 +21,14 @@ jobs:
           grep -q '^## Исправления$' "$notes" || { echo "Release notes must describe fixes"; exit 1; }
           grep -q '^- ' "$notes" || { echo "Release notes must contain changes"; exit 1; }
       - name: Test installer release selection
-        run: sh scripts/test-release-source.sh
+        run: |
+          sh scripts/test-release-source.sh
+          sh scripts/test-installer-transaction.sh
+          sh scripts/test-self-update.sh
       - uses: oven-sh/setup-bun@v2
       - name: Build frontend
         working-directory: frontend
-        run: bun install --frozen-lockfile && bunx eslint . --max-warnings 0 && bun run build
+        run: bun install --frozen-lockfile && bunx eslint . --max-warnings 0 && bun test tests && bun run build
       - name: Install Rust for tests
         run: rustup toolchain install stable --profile minimal
       - uses: swatinem/rust-cache@v2
