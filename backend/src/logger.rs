@@ -70,6 +70,10 @@ pub fn process_log_line(line: String, tz: i32) -> String {
         }
     }
 
+    // Log content is untrusted (including validator and upstream error output).
+    // Escape it before adding our fixed markup, never after ANSI/level rendering.
+    out = escape_html(&out);
+
     out = ANSI_RE
         .replace_all(&out, |caps: &regex_lite::Captures<'_>| match &caps[0] {
             "\x1b[32m" | "\x1b[92m" => r#"<span style="color: #00cc00;">"#,
@@ -95,4 +99,66 @@ pub fn process_log_line(line: String, tz: i32) -> String {
         .to_string();
 
     format!(r#"<div class="log-line">{}</div>"#, out)
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_log_content_is_escaped_before_trusted_markup() {
+        for payload in [
+            "<img src=x onerror=alert(1)>",
+            "</div><svg onload=alert(1)>",
+            "<script>alert(1)</script>",
+            "<span class=log-badge data-filter=ERROR onclick=alert(1)>fake</span>",
+            "&lt;img src=x onerror=alert(1)&gt;",
+            "quotes: \" ' & < > кириллица",
+        ] {
+            let rendered = process_log_line(format!("[ERROR] {}", payload), 0);
+            assert!(rendered.contains(&escape_html(payload)), "{rendered}");
+            assert!(rendered.contains(r#"<span class="log-badge log-badge-error" data-filter="ERROR">ERROR</span>"#));
+            assert!(!rendered.contains("<img"));
+            assert!(!rendered.contains("<svg"));
+            assert!(!rendered.contains("<script"));
+        }
+    }
+
+    #[test]
+    fn ansi_colors_and_levels_do_not_unescape_payloads() {
+        let rendered = process_log_line("\x1b[31m[warning] <img src='x' onerror=alert(1)>\x1b[0m".into(), 0);
+        assert_eq!(
+            rendered,
+            r##"<div class="log-line"><span style="color: #ef4444;"><span class="log-badge log-badge-warn" data-filter="WARN">WARN</span> &lt;img src=&#39;x&#39; onerror=alert(1)&gt;</span></div>"##
+        );
+    }
+
+    #[test]
+    fn timestamp_formats_escape_extracted_messages() {
+        let standard = process_log_line("2026/10/06 12:00:00.123456789 [INFO] <svg onload=alert(1)>".into(), 3);
+        assert!(standard.contains("2026/10/06 15:00:00.123456"));
+        assert!(standard.contains("&lt;svg onload=alert(1)&gt;"));
+        let structured = process_log_line(
+            r#"time="2026-10-06T12:00:00Z" level=error msg="<img onerror=alert(1)>""#.into(),
+            3,
+        );
+        assert!(structured.contains("2026/10/06 15:00:00"));
+        assert!(structured.contains("&lt;img onerror=alert(1)&gt;"));
+        assert_eq!(process_log_line(String::new(), 0), "");
+    }
 }

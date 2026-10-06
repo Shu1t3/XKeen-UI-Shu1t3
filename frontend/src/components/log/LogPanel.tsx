@@ -11,6 +11,7 @@ import { LOCAL_ROUTER_ID, isRouterSelectable, routerId } from '../../lib/multi-r
 import { useRoutersStore } from '../../lib/multi-routers/store'
 import { useSettings } from '../../lib/store'
 import { cn } from '../../lib/utils'
+import { renderLogError } from '../../lib/log-html'
 import type { WsMessage } from '../../lib/websocket'
 import { useWebSocket } from '../../lib/websocket'
 import { AddRouterDialog } from './multi-routers/AddRouterDialog'
@@ -113,7 +114,7 @@ export function LogPanel() {
   const handleMessage = useCallback(
     (data: WsMessage) => {
       if (data.error) {
-        renderAll([`<div style="color:#ef4444">ERROR: ${data.error}</div>`])
+        renderAll([renderLogError(data.error)])
         return
       }
       if (data.type === 'initial' || data.type === 'filtered') {

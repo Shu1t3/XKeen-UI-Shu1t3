@@ -238,3 +238,32 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn initial_filtered_and_appended_logs_escape_stored_payloads() {
+        let path = std::env::temp_dir().join(format!("xkeen-log-xss-{}.log", uuid::Uuid::new_v4()));
+        let name = path.to_string_lossy().into_owned();
+        let payload = "[ERROR] upstream: <img src=x onerror=alert(1)>\n";
+        std::fs::write(&path, payload).unwrap();
+        let (kind, initial, offset) = read_log_file(name.clone(), 0, String::new(), true, 0);
+        assert_eq!(kind, "initial");
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].contains("&lt;img src=x onerror=alert(1)&gt;"));
+        let (_, filtered, _) = read_log_file(name.clone(), 0, "ERROR".into(), true, 0);
+        assert_eq!(filtered, initial);
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "[WARN] validator: </div><svg onload=alert(1)>").unwrap();
+        let (kind, appended, _) = read_log_file(name, offset, String::new(), false, 0);
+        assert_eq!(kind, "append");
+        assert_eq!(appended.len(), 1);
+        assert!(appended[0].contains("&lt;/div&gt;&lt;svg onload=alert(1)&gt;"));
+        let wire = serde_json::json!({"type": kind, "content": appended.join("\n")});
+        assert!(!wire["content"].as_str().unwrap().contains("<svg"));
+        std::fs::remove_file(path).unwrap();
+    }
+}
