@@ -19,10 +19,10 @@ case "$1" in
  touch '{running}';;
 esac
 '''); init.chmod(0o755)
-        mocks={'id':'echo 0', 'opkg':'echo "arch aarch64-3.10_kn 200"', 'pidof':f'test -f "{running}"', 'timeout': 'exit 1' if scenario=='bad-version' else 'echo "XKeen UI v0.0.1-fork.1"', 'sync':':','sleep':':','curl':'exit 22', 'od':'[ "$1" = "-b" ] || exit 1\nexec /usr/bin/od "$@"'}
+        mocks={'id':'echo 0', 'opkg':'echo "arch aarch64-3.10_kn 200"', 'pidof':f'test -f "{running}"', 'check-version': 'exit 1' if scenario=='bad-version' else 'echo "XKeen UI v0.0.1-fork.1"', 'sync':':','sleep':':','curl':'exit 22', 'od':'[ "$1" = "-b" ] || exit 1\nexec /usr/bin/od "$@"'}
         for name,body in mocks.items():
             p=commands/name;p.write_text('#!/bin/sh\n'+body+'\n');p.chmod(0o755)
-        script=root/'switch.sh';script.write_text(source.replace('/opt/',str(opt)+'/'))
+        script=root/'switch.sh';script.write_text(source.replace('/opt/',str(opt)+'/').replace('check_version "$WORK/new"', '"'+str(commands/'check-version')+'" "$WORK/new"'))
         payload=opt/'tmp/new';payload.write_bytes(b'html' if scenario=='bad-elf' else new)
         if scenario=='rollback':
             backup=root/'backup';backup.mkdir();(backup/'xkeen-ui').write_bytes(new);args=['--rollback',str(backup)]
@@ -40,3 +40,15 @@ esac
             assert (backups[0]/'xkeen-ui').read_bytes()==old
             assert (backups[0]/'xkeen-ui.json').read_text()=='private-settings'
         print('PASS',scenario)
+
+# Exercise the real watchdog with success, failure, and a hung executable.
+helper = source[source.index('check_version() ('):source.index('MODE=release')]
+for name, body, expected in [('version-success', 'exit 0', True), ('version-failure', 'exit 7', False), ('version-hung', 'while :; do :; done', False)]:
+    with tempfile.TemporaryDirectory() as d:
+        root = pathlib.Path(d)
+        executable = root/'candidate'
+        executable.write_text('#!/bin/sh\n'+body+'\n')
+        executable.chmod(0o755)
+        result = subprocess.run(['sh', '-c', helper.replace('sleep 15 &', 'sleep 1 &')+'\ncheck_version "$1"', 'check', str(executable)], capture_output=True, text=True, timeout=5)
+        assert (result.returncode == 0) == expected, (name, result)
+        print('PASS', name)

@@ -15,6 +15,24 @@ For a prerelease, specify its exact tag with --tag.
 HELP
 }
 fail() { printf '%s\n' "Ошибка: $*" >&2; exit 1; }
+# Use only shell builtins and sleep: minimal BusyBox may not provide timeout.
+check_version() (
+    "$1" --version &
+    version_pid=$!
+    (
+        sleep 15 &
+        timer_pid=$!
+        trap 'kill "$timer_pid" 2>/dev/null || :; exit 0' HUP INT TERM
+        wait "$timer_pid" || exit 0
+        kill -KILL "$version_pid" 2>/dev/null || :
+    ) &
+    watchdog_pid=$!
+    trap 'kill "$version_pid" "$watchdog_pid" 2>/dev/null || :; exit 1' HUP INT TERM
+    if wait "$version_pid"; then result=0; else result=$?; fi
+    kill "$watchdog_pid" 2>/dev/null || :
+    wait "$watchdog_pid" 2>/dev/null || :
+    exit "$result"
+)
 MODE=release
 TAG=latest
 SOURCE=
@@ -96,8 +114,7 @@ chmod 755 "$WORK/new"
 MAGIC=$(dd if="$WORK/new" bs=4 count=1 2>/dev/null | od -b | awk 'NR == 1 { print $2 $3 $4 $5 }')
 [ "$MAGIC" = 177105114106 ] || fail 'Файл не является ELF-бинарником.'
 # Check both the architecture/loader and the CLI before stopping the panel.
-command -v timeout >/dev/null 2>&1 || fail 'Не найдена команда timeout.'
-timeout 15 "$WORK/new" --version || fail 'Бинарник не запускается на этом роутере.'
+check_version "$WORK/new" || fail 'Бинарник не запускается на этом роутере.'
 
 mkdir -p "$BACKUP_ROOT"
 chmod 700 "$BACKUP_ROOT"
