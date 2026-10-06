@@ -21,7 +21,7 @@ if run_version_probe "$ROOT/probe" >/dev/null 2>&1; then exit 1; fi
 printf '#!/bin/sh\nexec sleep 30\n' > "$ROOT/probe"
 if run_version_probe "$ROOT/probe" >/dev/null 2>&1; then exit 1; fi
 printf 'PASS version failure and watchdog timeout\n'
-run_version_probe() { [ "$FAULT" != version ]; }
+run_version_probe() { [ -z "${CASE:-}" ] || touch "$CASE/probed"; [ "$FAULT" != version ]; }
 # Real ELF validation, with execution independently injected.
 STAGE=$ROOT CANDIDATE=$ROOT/elf FAULT=none
 make_elf "$CANDIDATE"
@@ -32,14 +32,50 @@ make_elf "$CANDIDATE"
 printf '\010' | dd of="$CANDIDATE" bs=1 seek=18 conv=notrunc 2>/dev/null
 if validate_candidate "$CANDIDATE" >/dev/null 2>&1; then exit 1; fi
 curl() {
+  first=$1
+  output='' url='' direct=false protocol=false write_status=false
   while [ "$#" -gt 0 ]; do
-    if [ "$1" = -o ]; then shift; output=$1; fi
+    case "$1" in
+      -o) shift; output=$1 ;;
+      --noproxy) shift; [ "$1" = '*' ] && direct=true ;;
+      --proto) shift; [ "$1" = '=https' ] && protocol=true ;;
+      --write-out) shift; write_status=true ;;
+      https://*) url=$1 ;;
+      -fL|-fLsS|-L) case "$url" in *api.github.com*) return 99;; esac ;;
+    esac
     shift
   done
-  if [ "$FAULT" = download ]; then printf 'PARTIAL' > "$output"; return 18; fi
-  make_elf "$output"
-  if [ "$FAULT" = architecture ]; then printf 'BAD' > "$output"; fi
+  case "$url" in
+    https://api.github.com/*)
+      [ "$first" = -q ] && [ "$direct" = true ] && [ "$protocol" = true ] && [ "$write_status" = true ] || return 99
+      if [ "$FAULT" = metadata-network ]; then return 60; fi
+      if [ "$FAULT" = metadata-redirect ]; then printf '302'; return 0; fi
+      case "$url" in
+        *'/releases?'*) printf '[{"tag_name":"v0.0.1-fork.8","draft":false,"prerelease":false}]' > "$output" ;;
+        *)
+          make_elf "$STAGE/hash-source"
+          if [ "$FAULT" = architecture ]; then printf BAD > "$STAGE/hash-source"; fi
+          digest=$(command sha256sum "$STAGE/hash-source"); digest=${digest%% *}
+          case "$FAULT" in
+            missing-digest) digest='' ;;
+            invalid-digest) digest=invalid ;;
+          esac
+          jq -n --arg digest "sha256:$digest" '{tag_name:"v0.0.1-fork.8",draft:false,assets:[{name:"xkeen-ui-arm64-v8a",state:"uploaded",digest:$digest}]}' > "$output"
+          case "$FAULT" in
+            duplicate-asset) jq '.assets += .assets' "$output" > "$output.tmp"; command mv "$output.tmp" "$output" ;;
+            wrong-tag) jq '.tag_name = "v9.0.0"' "$output" > "$output.tmp"; command mv "$output.tmp" "$output" ;;
+            draft) jq '.draft = true' "$output" > "$output.tmp"; command mv "$output.tmp" "$output" ;;
+          esac ;;
+      esac
+      printf 200 ;;
+    *)
+      if [ "$FAULT" = download ]; then printf 'PARTIAL' > "$output"; return 18; fi
+      make_elf "$output"
+      if [ "$FAULT" = architecture ]; then printf BAD > "$output"; fi
+      if [ "$FAULT" = tamper ]; then printf tampered >> "$output"; fi ;;
+  esac
 }
+
 pidof() { [ -f "$CASE/running" ]; }
 killall() { rm -f "$CASE/running"; }
 sleep() { :; }
@@ -54,7 +90,7 @@ mv() {
   command mv "$@"
 }
 finish_setup() { :; }
-for FAULT in download architecture version backup sync stop rename init-rename start health recovery none; do
+for FAULT in metadata-network metadata-redirect missing-digest invalid-digest duplicate-asset wrong-tag draft tamper download architecture version backup sync stop rename init-rename start health recovery none; do
   CASE=$ROOT/case-$FAULT; mkdir "$CASE"
   XKEENUI_BIN=$CASE/xkeen-ui
   XKEENUI_INIT=$CASE/init
@@ -93,6 +129,11 @@ INIT
     printf 'PASS recovery (backup and lock retained)\n'
     continue
   fi
+  case "$FAULT" in
+    metadata-*|*-digest|duplicate-asset|wrong-tag|draft|tamper|download)
+      test ! -f "$CASE/probed"
+      test ! -f "$CASE/synced" ;;
+  esac
   test -f "$CASE/running"
   test ! -d "$CASE/.xkeen-ui-update.lock"
   test -z "$(find "$CASE" -name '*.stage.*' -print)"

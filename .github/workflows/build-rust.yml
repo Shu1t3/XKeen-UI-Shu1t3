@@ -149,3 +149,12 @@ jobs:
           fail_on_unmatched_files: true
           prerelease: true
           files: artifacts/xkeen-ui-*/*
+
+      - name: Verify published GitHub digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+          HTTPS_PROXY: ''
+          HTTP_PROXY: ''
+          ALL_PROXY: ''
+        run: python3 .github/scripts/verify-release-digests.py

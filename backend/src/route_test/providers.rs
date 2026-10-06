@@ -681,6 +681,18 @@ pub(crate) struct Providers {
 }
 
 impl Providers {
+    #[cfg(test)]
+    pub(crate) fn from_test_nodes(nodes: Vec<(&str, RuleKind)>) -> Self {
+        Self {
+            loaded: nodes.into_iter().map(|(name, node)| {
+                (name.to_string(), Arc::new(ParsedProvider::Classical(ClassicalProvider {
+                    rules: vec![(node, "test node".into())],
+                })))
+            }).collect(),
+            unusable: HashMap::new(),
+        }
+    }
+
     pub(crate) async fn load(defs: HashMap<String, ProviderDef>) -> Self {
         let mut loaded = HashMap::new();
         let mut unusable = HashMap::new();

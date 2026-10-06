@@ -27,7 +27,8 @@ RELEASE_CHANNEL=latest
 LOCAL=false
 case "${1:-latest}" in
   latest|stable|beta) RELEASE_CHANNEL="${1:-latest}" ;;
-  *) printf 'Неизвестный канал: %s (latest, stable, beta)\n' "$1" >&2; exit 1 ;;
+  --local) LOCAL=true ;;
+  *) printf 'Неизвестный канал: %s (latest, stable, beta, --local)\n' "$1" >&2; exit 1 ;;
 esac
 
 spinner() {
@@ -56,6 +57,28 @@ get_arch() {
 
 select_release_tag() {
   jq -er --arg channel "$RELEASE_CHANNEL" '[.[] | select(.draft != true) | select($channel == "latest" or ($channel == "beta" and .prerelease == true) or ($channel == "stable" and .prerelease != true))] | first | .tag_name | select(type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$"))'
+}
+
+# Metadata is trusted only when obtained directly from GitHub over HTTPS.
+# Do not follow redirects or inherit environment proxy settings for this request.
+get_trusted_release() {
+  local status
+  status=$(curl -q -fsS --noproxy '*' --proto '=https' --connect-timeout 20 --max-time 60 \
+    -o "$2" --write-out '%{http_code}' "$1") || return 1
+  [ "$status" = 200 ] || { printf 'GitHub API вернул неожиданный HTTP-статус: %s\n' "$status" >&2; return 1; }
+}
+release_asset_digest() {
+  jq -er --arg tag "$2" --arg name "$3" '
+    select(.draft == false and .tag_name == $tag)
+    | [.assets[] | select(.name == $name)] | select(length == 1) | .[0] | select(.state == "uploaded") | .digest
+    | select(type == "string" and test("^sha256:[0-9a-fA-F]{64}$"))
+    | .[7:] | ascii_downcase' "$1"
+}
+verify_release_file() {
+  local actual
+  actual=$(sha256sum "$1") || return 1
+  actual=${actual%% *}
+  [ "$actual" = "$2" ] || { printf 'SHA-256 бинарника не совпадает с доверенными метаданными GitHub\n' >&2; return 1; }
 }
 
 # Transaction helpers run in a subshell so traps cannot leak into the menu.
@@ -96,19 +119,21 @@ run_version_probe() {
 }
 
 download_files() {
-  local base_url="https://github.com/$UI_REPOSITORY/releases"
-  local download_url="$base_url/latest/download"
   local bin_name="xkeen-ui-$ARCH"
-  if [ "$LOCAL" != true ] && [ "$RELEASE_CHANNEL" != stable ]; then
-    curl -fsS --connect-timeout 20 --max-time 60 "https://api.github.com/repos/$UI_REPOSITORY/releases?per_page=100" > "$STAGE/releases" || return 1
-    local tag
-    tag=$(select_release_tag < "$STAGE/releases") || return 1
-    download_url="$base_url/download/$tag"
-  fi
-  if [ "$LOCAL" = true ] && [ -f "/opt/tmp/$bin_name" ]; then
+  if [ "$LOCAL" = true ]; then
+    [ -f "/opt/tmp/$bin_name" ] || return 1
+    printf 'Установка локального файла: источник доверия подтверждается вручную (%s)\n' "/opt/tmp/$bin_name"
     cp "/opt/tmp/$bin_name" "$CANDIDATE" || return 1
   else
-    curl -fLsS --connect-timeout 20 --max-time 300 -o "$CANDIDATE" "$download_url/$bin_name" || return 1
+    command -v jq >/dev/null 2>&1 || { printf 'Для проверки релиза установите jq: opkg install jq\n' >&2; return 1; }
+    command -v sha256sum >/dev/null 2>&1 || { printf 'Для проверки релиза необходим sha256sum\n' >&2; return 1; }
+    get_trusted_release "https://api.github.com/repos/$UI_REPOSITORY/releases?per_page=100" "$STAGE/releases" || return 1
+    local tag digest
+    tag=$(select_release_tag < "$STAGE/releases") || return 1
+    get_trusted_release "https://api.github.com/repos/$UI_REPOSITORY/releases/tags/$tag" "$STAGE/release" || return 1
+    digest=$(release_asset_digest "$STAGE/release" "$tag" "$bin_name") || { printf 'Нет доверенного SHA-256 для выбранного релиза; установка запрещена\n' >&2; return 1; }
+    curl -fLsS --connect-timeout 20 --max-time 300 -o "$CANDIDATE" "https://github.com/$UI_REPOSITORY/releases/download/$tag/$bin_name" || return 1
+    verify_release_file "$CANDIDATE" "$digest" || return 1
   fi
   validate_candidate "$CANDIDATE"
 }
@@ -197,7 +222,6 @@ replace_xkeenui() (
 )
 
 install_xkeenui() {
-  [ -f "/opt/tmp/xkeen-ui-$ARCH" ] && LOCAL=true
   replace_xkeenui || return 1
   finish_setup "установлен"
 }

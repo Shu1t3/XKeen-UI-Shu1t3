@@ -16,6 +16,7 @@ mod geo;
 mod local_dev;
 mod logger;
 mod release_source;
+mod release_integrity;
 mod route_test;
 mod ruleset_inspector;
 mod settings;

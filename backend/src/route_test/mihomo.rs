@@ -211,6 +211,29 @@ fn split_top_level_groups(payload: &str) -> Result<Vec<String>, String> {
     Ok(groups)
 }
 
+// Ограничение действует до рекурсивного построения дерева и при его оценке.
+const MAX_RULE_DEPTH: usize = 64;
+
+/// Проверяем логические потомки итеративно: вредоносная строка не расходует стек парсера.
+fn validate_rule_tree(line: &str, classical: bool) -> Result<(), String> {
+    let mut pending = vec![(line.to_string(), 0usize)];
+    while let Some((line, depth)) = pending.pop() {
+        if depth >= MAX_RULE_DEPTH {
+            return Err(format!("превышена глубина вложенности правил ({MAX_RULE_DEPTH})"));
+        }
+        let (tp, payload, _, _) = parse_rule_payload(&line, false);
+        if classical && matches!(tp.as_str(), "MATCH" | "RULE-SET" | "SUB-RULE") {
+            return Err(format!("тип {tp} недопустим внутри classical rule-set"));
+        }
+        if matches!(tp.as_str(), "AND" | "OR" | "NOT") {
+            for child in split_top_level_groups(&payload)? {
+                pending.push((child, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_predicate_from_line(line: &str) -> RuleKind {
     let (tp, payload, _target, params) = parse_rule_payload(line, false);
     if tp == "MATCH" {
@@ -246,9 +269,7 @@ fn build_not(payload: &str) -> RuleKind {
 /// mihomo зовёт `classicalStrategy.payloadToRule`, `MATCH`/`RULE-SET`/`SUB-RULE` запрещены).
 pub(crate) fn parse_predicate(line: &str) -> Result<RuleKind, String> {
     let (tp, payload, _target, params) = parse_rule_payload(line, false);
-    if matches!(tp.as_str(), "MATCH" | "RULE-SET" | "SUB-RULE") {
-        return Err(format!("тип {tp} недопустим внутри classical rule-set"));
-    }
+    validate_rule_tree(line, true)?;
     Ok(build_rule_kind(&tp, &payload, &params))
 }
 
@@ -259,6 +280,11 @@ fn rule_kind_from_bool(b: bool) -> RuleKind {
 }
 
 fn build_rule_kind(tp: &str, payload: &str, params: &[String]) -> RuleKind {
+    if matches!(tp, "AND" | "OR" | "NOT")
+        && let Err(reason) = validate_rule_tree(&format!("{tp},{payload}"), false)
+    {
+        return RuleKind::Unknown(reason);
+    }
     match tp {
         "DOMAIN" => RuleKind::Domain(payload.to_lowercase()),
         "DOMAIN-SUFFIX" => RuleKind::DomainSuffix(payload.to_lowercase()),
@@ -560,6 +586,8 @@ pub(crate) struct EvalState<'a, R: Resolver> {
     /// правил смысл их собственного `is_src` инвертируется. `Host` при этом НЕ меняется
     /// (`RuleHost()` не участвует в свопе), поэтому на доменные правила/провайдеры это не влияет.
     swap_src: bool,
+    predicate_depth: usize,
+    active_providers: Vec<String>,
     detail: Option<String>,
     providers: &'a Providers,
     geodata_mode: bool,
@@ -737,6 +765,10 @@ impl<'a, R: Resolver> EvalState<'a, R> {
                 }
             }
             ParsedProvider::Classical(cp) => {
+                if self.active_providers.iter().any(|active| active == name) {
+                    return Verdict::Unknown(format!("циклическая ссылка на провайдер '{name}'"));
+                }
+                self.active_providers.push(name.to_string());
                 // `is_src` => полный своп Src/Dst для вложенных правил (mihomo:
                 // `RuleSet.Match`/`SwapSrcDst`); `Host` не свопается, поэтому доменные правила
                 // внутри classical (в т.ч. через `swap_src`) читают тот же `domain_target`, что и
@@ -750,6 +782,7 @@ impl<'a, R: Resolver> EvalState<'a, R> {
                     self.swap_src = true;
                 }
                 let (verdict, matched_text) = cp.matches(self).await;
+                self.active_providers.pop();
                 self.suppress_resolve = saved_suppress;
                 self.swap_src = saved_swap;
                 if verdict == Verdict::Match
@@ -806,6 +839,20 @@ impl<'a, R: Resolver> EvalState<'a, R> {
 /// Рекурсивное async-вычисление предиката. Возвращает боксированный future явно — рекурсивные
 /// `async fn` в Rust не компилируются без такого приёма (неизвестный размер future).
 pub(crate) fn eval_predicate<'a, R: Resolver>(
+    node: &'a RuleKind, eval: &'a mut EvalState<'_, R>,
+) -> Pin<Box<dyn Future<Output = Verdict> + Send + 'a>> {
+    Box::pin(async move {
+        if eval.predicate_depth >= MAX_RULE_DEPTH {
+            return Verdict::Unknown(format!("превышена глубина оценки правил ({MAX_RULE_DEPTH})"));
+        }
+        eval.predicate_depth += 1;
+        let verdict = eval_predicate_inner(node, eval).await;
+        eval.predicate_depth -= 1;
+        verdict
+    })
+}
+
+fn eval_predicate_inner<'a, R: Resolver>(
     node: &'a RuleKind, eval: &'a mut EvalState<'_, R>,
 ) -> Pin<Box<dyn Future<Output = Verdict> + Send + 'a>> {
     Box::pin(async move {
@@ -1403,6 +1450,8 @@ impl Engine {
             dns_source: None,
             suppress_resolve: false,
             swap_src: false,
+            predicate_depth: 0,
+            active_providers: Vec::new(),
             detail: None,
             providers: &self.providers,
             geodata_mode: self.geodata_mode,
@@ -1553,6 +1602,98 @@ mod tests {
 
     fn empty_resolver() -> StaticResolver {
         StaticResolver(Map::new())
+    }
+
+    #[test]
+    fn classical_rejects_forbidden_nodes_at_every_logical_level() {
+        for forbidden in ["MATCH", "RULE-SET,A", "SUB-RULE,((DOMAIN,example.com)),A"] {
+            for line in [
+                forbidden.to_string(),
+                format!("AND,(({forbidden}),(DOMAIN,example.com))"),
+                format!("OR,((DOMAIN,example.com),(NOT,((AND,(({forbidden}))))))"),
+            ] {
+                assert!(parse_predicate(&line).is_err(), "accepted {line}");
+            }
+        }
+        assert!(parse_predicate("AND,((DOMAIN-SUFFIX,example.com),(OR,((NETWORK,TCP),(DST-PORT,443))))").is_ok());
+        // Подстроки запрещённых имён в обычном payload не являются ссылкой на provider.
+        assert!(parse_predicate("DOMAIN-REGEX,(RULE-SET|MATCH|SUB-RULE)\\.example").is_ok());
+    }
+
+    #[test]
+    fn parser_bounds_nested_logic_before_building_tree() {
+        let mut line = "DOMAIN,example.com".to_string();
+        for _ in 0..MAX_RULE_DEPTH - 1 {
+            line = format!("NOT,(({line}))");
+        }
+        assert!(parse_predicate(&line).is_ok());
+        line = format!("NOT,(({line}))");
+        assert!(matches!(parse_predicate(&line), Err(reason) if reason.contains("глубина")));
+        let top = build_top_rules(&[format!("{line},PROXY")]);
+        assert!(matches!(&top[0].node, RuleKind::Unknown(reason) if reason.contains("глубина")));
+    }
+
+    fn ruleset_node(name: &str) -> RuleKind {
+        RuleKind::RuleSet { name: name.into(), is_src: true, no_resolve: true }
+    }
+
+    #[tokio::test]
+    async fn evaluator_rejects_self_and_two_provider_cycles_and_recovers() {
+        for nodes in [
+            vec![("A", ruleset_node("A"))],
+            vec![("A", RuleKind::Not(Box::new(ruleset_node("B")))), ("B", ruleset_node("A"))],
+        ] {
+            // Обход парсера специально проверяет независимую защиту evaluator.
+            let mut engine = from_yaml_str("rules: [\"RULE-SET,A,PROXY\", \"DOMAIN,example.com,SAFE\"]", Path::new(".")).await.unwrap();
+            engine.providers = Providers::from_test_nodes(nodes);
+            let result = engine.evaluate(&ctx_domain("example.com"), &empty_resolver()).await;
+            assert_eq!(result.outbound.as_deref(), Some("SAFE"));
+            assert_eq!(result.skipped.len(), 1);
+            assert!(result.skipped[0].reason.contains("циклическая"));
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluator_bounds_deep_trees_and_provider_chains() {
+        let mut engine = from_yaml_str("rules: [\"RULE-SET,A,PROXY\", \"DOMAIN,example.com,SAFE\"]", Path::new(".")).await.unwrap();
+        let mut node = RuleKind::Domain("example.com".into());
+        for _ in 0..MAX_RULE_DEPTH {
+            node = RuleKind::Not(Box::new(node));
+        }
+        engine.providers = Providers::from_test_nodes(vec![("A", node)]);
+        let resolver = empty_resolver();
+        let result = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(result.outbound.as_deref(), Some("SAFE"));
+        assert!(result.skipped[0].reason.contains("глубина"));
+
+        let names: Vec<String> = (0..MAX_RULE_DEPTH + 1).map(|i| if i == 0 { "A".into() } else { format!("P{i}") }).collect();
+        let nodes = names.windows(2).map(|pair| (pair[0].as_str(), ruleset_node(&pair[1]))).collect();
+        engine.providers = Providers::from_test_nodes(nodes);
+        let result = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(result.outbound.as_deref(), Some("SAFE"));
+        assert!(result.skipped[0].reason.contains("глубина"));
+    }
+
+    #[tokio::test]
+    async fn classical_load_skips_nested_cycles_but_keeps_valid_rules() {
+        let yaml = r#"
+rule-providers:
+  A:
+    type: inline
+    behavior: classical
+    payload:
+      - "OR,((RULE-SET,A),(DOMAIN,example.com))"
+      - "AND,((DOMAIN,example.com),(NETWORK,TCP))"
+rules:
+  - "RULE-SET,A,PROXY"
+  - "MATCH,DIRECT"
+"#;
+        let engine = from_yaml_str(yaml, Path::new(".")).await.unwrap();
+        let result = engine.evaluate(&ctx_domain("example.com"), &empty_resolver()).await;
+        assert_eq!(result.outbound.as_deref(), Some("PROXY"));
+        assert!(result.rule.unwrap().text.contains("RULE-SET,A"));
+        let result = engine.evaluate(&ctx_domain("other.com"), &empty_resolver()).await;
+        assert_eq!(result.outbound.as_deref(), Some("DIRECT"));
     }
 
     const BASE_YAML: &str = r#"

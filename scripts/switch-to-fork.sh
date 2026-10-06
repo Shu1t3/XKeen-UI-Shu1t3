@@ -10,7 +10,9 @@ BACKUP_ROOT=/opt/var/backups/xkeen-ui-switch
 usage() {
     cat <<'HELP'
 Usage: sh switch-to-fork.sh [--tag TAG | --file /path/to/binary | --rollback BACKUP_DIR]
-Without arguments, download the newest published fork release, including prereleases (requires jq).
+Without arguments, download the newest published fork release, including prereleases.
+All remote releases (including --tag) require jq and sha256sum.
+--file and --rollback explicitly trust the supplied local binary.
 Use --tag to select an exact release.
 HELP
 }
@@ -36,6 +38,28 @@ check_version() (
 select_published_tag() {
     jq -er '[.[] | select(.draft != true)] | first | .tag_name | select(type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$"))' "$@"
 }
+# Metadata is trusted only when obtained directly from GitHub over HTTPS.
+# Do not follow redirects or inherit environment proxy settings for this request.
+get_trusted_release() {
+  local status
+  status=$(curl -q -fsS --noproxy '*' --proto '=https' --connect-timeout 20 --max-time 60 \
+    -o "$2" --write-out '%{http_code}' "$1") || return 1
+  [ "$status" = 200 ] || { printf 'GitHub API вернул неожиданный HTTP-статус: %s\n' "$status" >&2; return 1; }
+}
+release_asset_digest() {
+  jq -er --arg tag "$2" --arg name "$3" '
+    select(.draft == false and .tag_name == $tag)
+    | [.assets[] | select(.name == $name)] | select(length == 1) | .[0] | select(.state == "uploaded") | .digest
+    | select(type == "string" and test("^sha256:[0-9a-fA-F]{64}$"))
+    | .[7:] | ascii_downcase' "$1"
+}
+verify_release_file() {
+  local actual
+  actual=$(sha256sum "$1") || return 1
+  actual=${actual%% *}
+  [ "$actual" = "$2" ] || { printf 'SHA-256 бинарника не совпадает с доверенными метаданными GitHub\n' >&2; return 1; }
+}
+
 MODE=release
 TAG=latest
 SOURCE=
@@ -97,23 +121,29 @@ trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 
 case "$MODE" in
-    file) [ -f "$SOURCE" ] || fail "Не найден $SOURCE."; cp "$SOURCE" "$WORK/new" ;;
+    file) printf '%s\n' 'Локальный файл: источник доверия подтверждается вручную.'; [ -f "$SOURCE" ] || fail "Не найден $SOURCE."; cp "$SOURCE" "$WORK/new" ;;
     rollback)
+        printf '%s\n' 'Откат из локальной копии: источник доверия подтверждается вручную.'
         [ -f "$SOURCE/xkeen-ui" ] || fail 'В резервной копии нет бинарника.'
         cp "$SOURCE/xkeen-ui" "$WORK/new" ;;
     release)
         command -v curl >/dev/null 2>&1 || fail 'Не найден curl.'
+        command -v jq >/dev/null 2>&1 || fail 'Для проверки релиза установите jq: opkg install jq.'
+        command -v sha256sum >/dev/null 2>&1 || fail 'Для проверки релиза необходим sha256sum.'
         if [ "$TAG" = latest ]; then
-            command -v jq >/dev/null 2>&1 || fail 'Для выбора самого нового релиза нужен jq; либо укажите --tag.'
-            curl -fL --connect-timeout 20 --max-time 300 \
-                -o "$WORK/releases.json" "https://api.github.com/repos/$REPO/releases?per_page=100" ||
-                fail 'Не удалось получить релизы форка. Используйте --tag либо --file.'
+            get_trusted_release "https://api.github.com/repos/$REPO/releases?per_page=100" "$WORK/releases.json" ||
+                fail 'Не удалось напрямую получить релизы GitHub. Установка запрещена.'
             TAG=$(select_published_tag "$WORK/releases.json") || fail 'Нет опубликованного релиза форка.'
         fi
+        get_trusted_release "https://api.github.com/repos/$REPO/releases/tags/$TAG" "$WORK/release.json" ||
+            fail 'Не удалось напрямую получить метаданные релиза GitHub. Установка запрещена.'
+        DIGEST=$(release_asset_digest "$WORK/release.json" "$TAG" "xkeen-ui-$ARCH") ||
+            fail 'Нет доверенного SHA-256 для выбранного релиза. Установка запрещена.'
         URL="https://github.com/$REPO/releases/download/$TAG/xkeen-ui-$ARCH"
         printf '%s\n' "Загрузка $URL"
         curl -fL --connect-timeout 20 --max-time 300 -o "$WORK/new" "$URL" ||
-            fail 'Релиз или бинарник недоступен. Используйте --tag либо --file.' ;;
+            fail 'Релиз или бинарник недоступен. Используйте --tag либо --file.'
+        verify_release_file "$WORK/new" "$DIGEST" || fail 'Проверка целостности не пройдена.' ;;
 esac
 chmod 755 "$WORK/new"
 # Minimal router BusyBox od supports -b, but may lack -A, -t and -N.

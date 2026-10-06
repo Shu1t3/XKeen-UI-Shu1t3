@@ -210,6 +210,23 @@ fn response(success: bool, error: Option<String>) -> (HeaderMap, Json<Value>) {
     (h, Json(json!({ "success": success, "error": error })))
 }
 
+async fn download_verified(repo: &str, tag: &str, name: &str, proxies: &[String], path: &Path) -> Result<DownloadResult, String> {
+    let trusted = crate::release_integrity::asset(repo, tag, name).await?;
+    download_with_trusted_asset(trusted, proxies, path).await
+}
+
+async fn download_with_trusted_asset(trusted: crate::release_integrity::TrustedAsset, proxies: &[String], path: &Path) -> Result<DownloadResult, String> {
+    let result = download(&trusted.url, proxies, path).await?;
+    match &result {
+        DownloadResult::RAM(bytes) => trusted.verify_bytes(bytes)?,
+        DownloadResult::Disk(file) => {
+            let file = file.clone();
+            tokio::task::spawn_blocking(move || trusted.verify_file(&file)).await.map_err(|e| e.to_string())??;
+        }
+    }
+    Ok(result)
+}
+
 async fn download(url: &str, proxies: &[String], tmp_path: &Path) -> Result<DownloadResult, String> {
     // Downloads need a larger budget than the shared API/relay client.
     let client = reqwest::Client::builder()
@@ -393,24 +410,13 @@ async fn install_jq() -> Result<(), String> {
 
 async fn install_yq(proxies: &[String], tmp_dir: &Path) -> Result<(), String> {
     let arch = std::env::consts::ARCH;
-    let url = match arch {
-        "aarch64" => format!(
-            "{}/mikefarah/yq/releases/latest/download/yq_linux_arm64",
-            GITHUB_RELEASE
-        ),
-        "mips" if cfg!(target_endian = "little") => format!(
-            "{}/mikefarah/yq/releases/download/v4.52.2/yq_linux_mipsle",
-            GITHUB_RELEASE
-        ),
-        "mips" => format!(
-            "{}/mikefarah/yq/releases/download/v4.52.2/yq_linux_mips",
-            GITHUB_RELEASE
-        ),
+    let (tag, name) = match arch {
+        "aarch64" => ("latest", "yq_linux_arm64"),
+        "mips" if cfg!(target_endian = "little") => ("v4.52.2", "yq_linux_mipsle"),
+        "mips" => ("v4.52.2", "yq_linux_mips"),
         _ => return Err("Архитектура не поддерживается для yq".into()),
     };
-
-    log("INFO", format!("Загрузка yq: {}", url));
-    let dl_res = download(&url, proxies, &tmp_dir.join("yq.tmp")).await?;
+    let dl_res = download_verified("mikefarah/yq", tag, name, proxies, &tmp_dir.join("yq.tmp")).await?;
     let target = opt_path!("/sbin/yq");
     if let Err(e) = save(dl_res, tmp_dir.join("yq.bin")).await {
         return Err(format!("Ошибка записи yq: {}", e));
@@ -481,8 +487,7 @@ async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Val
         };
 
         log("INFO", "Загрузка исполняемого файла...".into());
-        let bin_url = format!("{GITHUB_RELEASE}/{repo}/releases/download/{ver}/xkeen-ui-{arch_suffix}");
-        let bin_d = match download(&bin_url, &proxies, &tmp_dir.join("bin.tmp")).await {
+        let bin_d = match download_verified(&repo, &ver, &format!("xkeen-ui-{arch_suffix}"), &proxies, &tmp_dir.join("bin.tmp")).await {
             Ok(d) => d,
             Err(e) => return response(false, Some(e)),
         };
@@ -594,7 +599,7 @@ async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Val
     }
 
     log("INFO", format!("Загрузка: {}", url));
-    let dl_res = match download(&url, &proxies, &tmp_dir.join("download.tmp")).await {
+    let dl_res = match download_verified(&repo, &ver, &asset, &proxies, &tmp_dir.join("download.tmp")).await {
         Ok(r) => r,
         Err(e) => return response(false, Some(e)),
     };
@@ -925,5 +930,29 @@ mod tests {
             pick_asset(&["Xray-linux-64.zip".to_string()], "aarch64", "v25.9.6"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn gateway_bytes_cannot_pass_without_matching_independently_trusted_hash() {
+        use axum::{Router, routing::get};
+        let app = Router::new().route("/artifact", get(|| async { "forged executable" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = std::env::temp_dir().join(format!("xkeen-gateway-{}", uuid::Uuid::new_v4()));
+        let trusted = crate::release_integrity::fixture_asset(url.clone(), b"genuine executable");
+        let error = match download_with_trusted_asset(trusted, &[], &path).await {
+            Ok(_) => panic!("accepted forged gateway executable"),
+            Err(error) => error,
+        };
+        assert!(error.contains("SHA-256"));
+        assert!(!path.exists());
+        let trusted = crate::release_integrity::fixture_asset(url, b"forged executable");
+        assert!(download_with_trusted_asset(trusted, &[], &path).await.is_ok());
+        server.abort();
     }
 }
