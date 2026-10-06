@@ -76,21 +76,21 @@ typescript-eslint 8.71.1 требует TypeScript ниже 6.1, проект ф
 
 ## Находки
 
-### R01 — CRITICAL — Произвольная команда через выбор ядра
+### ~~R01 — CRITICAL — Произвольная команда через выбор ядра~~
 
-**Статус:** Fixed (6 октября 2026 года; исходная находка Confirmed). **Категория:** command injection / управление процессами.
-**Локация:** backend/src/controller.rs:267,292,319; дополнительно :124,129,146; setup.sh:198.
+~~**Статус:** Fixed (6 октября 2026 года; исходная находка Confirmed). **Категория:** command injection / управление процессами.~~
+~~**Локация:** backend/src/controller.rs:267,292,319; дополнительно :124,129,146; setup.sh:198.~~
 
-- **Сценарий:** POST /api/control с action=switchCore и core, содержащим shell command substitution.
-  Значение вставляется в name_client="..." и init-скрипт запускается. При auth=false сессия не требуется.
-- **Влияние:** исполнение команд с правами панели, в типичной Entware-установке root.
-  softRestart также допускает произвольный executable/path и SIGKILL процессов с произвольным comm;
-  setgid(11111) не снижает UID.
-- **Доказательство:** отсутствует allowlist; content.replace использует req.core непосредственно.
-  Безопасный временный PoC с core=$(printf audited > временный_marker) подтвердил исполнение
-  при shell assignment. check_core_config пропускает неизвестные имена.
-- **Минимальная рекомендация:** типизированный enum Xray/Mihomo на входе до любых stop/write/kill/spawn;
-  использовать фиксированные пути команд и не формировать shell-код из внешних значений.
+- ~~**Сценарий:** POST /api/control с action=switchCore и core, содержащим shell command substitution.~~
+  ~~Значение вставляется в name_client="..." и init-скрипт запускается. При auth=false сессия не требуется.~~
+- ~~**Влияние:** исполнение команд с правами панели, в типичной Entware-установке root.~~
+  ~~softRestart также допускает произвольный executable/path и SIGKILL процессов с произвольным comm;~~
+  ~~setgid(11111) не снижает UID.~~
+- ~~**Доказательство:** отсутствует allowlist; content.replace использует req.core непосредственно.~~
+  ~~Безопасный временный PoC с core=$(printf audited > временный_marker) подтвердил исполнение~~
+  ~~при shell assignment. check_core_config пропускает неизвестные имена.~~
+- ~~**Минимальная рекомендация:** типизированный enum Xray/Mihomo на входе до любых stop/write/kill/spawn;~~
+  ~~использовать фиксированные пути команд и не формировать shell-код из внешних значений.~~
 
 **Исправление:** `ControlReq.core` десериализуется в enum Xray/Mihomo. Неизвестное,
 пустое или некорректное значение отклоняется JSON extractor с HTTP 422; отсутствующее
@@ -101,15 +101,15 @@ typescript-eslint 8.71.1 требует TypeScript ниже 6.1, проект ф
 check_core_config больше не пропускает неизвестные ядра. UID/GID-политика не изменена:
 это исправление ввода и выбора команд, а не внедрение privilege separation.
 
-**Проверка:** добавлены 3 регрессионных теста, включая настоящий HTTP endpoint без
-local-dev blocker. Проверены shell substitutions `$()`/backticks, разрыв кавычек,
-пути `/bin/sh`/`../xray`, имя постороннего процесса, Unicode, неверный регистр,
-перевод строки, пустое/отсутствующее/null-значение; init-файл, его permissions и
-состояние остаются неизменными, stop-скрипт и injected marker не запускаются.
-Допустимые имена сохраняют совместимость; no-op переключение проверено для обоих ядер.
-`cargo test` и `cargo test --features local-dev`: в каждом 177 passed, 0 failed,
-2 ignored (имеющиеся тесты с внешними MMDB-файлами). Проверка запуска настоящих ядер
-и cross-build ARM/MIPS на роутере не выполнялась. Связанные дефекты R09/R10 остаются открытыми.
+~~**Проверка:** добавлены 3 регрессионных теста, включая настоящий HTTP endpoint без~~
+~~local-dev blocker. Проверены shell substitutions `$()`/backticks, разрыв кавычек,~~
+~~пути `/bin/sh`/`../xray`, имя постороннего процесса, Unicode, неверный регистр,~~
+~~перевод строки, пустое/отсутствующее/null-значение; init-файл, его permissions и~~
+~~состояние остаются неизменными, stop-скрипт и injected marker не запускаются.~~
+~~Допустимые имена сохраняют совместимость; no-op переключение проверено для обоих ядер.~~
+~~`cargo test` и `cargo test --features local-dev`: в каждом 177 passed, 0 failed,~~
+~~2 ignored (имеющиеся тесты с внешними MMDB-файлами). Проверка запуска настоящих ядер~~
+~~и cross-build ARM/MIPS на роутере не выполнялась. Связанные дефекты R09/R10 остаются открытыми.~~
 
 ### R02 — HIGH — Открытая авторизация по умолчанию и fail-open при ошибке настроек
 
@@ -155,21 +155,40 @@ backend/src/configs.rs:237; frontend/src/components/log/LogPanel.tsx:90,105.
 - **Минимальная рекомендация:** structured plain text и безопасный React-render;
   при сохранении HTML-формата экранировать весь исходный текст до добавления доверенной разметки.
 
-### R05 — HIGH — Поле порта relay выводит запрос за loopback и передаёт cookie
+### ~~R05 — HIGH — Поле порта relay выводит запрос за loopback и передаёт cookie~~
 
-**Статус:** Confirmed. **Категория:** SSRF / credential forwarding.
-**Локация:** backend/src/api_relay.rs:209,260,309,340.
+~~**Статус:** Confirmed. **Категория:** SSRF / credential forwarding.~~
+~~**Локация:** backend/src/api_relay.rs:209,260,309,340.~~
 
-- **Сценарий:** X-Clash-Port содержит 80@example.invalid.
-  build_url формирует http://127.0.0.1:80@example.invalid/proxies: 127.0.0.1:80 становится userinfo,
-  фактический hostname — example.invalid. Аналогичная строка порта применяется в WS relay.
-- **Влияние:** сетевой запрос к произвольному upstream вместо loopback; Cookie панели пересылается,
-  поскольку отсутствует в фильтре. Числовой порт дополнительно открывает доступ к произвольным локальным HTTP-сервисам.
-- **Доказательство:** resolve_clash_target принимает String без разбора порта; URL собирается format;
-  should_forward_header пропускает cookie. URL-семантика подтверждена Node-проверкой;
-  end-to-end reqwest-тест ограничен отсутствием Rust.
-- **Минимальная рекомендация:** parse u16 с запретом 0, фиксированный host через URL builder,
-  допустимые management ports, ограниченная redirect policy; не пересылать UI Cookie и upstream Set-Cookie.
+- ~~**Сценарий:** X-Clash-Port содержит 80@example.invalid.~~
+  ~~build_url формирует http://127.0.0.1:80@example.invalid/proxies: 127.0.0.1:80 становится userinfo,~~
+  ~~фактический hostname — example.invalid. Аналогичная строка порта применяется в WS relay.~~
+- ~~**Влияние:** сетевой запрос к произвольному upstream вместо loopback; Cookie панели пересылается,~~
+  ~~поскольку отсутствует в фильтре. Числовой порт дополнительно открывает доступ к произвольным локальным HTTP-сервисам.~~
+- ~~**Доказательство:** resolve_clash_target принимает String без разбора порта; URL собирается format;~~
+  ~~should_forward_header пропускает cookie. URL-семантика подтверждена Node-проверкой;~~
+  ~~end-to-end reqwest-тест ограничен отсутствием Rust.~~
+- ~~**Минимальная рекомендация:** parse u16 с запретом 0, фиксированный host через URL builder,~~
+  ~~допустимые management ports, ограниченная redirect policy; не пересылать UI Cookie и upstream Set-Cookie.~~
+
+**Исправление (6 октября 2026 года):** порт TCP разбирается как ненулевой u16 и
+должен совпадать с `external-controller` из сохранённого `config.yaml` Mihomo.
+Отсутствующий/некорректный конфиг закрывает TCP relay. Поддерживаются текущие
+адреса контроллера 127.0.0.1 и 0.0.0.0; upstream всегда 127.0.0.1.
+URL HTTP/WS строится через URL builder, поле host исключено из ClashTarget.
+Заголовки Cookie/Cookie2, UI Authorization и Proxy-Authorization не пересылаются;
+upstream Set-Cookie/Set-Cookie2 не передаются браузеру. Отдельный pooled HTTP-клиент
+игнорирует системные proxy и не следует редиректам; 3xx upstream возвращается как
+502 без Location. Та же граница URL и redirects применяется к DNS-запросам тестера
+маршрутов. Unix relay сохранён.
+
+~~**Проверка:** добавлены 7 регрессионных тестов: числовые границы порта, совпадение~~
+~~с сохранённым controller, фиксация loopback и encoded path/query, изоляция headers,~~
+~~реальные HTTP/WS-запросы с инъекцией, передача только Mihomo bearer и запрет redirect.~~
+~~Контрольные listeners подтверждают отсутствие подключения при инъекции/redirect.~~
+~~cargo test и cargo test --features local-dev: по 187 passed, 0 failed, 2 ignored;~~
+~~frontend build и ESLint --max-warnings 0 проходят.~~
+~~Реальные роутеры не затрагивались; остальные открытые пункты аудита сохраняются.~~
 
 ### R06 — HIGH — Обход ограничения попыток входа
 
@@ -564,28 +583,28 @@ frontend/src/components/modals/AddOutbound.tsx:201,317.
   обязательные checks auth/control/config/update и проверка release каждой архитектуры.
   Назначение lockfile описано в [Cargo Book](https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html).
 
-### R34 — MEDIUM — Текущий lint не запускается с зафиксированным TypeScript
+### ~~R34 — MEDIUM — Текущий lint не запускается с зафиксированным TypeScript~~
 
-**Статус:** Fixed (6 октября 2026 года; исходная находка Confirmed). **Категория:** verification tooling.
-**Локация:** frontend/package.json:9,64,65; frontend/eslint.config.js.
+~~**Статус:** Fixed (6 октября 2026 года; исходная находка Confirmed). **Категория:** verification tooling.~~
+~~**Локация:** frontend/package.json:9,64,65; frontend/eslint.config.js.~~
 
-- **Сценарий:** чистая установка frontend по bun.lock и bun run lint.
-- **Влияние:** статические проверки прекращаются до анализа кода.
-- **Доказательство:** воспроизведён exit 2, typescript-eslint does not support TS 7.0.
-  npm также сообщает несовместимый peer range. Build при этом успешно проходит.
-- **Минимальная рекомендация:** согласовать версии API TypeScript и typescript-eslint;
-  закрепить рабочий lint в CI. Текущий статус поддержки отражён в
-  [трекере typescript-eslint](https://github.com/typescript-eslint/typescript-eslint/issues/10940).
+- ~~**Сценарий:** чистая установка frontend по bun.lock и bun run lint.~~
+- ~~**Влияние:** статические проверки прекращаются до анализа кода.~~
+- ~~**Доказательство:** воспроизведён exit 2, typescript-eslint does not support TS 7.0.~~
+  ~~npm также сообщает несовместимый peer range. Build при этом успешно проходит.~~
+- ~~**Минимальная рекомендация:** согласовать версии API TypeScript и typescript-eslint;~~
+  ~~закрепить рабочий lint в CI. Текущий статус поддержки отражён в~~
+  ~~[трекере typescript-eslint](https://github.com/typescript-eslint/typescript-eslint/issues/10940).~~
 
-**Исправление и проверка:** сохранены подготовленные изменения npm aliases:
+**Исправление:** сохранены подготовленные изменения npm aliases:
 TypeScript 7 для сборки, совместимый TypeScript 6 API для ESLint. По дополнительному
 указанию пользователя исправлены все 19 ошибок и 1 предупреждение правил в исходниках:
 порядок hooks, чтение refs, пересинхронизация состояния, async callbacks после закрытия
 модальных окон, cause ошибок и передача tooltip timeout. Правила не отключались.
-`bun install --frozen-lockfile`, `bun run build`, `bun run lint` и
-`bunx eslint . --max-warnings 0` завершились успешно. Проверено открытие/повторное
-открытие шаблонов, открытие бэкапов, геофайлов и route tester в локальном браузере;
-ошибок/предупреждений в browser console нет. Добавление CI gates остаётся областью R33.
+~~`bun install --frozen-lockfile`, `bun run build`, `bun run lint` и~~
+~~`bunx eslint . --max-warnings 0` завершились успешно. Проверено открытие/повторное~~
+~~открытие шаблонов, открытие бэкапов, геофайлов и route tester в локальном браузере;~~
+~~ошибок/предупреждений в browser console нет. Добавление CI gates остаётся областью R33.~~
 
 ### R35 — MEDIUM — Миграция/удаление панели затрагивает общий lighttpd
 
@@ -683,8 +702,8 @@ shadcn → @shadcn/registry → fast-glob → micromatch → braces.
 
 ## Приоритет исправлений и допуска
 
-Прогресс исправлений на 6 октября 2026 года: **2 из 36 подтверждённых пунктов закрыты**
-(R01, R34), **34 остаются открытыми**. H01–H05 остаются без изменения статуса.
+Прогресс исправлений на 6 октября 2026 года: **3 из 36 подтверждённых пунктов закрыты**
+(R01, R05, R34), **33 остаются открытыми**. H01–H05 остаются без изменения статуса.
 Исторические результаты первоначального аудита выше сохранены; актуальные результаты
 повторных проверок приведены у исправленных пунктов.
 

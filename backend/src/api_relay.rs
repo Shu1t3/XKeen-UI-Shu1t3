@@ -18,14 +18,8 @@ use crate::types::{ApiResponse, AppState, MIHOMO_CONF_DIR};
 
 #[derive(Clone)]
 pub(crate) enum ClashTarget {
-    Tcp {
-        host: String,
-        port: String,
-        secret: Option<String>,
-    },
-    Unix {
-        path: String,
-    },
+    Tcp { port: u16, secret: Option<String> },
+    Unix { path: String },
 }
 
 #[derive(Deserialize)]
@@ -71,7 +65,7 @@ fn raw_relay_path(matched_path: &str, request_path: &str) -> String {
         .to_string()
 }
 
-pub async fn proxy_http(State(state): State<AppState>, matched_path: MatchedPath, req: Request<Body>) -> Response {
+pub async fn proxy_http(matched_path: MatchedPath, req: Request<Body>) -> Response {
     let path = raw_relay_path(matched_path.as_str(), req.uri().path());
     let (parts, body) = req.into_parts();
     let port_override = header_value(&parts.headers, "x-clash-port");
@@ -80,7 +74,7 @@ pub async fn proxy_http(State(state): State<AppState>, matched_path: MatchedPath
 
     let target = match resolve_clash_target(port_override, secret_override, unix_override).await {
         Ok(t) => t,
-        Err(e) => return make_error(StatusCode::BAD_GATEWAY, e),
+        Err(e) => return make_error(StatusCode::BAD_REQUEST, e),
     };
 
     const CLASH_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -90,20 +84,19 @@ pub async fn proxy_http(State(state): State<AppState>, matched_path: MatchedPath
     };
 
     match target {
-        ClashTarget::Tcp { host, port, secret } => {
-            let url = build_url("http", &host, &port, &path, parts.uri.query());
-            do_proxy_http(state.http_client.clone(), parts, body_bytes, url, secret).await
+        ClashTarget::Tcp { port, secret } => {
+            let url = build_url("http", port, &path, parts.uri.query());
+            let client = match relay_http_client(None) {
+                Ok(client) => client,
+                Err(e) => return make_error(StatusCode::BAD_GATEWAY, e),
+            };
+            do_proxy_http(client, parts, body_bytes, url, secret).await
         }
         ClashTarget::Unix { path: socket_path } => {
-            let url = build_url("http", "127.0.0.1", "80", &path, parts.uri.query());
-            let client = match reqwest::Client::builder()
-                .unix_socket(socket_path)
-                .user_agent("XKeen-UI")
-                .timeout(Duration::from_secs(120))
-                .build()
-            {
+            let url = build_url("http", 80, &path, parts.uri.query());
+            let client = match relay_http_client(Some(&socket_path)) {
                 Ok(c) => c,
-                Err(e) => return make_error(StatusCode::BAD_GATEWAY, e.to_string()),
+                Err(e) => return make_error(StatusCode::BAD_GATEWAY, e),
             };
             do_proxy_http(client, parts, body_bytes, url, None).await
         }
@@ -131,12 +124,12 @@ async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget)
     type UpstreamStream = Pin<Box<dyn Stream<Item = Result<TMessage, TError>> + Send>>;
 
     let (mut upstream_tx, mut upstream_rx): (UpstreamSink, UpstreamStream) = match target {
-        ClashTarget::Tcp { host, port, secret } => {
-            let mut url = build_url("ws", &host, &port, &path, None);
+        ClashTarget::Tcp { port, secret } => {
+            let mut url = build_url("ws", port, &path, None);
             if let Some(secret) = secret {
-                url.push_str(&format!("?token={}", urlencoding::encode(&secret)));
+                url.query_pairs_mut().append_pair("token", &secret);
             }
-            let (ws, _) = timeout(Duration::from_secs(5), connect_async(url))
+            let (ws, _) = timeout(Duration::from_secs(5), connect_async(url.as_str()))
                 .await
                 .map_err(|_| "Upstream connect timeout".to_string())?
                 .map_err(|e| e.to_string())?;
@@ -144,10 +137,10 @@ async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget)
             (Box::pin(tx), Box::pin(rx))
         }
         ClashTarget::Unix { path: socket_path } => {
-            let url = build_url("ws", "127.0.0.1", "80", &path, None);
+            let url = build_url("ws", 80, &path, None);
             let (ws, _) = timeout(Duration::from_secs(5), async {
                 let stream = UnixStream::connect(socket_path).await?;
-                client_async(url, stream)
+                client_async(url.as_str(), stream)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
             })
@@ -221,6 +214,9 @@ fn should_forward_header(name: &HeaderName) -> bool {
             | "x-clash-secret"
             | "x-clash-unix"
             | "authorization"
+            | "cookie"
+            | "cookie2"
+            | "proxy-authorization"
     )
 }
 
@@ -234,6 +230,8 @@ fn should_forward_response_header(name: &HeaderName) -> bool {
             | "sec-websocket-protocol"
             | "transfer-encoding"
             | "content-length"
+            | "set-cookie"
+            | "set-cookie2"
     )
 }
 
@@ -258,7 +256,7 @@ fn make_error(status: StatusCode, err: String) -> Response {
 }
 
 async fn do_proxy_http(
-    client: reqwest::Client, parts: http::request::Parts, body_bytes: axum::body::Bytes, url: String,
+    client: reqwest::Client, parts: http::request::Parts, body_bytes: axum::body::Bytes, url: reqwest::Url,
     secret: Option<String>,
 ) -> Response {
     let mut builder = client.request(parts.method.clone(), url);
@@ -279,6 +277,9 @@ async fn do_proxy_http(
 
 async fn build_http_response(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
+    if status.is_redirection() {
+        return make_error(StatusCode::BAD_GATEWAY, "Редиректы Clash API запрещены".into());
+    }
     let headers = upstream.headers().clone();
     let bytes = upstream.bytes().await.unwrap_or_default();
 
@@ -319,8 +320,14 @@ pub(crate) async fn resolve_clash_target(
     }
 
     if let Some(port) = port_override {
+        let port = parse_clash_port(&port)?;
+        let docs = crate::ruleset_inspector::load_mihomo_yaml().await?;
+        let configured = docs
+            .first()
+            .and_then(|doc| doc["external-controller"].as_str())
+            .ok_or_else(|| "В сохранённом config.yaml не задан external-controller".to_string())?;
+        authorize_clash_port(port, configured)?;
         return Ok(ClashTarget::Tcp {
-            host: "127.0.0.1".to_string(),
             port,
             secret: secret_override,
         });
@@ -337,11 +344,262 @@ fn sanitize_unix_name(raw: &str) -> Option<String> {
     Some(format!("{}/{}", MIHOMO_CONF_DIR, name))
 }
 
-pub(crate) fn build_url(scheme: &str, host: &str, port: &str, path: &str, query: Option<&str>) -> String {
-    let mut url = format!("{}://{}:{}/{}", scheme, host, port, path.trim_start_matches('/'));
-    if let Some(q) = query {
-        url.push('?');
-        url.push_str(q);
+fn parse_clash_port(raw: &str) -> Result<u16, String> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Порт Clash API должен быть числом от 1 до 65535".into());
     }
+    raw.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| "Порт Clash API должен быть числом от 1 до 65535".into())
+}
+
+fn authorize_clash_port(requested: u16, configured: &str) -> Result<(), String> {
+    let addr = configured
+        .parse::<std::net::SocketAddrV4>()
+        .map_err(|_| "Некорректный external-controller в сохранённом config.yaml".to_string())?;
+    if !matches!(
+        *addr.ip(),
+        std::net::Ipv4Addr::LOCALHOST | std::net::Ipv4Addr::UNSPECIFIED
+    ) || addr.port() == 0
+    {
+        return Err("external-controller должен слушать 127.0.0.1 или 0.0.0.0 на ненулевом порту".into());
+    }
+    if requested != addr.port() {
+        return Err("Порт relay не совпадает с external-controller в сохранённом config.yaml".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn relay_http_client(socket_path: Option<&str>) -> Result<reqwest::Client, String> {
+    // Keep TCP connection pooling without sharing API clients that follow redirects.
+    static TCP_CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
+        std::sync::LazyLock::new(|| build_relay_http_client(None));
+    match socket_path {
+        None => TCP_CLIENT.clone(),
+        Some(path) => build_relay_http_client(Some(path)),
+    }
+}
+
+fn build_relay_http_client(socket_path: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("XKeen-UI")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(120));
+    if let Some(path) = socket_path {
+        builder = builder.unix_socket(path);
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+pub(crate) fn build_url(scheme: &str, port: u16, path: &str, query: Option<&str>) -> reqwest::Url {
+    let mut url = reqwest::Url::parse("http://127.0.0.1/").expect("fixed loopback URL");
+    url.set_scheme(scheme).expect("HTTP or WebSocket scheme");
+    url.set_port(Some(port)).expect("fixed loopback host supports a port");
+    url.set_path(&format!("/{}", path.trim_start_matches('/')));
+    url.set_query(query);
     url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        routing::{any, get},
+    };
+    use serde_json::json;
+
+    async fn serve(app: Router) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, task)
+    }
+
+    #[test]
+    fn ports_are_strict_nonzero_u16() {
+        for input in ["1", "9090", "65535", "09090"] {
+            assert!(parse_clash_port(input).is_ok());
+        }
+        for input in [
+            "",
+            "0",
+            "65536",
+            "-1",
+            "+80",
+            " 80",
+            "80 ",
+            "80@example.invalid",
+            "80/",
+            "80?",
+            "80#",
+            "80\\n",
+            "８０",
+        ] {
+            assert!(parse_clash_port(input).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_configured_controller_port_is_authorized() {
+        assert!(authorize_clash_port(9090, "127.0.0.1:9090").is_ok());
+        assert!(authorize_clash_port(12345, "0.0.0.0:12345").is_ok());
+        for (port, controller) in [
+            (79, "127.0.0.1:9090"),
+            (80, "0.0.0.0:9090"),
+            (0, "127.0.0.1:0"),
+            (9090, "192.0.2.1:9090"),
+            (9090, "example.invalid:9090"),
+            (9090, "127.0.0.1:9090@evil.invalid"),
+            (9090, ""),
+            (9090, "127.0.0.1:65536"),
+        ] {
+            assert!(authorize_clash_port(port, controller).is_err(), "{port} / {controller}");
+        }
+    }
+
+    #[test]
+    fn urls_keep_loopback_and_preserve_encoded_path_and_query() {
+        for scheme in ["http", "ws"] {
+            let url = build_url(scheme, 9090, "proxies/A%2FB", Some("name=a%26b&type=A"));
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+            assert_eq!(url.port(), Some(9090));
+            assert_eq!(url.username(), "");
+            assert!(url.password().is_none());
+            assert_eq!(url.path(), "/proxies/A%2FB");
+            assert_eq!(url.query(), Some("name=a%26b&type=A"));
+            let hostile_path = build_url(
+                scheme,
+                9090,
+                "//example.invalid/@other",
+                Some("@evil.invalid/#fragment"),
+            );
+            assert_eq!(hostile_path.host_str(), Some("127.0.0.1"));
+            assert!(hostile_path.fragment().is_none());
+        }
+    }
+
+    #[test]
+    fn session_headers_are_blocked_in_both_directions() {
+        for name in ["cookie", "cookie2", "authorization", "proxy-authorization"] {
+            assert!(!should_forward_header(&HeaderName::from_static(name)));
+        }
+        for name in ["set-cookie", "set-cookie2"] {
+            assert!(!should_forward_response_header(&HeaderName::from_static(name)));
+        }
+        assert!(should_forward_header(&HeaderName::from_static("content-type")));
+        assert!(should_forward_response_header(&HeaderName::from_static("content-type")));
+    }
+
+    #[tokio::test]
+    async fn http_and_websocket_reject_port_injection_without_connecting_to_target() {
+        let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let injected = format!("80@127.0.0.1:{}", decoy.local_addr().unwrap().port());
+        let (port, server) = serve(
+            Router::new()
+                .route("/clash/{*path}", any(proxy_http))
+                .route("/clash-ws/{*path}", get(proxy_ws)),
+        )
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for value in [injected.as_str(), "80@example.invalid", "0", "65536", "+80"] {
+            let response = client
+                .get(format!("http://127.0.0.1:{port}/clash/proxies"))
+                .header("X-Clash-Port", value)
+                .header("Cookie", "session=private")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let mut url = build_url("ws", port, "clash-ws/connections", None);
+            url.query_pairs_mut().append_pair("port", value);
+            let result = connect_async(url.as_str()).await;
+            assert!(matches!(result, Err(TError::Http(ref response)) if response.status() == StatusCode::BAD_REQUEST));
+        }
+        assert!(timeout(Duration::from_millis(100), decoy.accept()).await.is_err());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn http_relay_isolates_cookies_and_preserves_api_headers() {
+        let (port, server) = serve(Router::new().route(
+            "/proxies/{*name}",
+            any(|request: Request<Body>| async move {
+                let body = json!({
+                    "cookie": header_value(request.headers(), "cookie"),
+                    "authorization": header_value(request.headers(), "authorization"),
+                    "target_header": header_value(request.headers(), "x-clash-port"),
+                    "accept": header_value(request.headers(), "accept"),
+                    "path": request.uri().path(), "query": request.uri().query(),
+                });
+                (
+                    [("set-cookie", "session=upstream; Path=/"), ("x-upstream", "kept")],
+                    Json(body),
+                )
+            }),
+        ))
+        .await;
+        let (parts, _) = Request::builder()
+            .method("GET")
+            .header("cookie", "session=private")
+            .header("authorization", "Bearer ui-private")
+            .header("x-clash-port", "9090")
+            .header("accept", "application/json")
+            .body(Body::empty())
+            .unwrap()
+            .into_parts();
+        let response = do_proxy_http(
+            relay_http_client(None).unwrap(),
+            parts,
+            axum::body::Bytes::new(),
+            build_url("http", port, "proxies/A%2FB", Some("name=a%26b")),
+            Some("mihomo-secret".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert_eq!(response.headers()["x-upstream"], "kept");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["cookie"].is_null());
+        assert!(body["target_header"].is_null());
+        assert_eq!(body["authorization"], "Bearer mihomo-secret");
+        assert_eq!(body["accept"], "application/json");
+        assert_eq!(body["path"], "/proxies/A%2FB");
+        assert_eq!(body["query"], "name=a%26b");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn upstream_redirect_is_neither_followed_nor_forwarded() {
+        let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/capture", decoy.local_addr().unwrap());
+        let (port, server) = serve(Router::new().route(
+            "/proxies",
+            get(move || {
+                let location = location.clone();
+                async move { (StatusCode::FOUND, [("location", location)], "redirect") }
+            }),
+        ))
+        .await;
+        let (parts, _) = Request::builder().body(Body::empty()).unwrap().into_parts();
+        let response = do_proxy_http(
+            relay_http_client(None).unwrap(),
+            parts,
+            axum::body::Bytes::new(),
+            build_url("http", port, "proxies", None),
+            Some("private-secret".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key("location"));
+        assert!(timeout(Duration::from_millis(100), decoy.accept()).await.is_err());
+        server.abort();
+        let _ = server.await;
+    }
 }

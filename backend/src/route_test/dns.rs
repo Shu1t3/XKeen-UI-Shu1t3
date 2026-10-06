@@ -52,15 +52,15 @@ impl LiveResolver {
     /// Тип 1 (A); AAAA (28) пробуем только если A не вернул ни одной записи — как у mihomo
     /// (`resolver.ResolveIP` предпочитает IPv4).
     async fn query_mihomo(&self, target: &ClashTarget, domain: &str) -> Result<Vec<IpAddr>, String> {
-        let ips = Self::query_mihomo_type(target, &self.http, domain, "A", 1).await?;
+        let ips = Self::query_mihomo_type(target, domain, "A", 1).await?;
         if !ips.is_empty() {
             return Ok(ips);
         }
-        Self::query_mihomo_type(target, &self.http, domain, "AAAA", 28).await
+        Self::query_mihomo_type(target, domain, "AAAA", 28).await
     }
 
     async fn query_mihomo_type(
-        target: &ClashTarget, default_client: &reqwest::Client, domain: &str, qtype: &str, rtype_code: i32,
+        target: &ClashTarget, domain: &str, qtype: &str, rtype_code: i32,
     ) -> Result<Vec<IpAddr>, String> {
         #[derive(serde::Deserialize)]
         struct DnsQueryResponse {
@@ -74,27 +74,22 @@ impl LiveResolver {
             data: String,
         }
 
-        let path = format!("dns/query?name={}&type={}", urlencoding::encode(domain), qtype);
+        let query = format!("name={}&type={}", urlencoding::encode(domain), qtype);
 
-        let (url, client, secret): (String, reqwest::Client, Option<String>) = match target {
-            ClashTarget::Tcp { host, port, secret } => (
-                api_relay::build_url("http", host, port, &path, None),
-                default_client.clone(),
+        let (url, client, secret): (reqwest::Url, reqwest::Client, Option<String>) = match target {
+            ClashTarget::Tcp { port, secret } => (
+                api_relay::build_url("http", *port, "dns/query", Some(&query)),
+                api_relay::relay_http_client(None)?,
                 secret.clone(),
             ),
             ClashTarget::Unix { path: socket_path } => {
-                let url = api_relay::build_url("http", "127.0.0.1", "80", &path, None);
-                let client = reqwest::Client::builder()
-                    .unix_socket(socket_path.clone())
-                    .user_agent("XKeen-UI")
-                    .timeout(RESOLVE_TIMEOUT)
-                    .build()
-                    .map_err(|e| e.to_string())?;
+                let url = api_relay::build_url("http", 80, "dns/query", Some(&query));
+                let client = api_relay::relay_http_client(Some(socket_path))?;
                 (url, client, None)
             }
         };
 
-        let mut req = client.get(&url).timeout(RESOLVE_TIMEOUT);
+        let mut req = client.get(url).timeout(RESOLVE_TIMEOUT);
         if let Some(secret) = secret {
             req = req.header("Authorization", format!("Bearer {secret}"));
         }
