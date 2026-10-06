@@ -63,6 +63,7 @@ sh /opt/tmp/switch-to-fork.sh --rollback /opt/var/backups/xkeen-ui-switch/ИМЯ
 Workflow **Build Rust binaries** проверяет наличие описания и публикует его
 в GitHub Releases вместе с бинарниками. Пустые описания релизов недопустимы.
 
+[Описание v0.0.1-fork.5](docs/releases/v0.0.1-fork.5.md) ·
 [Описание v0.0.1-fork.4](docs/releases/v0.0.1-fork.4.md) ·
 [Описание v0.0.1-fork.3](docs/releases/v0.0.1-fork.3.md).
 Правило для дальнейшей работы закреплено в [AGENTS.md](AGENTS.md).
