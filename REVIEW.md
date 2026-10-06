@@ -698,34 +698,69 @@ backend/src/auth.rs:328; backend/src/main.rs:424.
 - **Минимальная рекомендация:** атомарное enrollment состояние/lock и повторная проверка перед commit;
   только победитель получает сессию.
 
-### R26 — MEDIUM — Logout/reset/expiration не отзывают открытые WebSocket
+~~### R26 — MEDIUM — Logout/reset/expiration не отзывают открытые WebSocket~~
 
-**Статус:** Confirmed. **Категория:** session revocation.
-**Локация:** backend/src/main.rs:512; backend/src/auth.rs:246,264;
-backend/src/websocket.rs:156,185; backend/src/api_relay.rs:129.
+~~**Статус:** Confirmed. **Категория:** session revocation.~~
+~~**Локация:** backend/src/main.rs:512; backend/src/auth.rs:246,264;~~
+~~backend/src/websocket.rs:156,185; backend/src/api_relay.rs:129.~~
 
-- **Сценарий:** клиент держит /ws или /clash-ws открытым, сессия отозвана/истекла.
-- **Влияние:** прежняя сессия продолжает получать данные и выполнять доступные WS команды,
-  в частности очистку журналов.
-- **Доказательство:** auth проверяется при HTTP upgrade; loops не связаны с дальнейшим состоянием сессии.
-- **Минимальная рекомендация:** session-bound connections с cancellation/revocation,
-  закрытие при logout/reset и достижении expiration.
+~~- **Сценарий:** клиент держит /ws или /clash-ws открытым, сессия отозвана/истекла.~~
+~~- **Влияние:** прежняя сессия продолжает получать данные и выполнять доступные WS команды,~~
+~~  в частности очистку журналов.~~
+~~- **Доказательство:** auth проверяется при HTTP upgrade; loops не связаны с дальнейшим состоянием сессии.~~
+~~- **Минимальная рекомендация:** session-bound connections с cancellation/revocation,~~
+~~  закрытие при logout/reset и достижении expiration.~~
 
-### R27 — MEDIUM — Некорректный lifecycle WebSocket вызывает reconnect и теряет watcher
+**Исправлено:** middleware привязывает WebSocket к допущенной сессии.
+Изменения auth уведомляют открытые соединения; отдельный таймер проверяет срок
+сессии без ожидания входящего трафика. Logout закрывает соединения только этой
+сессии, reset — всех отозванных сессий. Отключение auth не восстанавливает
+ранее отозванную сессию; анонимное соединение, открытое при выключенной auth,
+закрывается при её включении. Обновление настроек также уведомляет соединения.
+Защита охватывает /ws и /clash-ws: отменяет чтение/отправку и подключение relay
+к upstream, закрывая обе стороны. Перед WS-командами и relay-кадрами авторизация
+проверяется повторно; очистка журнала выполняется под той же блокировкой
+настроек, что и отзыв. Logout сопоставляет точный ID, а не его префикс.
 
-**Статус:** Confirmed. **Категория:** resource lifecycle / concurrency.
-**Локация:** frontend/src/lib/websocket.ts:48,73;
-backend/src/websocket.rs:91,152,223,236.
+~~**Проверка:** реальные log WebSocket закрываются при вызове обработчиков~~
+~~logout/reset и по expiration; logout сохраняет другое активное соединение.~~
+~~Relay-тесты проверяют закрытие клиента/upstream и отмену зависшего handshake.~~
+~~Отдельно проверены запрет очистки после отзыва legacy-сессии и включение auth.~~
+~~Backend в двух режимах: по 252 passed, 2 ignored; cargo check без предупреждений.~~
+~~Frontend: 21 passed, build и ESLint --max-warnings 0. Роутер не проверялся.~~
 
-- **Сценарий:** frontend cleanup вызывает close после очистки timer, onclose создаёт новый reconnect.
-  На backend failed initial send выходит без decrement; последний disconnect может остановить
-  watcher после подключения нового клиента.
-- **Влияние:** обращения и соединения после unmount/logout, лишняя нагрузка;
-  постоянно живущий watcher либо отсутствие live log updates у подключённого клиента.
-- **Доказательство:** извлечённые callbacks подтвердили новый timer после cleanup.
-  Backend interleaving: fetch_sub=1 → новый fetch_add/проверка existing watcher → старый take/abort.
-- **Минимальная рекомендация:** frontend active flag, снять handlers до close, отменять timers;
-  backend RAII cleanup на всех выходах и единый lifecycle lock для счётчика и watcher.
+~~### R27 — MEDIUM — Некорректный lifecycle WebSocket вызывает reconnect и теряет watcher~~
+
+~~**Статус:** Confirmed. **Категория:** resource lifecycle / concurrency.~~
+~~**Локация:** frontend/src/lib/websocket.ts:48,73;~~
+~~backend/src/websocket.rs:91,152,223,236.~~
+
+~~- **Сценарий:** frontend cleanup вызывает close после очистки timer, onclose создаёт новый reconnect.~~
+~~  На backend failed initial send выходит без decrement; последний disconnect может остановить~~
+~~  watcher после подключения нового клиента.~~
+~~- **Влияние:** обращения и соединения после unmount/logout, лишняя нагрузка;~~
+~~  постоянно живущий watcher либо отсутствие live log updates у подключённого клиента.~~
+~~- **Доказательство:** извлечённые callbacks подтвердили новый timer после cleanup.~~
+~~  Backend interleaving: fetch_sub=1 → новый fetch_add/проверка existing watcher → старый take/abort.~~
+~~- **Минимальная рекомендация:** frontend active flag, снять handlers до close, отменять timers;~~
+~~  backend RAII cleanup на всех выходах и единый lifecycle lock для счётчика и watcher.~~
+
+**Исправлено:** frontend effect владеет отдельной WS-сессией с active flag.
+Cleanup отменяет reconnect/ping, снимает handlers до close и запрещает действия
+уже поставленных в очередь callbacks. Старый socket/effect не меняет новое
+соединение; reconnect использует текущий выбранный файл.
+На backend число клиентов и watcher хранятся вместе под одной блокировкой.
+RAII-guard освобождает клиента на любом выходе, включая failed initial send,
+ошибку и отмену задачи. Последний disconnect останавливает watcher
+внутри той же критической секции; новый клиент либо сохраняет работающий
+watcher, либо создаёт новый. Завершение входящего stream также завершает socket.
+
+~~**Проверка:** 5 frontend regression tests покрывают cleanup открытого и~~
+~~подключаемого socket, queued callbacks/timers, замену effect и reconnect.~~
+~~Backend-тесты проверяют ранний выход, отмену задачи и 100 конкурентных~~
+~~connect/disconnect; реальные WS-проверки R26 подтверждают освобождение watcher.~~
+~~Backend в двух режимах: по 252 passed, 2 ignored; cargo check без предупреждений.~~
+~~Frontend: 21 passed, build и ESLint --max-warnings 0. Браузерный E2E не запускался.~~
 
 ### R28 — MEDIUM — Лог растёт без cap после прокрутки вверх
 
@@ -934,8 +969,8 @@ shadcn → @shadcn/registry → fast-glob → micromatch → braces.
 
 ## Приоритет исправлений и допуска
 
-Прогресс исправлений на 6 октября 2026 года: **14 из 36 подтверждённых пунктов закрыты**
-(R01, R04, R05, R06, R07, R10, R11, R12, R13, R14, R15, R16, R17, R34), **22 остаются открытыми**. H01–H05 остаются без изменения статуса.
+Прогресс исправлений на 7 октября 2026 года: **16 из 36 подтверждённых пунктов закрыты**
+(R01, R04, R05, R06, R07, R10, R11, R12, R13, R14, R15, R16, R17, R26, R27, R34), **20 остаются открытыми**. H01–H05 остаются без изменения статуса.
 Исторические результаты первоначального аудита выше сохранены; актуальные результаты
 повторных проверок приведены у исправленных пунктов.
 

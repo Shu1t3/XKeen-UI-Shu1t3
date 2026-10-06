@@ -64,6 +64,7 @@ pub async fn patch_settings(State(state): State<AppState>, Json(patch): Json<ser
     settings.normalize_proxies();
 
     *state.settings.write().unwrap() = settings;
+    state.auth_changes.send_modify(|version| *version = version.wrapping_add(1));
 
     if let Err(e) = tokio::fs::create_dir_all(XKEEN_CONF_DIR).await {
         return Json(serde_json::json!({"success": false, "error": e.to_string()}));

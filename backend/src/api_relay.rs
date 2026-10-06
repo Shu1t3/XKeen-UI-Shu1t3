@@ -1,6 +1,6 @@
 use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{MatchedPath, Query, State};
+use axum::extract::{Extension, MatchedPath, Query, State};
 use axum::http::{HeaderMap, HeaderName, Request, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -104,8 +104,12 @@ pub async fn proxy_http(matched_path: MatchedPath, req: Request<Body>) -> Respon
 }
 
 pub async fn proxy_ws(
-    matched_path: MatchedPath, Query(q): Query<ClashWsQuery>, ws: WebSocketUpgrade, req: Request<Body>,
+    matched_path: MatchedPath, Query(q): Query<ClashWsQuery>, Extension(session): Extension<crate::auth::WsSession>,
+    ws: WebSocketUpgrade, req: Request<Body>,
 ) -> impl IntoResponse {
+    if !session.authorized() {
+        return make_error(StatusCode::UNAUTHORIZED, "Сессия завершена".into());
+    }
     let path = raw_relay_path(matched_path.as_str(), req.uri().path());
     let target = match resolve_clash_target(q.port, q.secret, q.unix).await {
         Ok(t) => t,
@@ -113,13 +117,29 @@ pub async fn proxy_ws(
     };
 
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = proxy_ws_inner(socket, path, target).await {
+        if let Err(e) = proxy_ws_authorized(socket, path, target, session).await {
             eprintln!("Clash WS proxy error: {}", e);
         }
     })
 }
 
-async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget) -> Result<(), String> {
+async fn proxy_ws_authorized(
+    socket: WebSocket, path: String, target: ClashTarget, mut session: crate::auth::WsSession,
+) -> Result<(), String> {
+    if !session.authorized() {
+        return Ok(());
+    }
+    let forwarding_session = session.clone();
+    tokio::select! {
+        biased;
+        _ = session.revoked() => Ok(()),
+        result = proxy_ws_inner(socket, path, target, forwarding_session) => result,
+    }
+}
+
+async fn proxy_ws_inner(
+    client_ws: WebSocket, path: String, target: ClashTarget, session: crate::auth::WsSession,
+) -> Result<(), String> {
     type UpstreamSink = Pin<Box<dyn Sink<TMessage, Error = TError> + Send>>;
     type UpstreamStream = Pin<Box<dyn Stream<Item = Result<TMessage, TError>> + Send>>;
 
@@ -156,6 +176,9 @@ async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget)
 
     let client_to_upstream = async {
         while let Some(Ok(msg)) = client_rx.next().await {
+            if !session.authorized() {
+                break;
+            }
             let t_msg = match msg {
                 Message::Text(t) => TMessage::Text(t.to_string().into()),
                 Message::Binary(b) => TMessage::Binary(b),
@@ -174,6 +197,9 @@ async fn proxy_ws_inner(client_ws: WebSocket, path: String, target: ClashTarget)
 
     let upstream_to_client = async {
         while let Some(Ok(msg)) = upstream_rx.next().await {
+            if !session.authorized() {
+                break;
+            }
             let a_msg = match msg {
                 TMessage::Text(t) => Message::Text(t.to_string().into()),
                 TMessage::Binary(b) => Message::Binary(b),
@@ -412,6 +438,29 @@ mod tests {
     };
     use serde_json::json;
 
+    fn fixture_state() -> AppState {
+        use std::sync::{Arc, RwLock};
+        let (log_tx, _) = tokio::sync::broadcast::channel(16);
+        AppState {
+            core: Arc::new(RwLock::new(crate::types::CoreInfo {
+                name: "mihomo".into(),
+                conf_dir: String::new(),
+                is_json: false,
+            })),
+            settings: Arc::new(RwLock::new(crate::types::AppSettings::default())),
+            init_file: Arc::new(RwLock::new(None)),
+            http_client: reqwest::Client::new(),
+            update_checker: Default::default(),
+            geo_cache: Arc::new(RwLock::new(Default::default())),
+            log_tx: Arc::new(log_tx),
+            log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
+            auth_changes: tokio::sync::watch::channel(0).0,
+            app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
+            debug: false,
+            rci_token: None,
+        }
+    }
+
     async fn serve(app: Router) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -501,7 +550,11 @@ mod tests {
         let (port, server) = serve(
             Router::new()
                 .route("/clash/{*path}", any(proxy_http))
-                .route("/clash-ws/{*path}", get(proxy_ws)),
+                .route("/clash-ws/{*path}", get(proxy_ws))
+                .layer(Extension(crate::auth::WsSession::from_state(
+                    &fixture_state(),
+                    &HeaderMap::new(),
+                ))),
         )
         .await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -522,6 +575,118 @@ mod tests {
         assert!(timeout(Duration::from_millis(100), decoy.accept()).await.is_err());
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn revocation_cancels_pending_upstream_handshake() {
+        use tokio::io::AsyncReadExt;
+        let state = fixture_state();
+        let session = crate::auth::WsSession::from_state(&state, &HeaderMap::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            connected_tx.send(()).unwrap();
+            let mut bytes = Vec::new();
+            // Deliberately never answer the upgrade request. Cancellation must close TCP
+            // before the normal five-second upstream timeout expires.
+            stream.read_to_end(&mut bytes).await.unwrap();
+        });
+        let target = ClashTarget::Tcp {
+            port: upstream_port,
+            secret: None,
+        };
+        let app = Router::new().route(
+            "/relay",
+            get(move |ws: WebSocketUpgrade| {
+                let session = session.clone();
+                let target = target.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        proxy_ws_authorized(socket, "events".into(), target, session)
+                            .await
+                            .unwrap();
+                    })
+                }
+            }),
+        );
+        let (port, server) = serve(app).await;
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{port}/relay")).await.unwrap();
+        timeout(Duration::from_secs(1), connected_rx).await.unwrap().unwrap();
+        state.settings.write().unwrap().auth.enabled = true;
+        state
+            .auth_changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+        timeout(Duration::from_secs(1), upstream).await.unwrap().unwrap();
+        let end = timeout(Duration::from_secs(1), client.next()).await.unwrap();
+        assert!(matches!(end, None | Some(Err(_)) | Some(Ok(TMessage::Close(_)))));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_drops_both_connections_on_session_revocation_and_expiry() {
+        for expire in [false, true] {
+            let state = fixture_state();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            {
+                let mut settings = state.settings.write().unwrap();
+                settings.auth.enabled = true;
+                settings.auth.session_ids = vec![format!("relay-fixture:{}", now + if expire { 2 } else { 60 })];
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert("cookie", "session_id=relay-fixture".parse().unwrap());
+            let session = crate::auth::WsSession::from_state(&state, &headers);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_port = listener.local_addr().unwrap().port();
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let first = ws.next().await.unwrap().unwrap();
+                assert_eq!(first, TMessage::Text("before".into()));
+                ws.send(first).await.unwrap();
+                // No additional application frame may arrive after authorization ends.
+                let end = ws.next().await;
+                assert!(matches!(end, None | Some(Err(_)) | Some(Ok(TMessage::Close(_)))));
+            });
+            let target = ClashTarget::Tcp {
+                port: upstream_port,
+                secret: None,
+            };
+            let app = Router::new().route(
+                "/relay",
+                get(move |ws: WebSocketUpgrade| {
+                    let session = session.clone();
+                    let target = target.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            proxy_ws_authorized(socket, "events".into(), target, session)
+                                .await
+                                .unwrap();
+                        })
+                    }
+                }),
+            );
+            let (port, server) = serve(app).await;
+            let (mut client, _) = connect_async(format!("ws://127.0.0.1:{port}/relay")).await.unwrap();
+            client.send(TMessage::Text("before".into())).await.unwrap();
+            assert_eq!(client.next().await.unwrap().unwrap(), TMessage::Text("before".into()));
+            if !expire {
+                state.settings.write().unwrap().auth.session_ids.clear();
+                state
+                    .auth_changes
+                    .send_modify(|version| *version = version.wrapping_add(1));
+            }
+            let end = timeout(Duration::from_secs(4), client.next()).await.unwrap();
+            assert!(matches!(end, None | Some(Err(_)) | Some(Ok(TMessage::Close(_)))));
+            timeout(Duration::from_secs(1), upstream).await.unwrap().unwrap();
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]

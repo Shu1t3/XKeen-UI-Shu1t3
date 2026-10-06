@@ -21,67 +21,102 @@ export interface WsMessage {
   error?: string
 }
 
-export function useWebSocket(onMessage: WsMessageHandler) {
-  const wsRef = useRef<WebSocket | null>(null)
-  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const currentFileRef = useRef('error.log')
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const connectRef = useRef<() => void>(() => {})
+// One effect owns one session. A stopped session never reconnects, even when a
+// browser has already queued a callback before its handlers were detached.
+export function createLogWebSocketSession(getUrl: () => string, onMessage: WsMessageHandler) {
+  let active = true
+  let socket: WebSocket | null = null
+  let pingInterval: ReturnType<typeof setInterval> | null = null
+  let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
 
-  const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.close()
-    }
-    if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
-
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?file=${currentFileRef.current}`)
-    wsRef.current = ws
+  const clearPing = () => {
+    if (pingInterval !== null) clearInterval(pingInterval)
+    pingInterval = null
+  }
+  const detach = (ws: WebSocket) => {
+    ws.onopen = null
+    ws.onclose = null
+    ws.onerror = null
+    ws.onmessage = null
+  }
+  const connect = () => {
+    if (!active) return
+    const ws = new WebSocket(getUrl())
+    socket = ws
+    const isCurrent = () => active && socket === ws
 
     ws.onopen = () => {
-      pingIntervalRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
+      if (!isCurrent()) return
+      clearPing()
+      pingInterval = setInterval(() => {
+        if (isCurrent() && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'ping' }))
         }
       }, 30000)
     }
-
-    ws.onclose = (event) => {
-      console.warn(`WebSocket disconnected: ${event.code}. Reconnecting...`)
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
-      reconnectTimeoutRef.current = setTimeout(() => connectRef.current(), 1000)
+    ws.onclose = () => {
+      if (!isCurrent()) return
+      detach(ws)
+      socket = null
+      clearPing()
+      reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null
+        if (active) connect()
+      }, 1000)
     }
-
-    ws.onerror = () => ws.close()
-
+    ws.onerror = () => {
+      if (isCurrent()) ws.close()
+    }
     ws.onmessage = (event) => {
+      if (!isCurrent()) return
       try {
         const data = JSON.parse(event.data) as WsMessage
-        if (data.type === 'pong') return
-        onMessage(data)
+        if (data.type !== 'pong') onMessage(data)
       } catch {
         /* */
       }
     }
+  }
+
+  connect()
+  return {
+    send(data: object) {
+      if (active && socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(data))
+      }
+    },
+    stop() {
+      active = false
+      clearPing()
+      if (reconnectTimeout !== null) clearTimeout(reconnectTimeout)
+      reconnectTimeout = null
+      const ws = socket
+      socket = null
+      if (ws) {
+        detach(ws)
+        ws.close()
+      }
+    },
+  }
+}
+
+export function useWebSocket(onMessage: WsMessageHandler) {
+  const sessionRef = useRef<ReturnType<typeof createLogWebSocketSession> | null>(null)
+  const currentFileRef = useRef('error.log')
+
+  useEffect(() => {
+    const session = createLogWebSocketSession(
+      () => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?file=${currentFileRef.current}`,
+      onMessage
+    )
+    sessionRef.current = session
+    return () => {
+      sessionRef.current = null
+      session.stop()
+    }
   }, [onMessage])
 
-  useEffect(() => {
-    connectRef.current = connect
-  }, [connect])
-
-  useEffect(() => {
-    connect()
-    return () => {
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current)
-      wsRef.current?.close()
-    }
-  }, [connect])
-
-  const send = useCallback((data: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data))
-    }
-  }, [])
+  const send = useCallback((data: object) => sessionRef.current?.send(data), [])
 
   const switchFile = useCallback(
     (filename: string) => {

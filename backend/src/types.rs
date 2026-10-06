@@ -95,6 +95,12 @@ pub fn access_log_path() -> String {
     XRAY_LOG_PATHS.read().unwrap().access.clone()
 }
 
+#[derive(Default)]
+pub struct LogWatcherState {
+    pub clients: usize,
+    pub handle: Option<AbortHandle>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub core: Arc<RwLock<CoreInfo>>,
@@ -104,7 +110,8 @@ pub struct AppState {
     pub update_checker: UpdateChecker,
     pub geo_cache: Arc<RwLock<GeoCache>>,
     pub log_tx: Arc<broadcast::Sender<String>>,
-    pub log_watcher: Arc<Mutex<Option<AbortHandle>>>,
+    pub log_watcher: Arc<std::sync::Mutex<LogWatcherState>>,
+    pub auth_changes: tokio::sync::watch::Sender<u64>,
     pub app_config_lock: Arc<Mutex<()>>,
     pub debug: bool,
     pub rci_token: Option<String>,

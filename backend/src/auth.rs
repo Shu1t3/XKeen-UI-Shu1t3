@@ -285,7 +285,7 @@ pub async fn post_logout(State(state): State<AppState>, headers: HeaderMap) -> i
     if let Some(cookie) = get_session_cookie(&headers) {
         let cookie = cookie.to_string();
         update_auth(&state, |auth| {
-            auth.session_ids.retain(|id| !id.starts_with(&cookie) && id != &cookie)
+            auth.session_ids.retain(|id| id.split_once(':').map_or(id.as_str(), |(uid, _)| uid) != cookie)
         })
         .await;
     }
@@ -315,21 +315,79 @@ pub async fn post_auth_reset(State(state): State<AppState>) -> impl IntoResponse
     )
 }
 
-pub async fn auth_middleware(state: AppState, request: Request, next: Next) -> Response {
-    let enabled = state.settings.read().unwrap().auth.enabled;
-    if !enabled {
-        return next.run(request).await;
-    }
-    let session_ids = state.settings.read().unwrap().auth.session_ids.clone();
-    if session_ids.is_empty() {
-        return StatusCode::UNAUTHORIZED.into_response();
+/// Upgrade captures the admitted identity; disabling auth cannot resurrect a revoked session.
+#[derive(Clone)]
+pub struct WsSession {
+    state: AppState,
+    cookie: Option<String>,
+    changes: tokio::sync::watch::Receiver<u64>,
+}
+
+impl WsSession {
+    pub fn from_state(state: &AppState, headers: &HeaderMap) -> Self {
+        let changes = state.auth_changes.subscribe();
+        let auth = &state.settings.read().unwrap().auth;
+        let cookie = get_session_cookie(headers)
+            .filter(|cookie| auth.enabled || is_session_valid(&auth.session_ids, cookie))
+            .map(str::to_string);
+        Self { state: state.clone(), cookie, changes }
     }
 
-    let is_valid = get_session_cookie(request.headers()).map_or(false, |c| is_session_valid(&session_ids, c));
-    if !is_valid {
-        return StatusCode::UNAUTHORIZED.into_response();
+    fn authorized_with(&self, auth: &crate::types::AuthSettings) -> bool {
+        match &self.cookie {
+            Some(cookie) => is_session_valid(&auth.session_ids, cookie),
+            None => !auth.enabled,
+        }
     }
 
+    pub fn authorized(&self) -> bool {
+        self.authorized_with(&self.state.settings.read().unwrap().auth)
+    }
+
+    /// Order destructive commands with logout/reset's settings write lock.
+    pub fn if_authorized<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+        let settings = self.state.settings.read().unwrap();
+        self.authorized_with(&settings.auth).then(work)
+    }
+
+    pub async fn revoked(&mut self) {
+        loop {
+            // Mark current notifications seen before checking to avoid a check/subscribe race.
+            self.changes.borrow_and_update();
+            if !self.authorized() { return; }
+            let expiry = {
+                let auth = &self.state.settings.read().unwrap().auth;
+                self.cookie.as_ref().and_then(|cookie| {
+                    if auth.session_ids.iter().any(|id| id == cookie) { return None; }
+                    auth.session_ids.iter().find_map(|id| {
+                        let (uid, expiry) = id.split_once(':')?;
+                        (uid == cookie).then(|| expiry.parse::<u64>().ok()).flatten()
+                    })
+                })
+            };
+            tokio::select! {
+                result = self.changes.changed() => { if result.is_err() { return; } },
+                _ = async {
+                    match expiry {
+                        Some(exp) => {
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                            let delay = Duration::from_secs(exp).saturating_sub(now).min(Duration::from_secs(86400));
+                            tokio::time::sleep(delay).await;
+                        },
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {},
+            }
+        }
+    }
+}
+
+pub async fn auth_middleware(state: AppState, mut request: Request, next: Next) -> Response {
+    let session = WsSession::from_state(&state, request.headers());
+    if !session.authorized() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    request.extensions_mut().insert(session);
     next.run(request).await
 }
 
@@ -360,6 +418,7 @@ async fn update_auth(state: &AppState, modify: impl FnOnce(&mut crate::types::Au
             }
         });
     }
+    state.auth_changes.send_modify(|version| *version = version.wrapping_add(1));
     save_auth_to_config(state).await;
 }
 
@@ -496,7 +555,8 @@ mod tests {
             update_checker: UpdateChecker::default(),
             geo_cache: Arc::new(RwLock::new(Default::default())),
             log_tx: Arc::new(log_tx),
-            log_watcher: Arc::new(tokio::sync::Mutex::new(None)),
+            log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
+            auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
             debug: false,
             rci_token: None,
