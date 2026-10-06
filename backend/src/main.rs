@@ -9,6 +9,7 @@ mod auth;
 mod backuper;
 mod configs;
 mod controller;
+mod core_switch;
 mod dns;
 mod frontend_embedder;
 mod geo;

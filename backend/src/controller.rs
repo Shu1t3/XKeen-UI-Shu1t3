@@ -6,11 +6,12 @@ use nix::sys::resource::{Resource, setrlimit};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Gid, Pid, setgid, setsid};
 use serde::Deserialize;
-use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use tokio::fs::{self, set_permissions};
+
+use tokio::fs;
 use tokio::process::Command;
+
+static CONTROL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Deserialize)]
 pub struct ControlReq {
@@ -108,20 +109,15 @@ async fn resolve_init_file(state: &AppState) -> Result<String, String> {
 
 pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), String> {
     let path = resolve_init_file(state).await?;
-    let result = if let Ok(f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(error_log_path())
+    let mut command = Command::new(&path);
+    command.args(args).kill_on_drop(true);
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open(error_log_path())
     {
-        Command::new(&path)
-            .args(args)
-            .stdout(f.try_clone().unwrap())
-            .stderr(f)
-            .status()
-            .await
-    } else {
-        Command::new(&path).args(args).status().await
-    };
+        command.stdout(f.try_clone().map_err(|e| e.to_string())?).stderr(f);
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), command.status())
+        .await.map_err(|_| format!("Таймаут init: {path}"))?;
     match result {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("{path}: {status}")),
@@ -221,6 +217,7 @@ async fn confirm_started(
 }
 
 pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
+    let _control_guard = CONTROL_LOCK.lock().await;
     let mut current_core = state.core.read().unwrap().clone();
     let core_name = current_core.name.clone();
 
@@ -311,7 +308,47 @@ async fn check_core_config(core: &str) -> Result<(), String> {
     Ok(())
 }
 
+async fn switch_core(state: &AppState, init_file: &str, old: &str, new: &str) -> Result<(), String> {
+    let mut work = crate::update_transaction::Workspace::create(Path::new(opt_path!("/sbin")))?;
+    let was_running = !get_pid(old).is_empty();
+    let candidate = Core::parse(new)?;
+    let resolved_init = fs::canonicalize(init_file).await.map_err(|e| e.to_string())?;
+    crate::core_switch::transact(
+        &resolved_init, old, new, was_running, &mut work,
+        || async {
+            check_core_config(new).await?;
+            crate::update_transaction::check_elf(Path::new(candidate.executable()), std::env::consts::ARCH, cfg!(target_endian = "little"))?;
+            crate::update_transaction::check_candidate_commands(Path::new(candidate.executable()), new, "").await
+        },
+        |action, health| async move {
+            let args: &[&str] = if action == "start" { &["start", "on"] } else { &["stop"] };
+            run_init_command(state, args).await?;
+            if health {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let core = state.core.read().unwrap().name.clone();
+                if get_pid(&core).is_empty() { return Err(format!("Ядро {core} не запущено")); }
+            } else if !get_pid("xray").is_empty() || !get_pid("mihomo").is_empty() {
+                return Err("Ядро не остановлено".into());
+            }
+            Ok(())
+        },
+        |name| { *state.core.write().unwrap() = get_core_info(name); },
+    ).await
+}
+
 pub async fn post_control(State(state): State<AppState>, Json(req): Json<ControlReq>) -> impl IntoResponse {
+    // The detached task owns the guard and recovery even if the HTTP waiter disconnects.
+    let result = crate::update_transaction::run_to_completion(async move {
+        let _control_guard = CONTROL_LOCK.lock().await;
+        post_control_inner(state, req).await
+    }).await;
+    match result {
+        Ok(response) => response,
+        Err(e) => Json(ApiResponse { success: false, error: Some(e.to_string()), data: None }),
+    }
+}
+
+async fn post_control_inner(state: AppState, req: ControlReq) -> Json<ApiResponse<()>> {
     match req.action.as_str() {
         "switchCore" => {
             let core = match req.requested_core() {
@@ -343,42 +380,10 @@ pub async fn post_control(State(state): State<AppState>, Json(req): Json<Control
                     });
                 }
             };
-            _ = Command::new(&init_file).arg("stop").status().await;
-
-            if let Ok(content) = fs::read_to_string(&init_file).await {
-                let new_content = content.replace(
-                    &format!("name_client=\"{}\"", old),
-                    &format!("name_client=\"{}\"", core),
-                );
-                _ = fs::write(&init_file, new_content).await;
-                _ = set_permissions(&init_file, Permissions::from_mode(0o755)).await;
-            }
-
-            *state.core.write().unwrap() = get_core_info(core);
-
-            if let Err(e) = check_core_config(core).await {
-                log("ERROR", e);
-                return Json(ApiResponse {
-                    success: false,
-                    error: Some(format!(
-                        "Не удалось запустить {}{}",
-                        core[..1].to_uppercase(),
-                        &core[1..]
-                    )),
-                    data: None,
-                });
-            }
-
-            if core != "xray" {
-                _ = fs::write(error_log_path(), b"").await;
-            }
-
-            if let Err(e) = run_init_command(&state, &["start", "on"]).await {
-                return Json(ApiResponse {
-                    success: false,
-                    error: Some(e),
-                    data: None,
-                });
+            let result = switch_core(&state, &init_file, &old, core).await;
+            if let Err(e) = result {
+                log("ERROR", e.clone());
+                return Json(ApiResponse { success: false, error: Some(e), data: None });
             }
         }
         "softRestart" => {
@@ -460,6 +465,9 @@ mod tests {
     use super::*;
     use axum::{Router, routing::post};
     use std::sync::{Arc, RwLock};
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::fs::set_permissions;
     use tokio::sync::{Mutex, broadcast};
 
     #[test]
@@ -611,6 +619,19 @@ mod tests {
                 .unwrap();
             assert_eq!(response["success"], true);
         }
+        // A real request cannot enter while another control transaction owns the lock.
+        let guard = CONTROL_LOCK.lock().await;
+        let waiting_client = client.clone();
+        let waiting_url = url.clone();
+        let mut waiting = tokio::spawn(async move {
+            waiting_client.post(waiting_url).json(&serde_json::json!({
+                "action": "switchCore", "core": "mihomo"
+            })).send().await.unwrap()
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting).await.is_err());
+        drop(guard);
+        let response: serde_json::Value = waiting.await.unwrap().json().await.unwrap();
+        assert_eq!(response["success"], true);
         let req: ControlReq = serde_json::from_value(serde_json::json!({"action": "stop"})).unwrap();
         assert!(req.core.is_none());
         server.abort();

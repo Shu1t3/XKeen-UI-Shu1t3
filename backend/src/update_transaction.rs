@@ -112,7 +112,7 @@ pub async fn preflight(path: &Path, core: &str, version: &str) -> Result<(), Str
     check_candidate_commands(path, core, version).await
 }
 
-async fn check_candidate_commands(path: &Path, core: &str, version: &str) -> Result<(), String> {
+pub(crate) async fn check_candidate_commands(path: &Path, core: &str, version: &str) -> Result<(), String> {
     let args: &[&str] = match core {
         "self" => &["--version"],
         "xray" => &["version"],
