@@ -19,6 +19,10 @@ use tokio::process::Command;
 const GITHUB_API: &str = "https://api.github.com/repos";
 const GITHUB_RELEASE: &str = "https://github.com";
 
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Deserialize)]
 struct GhAsset {
     name: String,
@@ -193,7 +197,18 @@ fn response(success: bool, error: Option<String>) -> (HeaderMap, Json<Value>) {
     (h, Json(json!({ "success": success, "error": error })))
 }
 
-async fn download(
+async fn download(url: &str, proxies: &[String], tmp_path: &Path) -> Result<DownloadResult, String> {
+    // Downloads need a larger budget than the shared API/relay client.
+    let client = reqwest::Client::builder()
+        .user_agent("XKeen-UI")
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout(DOWNLOAD_TOTAL_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Не удалось создать клиент загрузки: {e:?}"))?;
+    download_with_client(&client, url, proxies, tmp_path).await
+}
+
+async fn download_with_client(
     client: &reqwest::Client, url: &str, proxies: &[String], tmp_path: &Path,
 ) -> Result<DownloadResult, String> {
     async fn load(r: reqwest::Response, path: &Path, source: &str) -> Option<DownloadResult> {
@@ -211,7 +226,7 @@ async fn download(
         };
 
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+            match tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, stream.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     if let Some(f) = &mut file {
                         if f.write_all(&chunk).await.is_err() {
@@ -243,11 +258,18 @@ async fn download(
                     });
                 }
                 Ok(Some(Err(e))) => {
-                    log("WARN", format!("Соединение оборвалось ({}): {}", source, e));
+                    log("WARN", format!("Соединение оборвалось ({}): {:?}", source, e));
                     break;
                 }
                 Err(_) => {
-                    log("WARN", format!("Таймаут загрузки ({})", source));
+                    log(
+                        "WARN",
+                        format!(
+                            "Таймаут загрузки ({}): нет данных {} с",
+                            source,
+                            DOWNLOAD_IDLE_TIMEOUT.as_secs()
+                        ),
+                    );
                     break;
                 }
             }
@@ -272,8 +294,13 @@ async fn download(
             );
         }
 
-        match client.get(&u).send().await {
-            Ok(r) if r.status().is_success() => {
+        let attempt = if is_proxy {
+            format!("прокси #{}", i)
+        } else {
+            "напрямую".into()
+        };
+        match tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, client.get(&u).send()).await {
+            Ok(Ok(r)) if r.status().is_success() => {
                 if r.headers()
                     .get("content-type")
                     .map_or(false, |v| v.to_str().unwrap_or("").contains("text/html"))
@@ -298,8 +325,16 @@ async fn download(
                     return Ok(res);
                 }
             }
-            Ok(r) => log("WARN", format!("Ошибка загрузки: {}", r.status())),
-            Err(e) => log("WARN", format!("Ошибка загрузки: {}", e)),
+            Ok(Ok(r)) => log("WARN", format!("Ошибка загрузки ({}): {}", attempt, r.status())),
+            Ok(Err(e)) => log("WARN", format!("Ошибка загрузки ({}): {:?}", attempt, e)),
+            Err(_) => log(
+                "WARN",
+                format!(
+                    "Таймаут ожидания ответа ({}): {} с",
+                    attempt,
+                    DOWNLOAD_IDLE_TIMEOUT.as_secs()
+                ),
+            ),
         }
     }
     log("ERROR", "Не удалось выполнить обновление".into());
@@ -343,7 +378,7 @@ async fn install_jq() -> Result<(), String> {
     Ok(())
 }
 
-async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path) -> Result<(), String> {
+async fn install_yq(proxies: &[String], tmp_dir: &Path) -> Result<(), String> {
     let arch = std::env::consts::ARCH;
     let url = match arch {
         "aarch64" => format!(
@@ -362,7 +397,7 @@ async fn install_yq(client: &reqwest::Client, proxies: &[String], tmp_dir: &Path
     };
 
     log("INFO", format!("Загрузка yq: {}", url));
-    let dl_res = download(client, &url, proxies, &tmp_dir.join("yq.tmp")).await?;
+    let dl_res = download(&url, proxies, &tmp_dir.join("yq.tmp")).await?;
     let target = opt_path!("/sbin/yq");
     if let Err(e) = save(dl_res, tmp_dir.join("yq.bin")).await {
         return Err(format!("Ошибка записи yq: {}", e));
@@ -422,7 +457,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
 
         log("INFO", "Загрузка исполняемого файла...".into());
         let bin_url = format!("{GITHUB_RELEASE}/{repo}/releases/download/{ver}/xkeen-ui-{arch_suffix}");
-        let bin_d = match download(&state.http_client, &bin_url, &proxies, &tmp_dir.join("bin.tmp")).await {
+        let bin_d = match download(&bin_url, &proxies, &tmp_dir.join("bin.tmp")).await {
             Ok(d) => d,
             Err(e) => return response(false, Some(e)),
         };
@@ -539,7 +574,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
         }
         "mihomo" if !Path::new(opt_path!("/sbin/yq")).exists() => {
             log("WARN", "Пакет yq не найден".into());
-            if let Err(e) = install_yq(&state.http_client, &proxies, tmp_dir).await {
+            if let Err(e) = install_yq(&proxies, tmp_dir).await {
                 return response(false, Some(e));
             }
         }
@@ -547,7 +582,7 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
     }
 
     log("INFO", format!("Загрузка: {}", url));
-    let dl_res = match download(&state.http_client, &url, &proxies, &tmp_dir.join("download.tmp")).await {
+    let dl_res = match download(&url, &proxies, &tmp_dir.join("download.tmp")).await {
         Ok(r) => r,
         Err(e) => return response(false, Some(e)),
     };
@@ -670,6 +705,68 @@ pub async fn post_update(State(state): State<AppState>, Json(req): Json<UpdateRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn download_server(header_delay: Duration, body_delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/asset", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            socket.read(&mut request).await.unwrap();
+            tokio::time::sleep(header_delay).await;
+            if socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcd")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(body_delay).await;
+            let _ = socket.write_all(b"efgh").await;
+        });
+        (url, server)
+    }
+
+    fn download_test_path() -> PathBuf {
+        std::env::temp_dir().join(format!("xkeen-download-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn download_accepts_response_headers_after_five_seconds() {
+        let (url, server) = download_server(Duration::from_secs(6), Duration::ZERO).await;
+        let result = download(&url, &[], &download_test_path()).await.unwrap();
+        assert!(matches!(result, DownloadResult::RAM(ref bytes) if bytes == b"abcdefgh"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_accepts_body_pauses_longer_than_five_seconds() {
+        let (url, server) = download_server(Duration::ZERO, Duration::from_secs(6)).await;
+        let result = download(&url, &[], &download_test_path()).await.unwrap();
+        assert!(matches!(result, DownloadResult::RAM(ref bytes) if bytes == b"abcdefgh"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_total_timeout_discards_partial_body_and_tries_proxy() {
+        let (url, stalled) = download_server(Duration::ZERO, Duration::from_secs(60)).await;
+        let (proxy_url, proxy) = download_server(Duration::ZERO, Duration::ZERO).await;
+        let proxy_base = proxy_url.strip_suffix("/asset").unwrap().to_string();
+        // A short total budget makes the timeout regression test fast.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let result = download_with_client(&client, &url, &[proxy_base], &download_test_path())
+            .await
+            .unwrap();
+        assert!(matches!(result, DownloadResult::RAM(ref bytes) if bytes == b"abcdefgh"));
+        proxy.await.unwrap();
+        stalled.abort();
+        let _ = stalled.await;
+    }
 
     #[test]
     fn slug_from_repo_url() {
