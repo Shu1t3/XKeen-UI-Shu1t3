@@ -30,24 +30,20 @@ pub struct DnsStatusFields {
 }
 
 fn check_dns_mihomo() -> bool {
-    if let Some(config_path) = find_mihomo_config() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(yaml) = yaml_rust2::YamlLoader::load_from_str(&content) {
-                if let Some(doc) = yaml.first() {
-                    if let Some(dns) = doc["dns"].as_hash() {
-                        let enable = dns
-                            .get(&yaml_rust2::Yaml::String("enable".into()))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let listen = dns
-                            .get(&yaml_rust2::Yaml::String("listen".into()))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        return enable && listen == "0.0.0.0:53";
-                    }
-                }
-            }
-        }
+    if let Some(config_path) = find_mihomo_config()
+        && let Ok(content) = std::fs::read_to_string(&config_path)
+        && let Ok(yaml) = yaml_rust2::YamlLoader::load_from_str(&content)
+        && let Some(doc) = yaml.first()
+        && let Some(dns) = doc["dns"].as_hash() {
+        let enable = dns
+            .get(&yaml_rust2::Yaml::String("enable".into()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let listen = dns
+            .get(&yaml_rust2::Yaml::String("listen".into()))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return enable && listen == "0.0.0.0:53";
     }
     false
 }
@@ -78,10 +74,9 @@ fn get_br0_ip() -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet ") {
-            if let Some(ip) = rest.split('/').next() {
-                return Ok(ip.to_string());
-            }
+        if let Some(rest) = line.strip_prefix("inet ")
+            && let Some(ip) = rest.split('/').next() {
+            return Ok(ip.to_string());
         }
     }
     Err("Не удалось получить IP адрес br0".into())

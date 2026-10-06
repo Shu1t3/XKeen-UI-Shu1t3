@@ -40,9 +40,9 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let entry_path = entry.path();
                         let matches = if is_mihomo {
-                            entry_path.extension().map_or(false, |e| e == "yaml" || e == "yml")
+                            entry_path.extension().is_some_and(|e| e == "yaml" || e == "yml")
                         } else {
-                            entry_path.extension().map_or(false, |e| e == "json")
+                            entry_path.extension().is_some_and(|e| e == "json")
                         };
                         if matches {
                             match tokio::fs::read_to_string(&entry_path).await {
@@ -113,13 +113,12 @@ pub async fn get_configs(
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path.extension().map_or(false, |e| e == "lst") || name == "xkeen.json" {
-                if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                    lst_configs.push(ConfigItem {
-                        file: path.to_string_lossy().into(),
-                        content,
-                    });
-                }
+            if (path.extension().is_some_and(|e| e == "lst") || name == "xkeen.json")
+                && let Ok(content) = tokio::fs::read_to_string(&path).await {
+                lst_configs.push(ConfigItem {
+                    file: path.to_string_lossy().into(),
+                    content,
+                });
             }
         }
     }
@@ -385,7 +384,7 @@ fn validation_snapshot(core: &str, directory: &Path, current: &str, content: &st
     let mut files = Vec::new();
     for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        if path.extension().map_or(false, |e| e == "json") {
+        if path.extension().is_some_and(|e| e == "json") {
             let resolved = fs::canonicalize(&path).map_err(|e| e.to_string())?;
             let same = path == current_path || current_resolved.as_ref() == Some(&resolved);
             let contents = if same {

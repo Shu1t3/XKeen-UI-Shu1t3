@@ -43,8 +43,7 @@ impl Fixture {
         let failures = Arc::new(Mutex::new(failures));
         transact(
             &self.init,
-            "xray",
-            "mihomo",
+            ("xray", "mihomo"),
             was_running,
             work,
             move || async move {
@@ -329,8 +328,7 @@ async fn cancelled_waiter_still_finishes_failed_start_rollback() {
     let waiter = tokio::spawn(crate::update_transaction::run_to_completion(async move {
         let result = transact(
             &init,
-            "xray",
-            "mihomo",
+            ("xray", "mihomo"),
             true,
             &mut work,
             || async { Ok(()) },
@@ -395,8 +393,7 @@ async fn run_with_staged_file_removed(
     let command_removed = removed.clone();
     let result = transact(
         &fixture.init,
-        "xray",
-        "mihomo",
+        ("xray", "mihomo"),
         true,
         work,
         || async { Ok(()) },

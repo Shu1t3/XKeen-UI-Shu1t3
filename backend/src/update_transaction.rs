@@ -243,14 +243,13 @@ where
                 work.path.join("old").display()
             ));
         }
-        if running && had_old {
-            if let Err(e) = attempt_restart(&mut restart).await {
-                work.preserve();
-                return Err(format!(
-                    "{error}; старый бинарник восстановлен, но не запущен: {e}; lock: {}",
-                    work.lock.display()
-                ));
-            }
+        if running && had_old
+            && let Err(e) = attempt_restart(&mut restart).await {
+            work.preserve();
+            return Err(format!(
+                "{error}; старый бинарник восстановлен, но не запущен: {e}; lock: {}",
+                work.lock.display()
+            ));
         }
         work.preserve = false;
         return Err(format!("{error}; предыдущая версия восстановлена"));

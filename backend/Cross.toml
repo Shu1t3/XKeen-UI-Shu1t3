@@ -1,9 +1,13 @@
+[build.env]
+passthrough = ["XKEEN_UI_VERSION", "SOURCE_DATE_EPOCH"]
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:65230be661f3171c6dc1eef3239b6430de8b4bab2683d4c41b0de3d91a29646e"
+
 [target.mips-unknown-linux-musl]
-image = "ghcr.io/cross-rs/mips-unknown-linux-musl:edge"
+image = "ghcr.io/cross-rs/mips-unknown-linux-musl@sha256:3ecf0f23518046694a0e843406c3e019a623e32d93ff4f728c509519a2272c67"
 pre-build = ["ln -s /usr/local/lib/gcc/mips-linux-muslsf/9.2.0/libgcc.a /usr/local/lib/gcc/mips-linux-muslsf/9.2.0/libunwind.a"]
 
 [target.mipsel-unknown-linux-musl]
-image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge"
+image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl@sha256:87f9a89250ae7fb0020f989a0f88ffb1b77039ed6f51934622f30cd1fdd997ca"
 pre-build = ["ln -s /usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0/libgcc.a /usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0/libunwind.a"]
-
-[target.mipsel-unknown-linux-gnu]

@@ -83,21 +83,19 @@ pub fn find_init_file(log_enabled: bool) -> Option<String> {
             .map(String::from)
     });
 
-    if log_enabled {
-        if let Some(p) = &final_path {
-            println!("{} [INFO] Defined initd_file ({}): {}", crate::logger::ts(), source, p);
-        }
+    if log_enabled
+        && let Some(p) = &final_path {
+        println!("{} [INFO] Defined initd_file ({}): {}", crate::logger::ts(), source, p);
     }
 
     final_path
 }
 
 async fn resolve_init_file(state: &AppState) -> Result<String, String> {
-    if let Some(path) = state.init_file.read().unwrap().clone() {
-        if Path::new(&path).exists() {
+    if let Some(path) = state.init_file.read().unwrap().clone()
+        && Path::new(&path).exists() {
             return Ok(path);
         }
-    }
     let new_path = tokio::task::spawn_blocking(|| find_init_file(false))
         .await
         .map_err(|e| e.to_string())?
@@ -310,7 +308,7 @@ async fn check_core_config(core: &str) -> Result<(), String> {
         let has_json = std::fs::read_dir(XRAY_CONF_DIR)
             .map(|dir| {
                 dir.flatten()
-                    .any(|e| e.path().extension().map_or(false, |x| x == "json"))
+                    .any(|e| e.path().extension().is_some_and(|x| x == "json"))
             })
             .unwrap_or(false);
         if !has_json {
@@ -328,7 +326,7 @@ async fn switch_core(state: &AppState, init_file: &str, old: &str, new: &str) ->
     let candidate = Core::parse(new)?;
     let resolved_init = fs::canonicalize(init_file).await.map_err(|e| e.to_string())?;
     crate::core_switch::transact(
-        &resolved_init, old, new, was_running, &mut work,
+        &resolved_init, (old, new), was_running, &mut work,
         || async {
             check_core_config(new).await?;
             crate::update_transaction::check_elf(Path::new(candidate.executable()), std::env::consts::ARCH, cfg!(target_endian = "little"))?;
@@ -423,19 +421,18 @@ async fn post_control_inner(state: AppState, req: ControlReq) -> Json<ApiRespons
             };
 
             let cur_name = state.core.read().unwrap().name.clone();
-            if a == "start" || a == "hardRestart" {
-                if let Err(e) = check_core_config(&cur_name).await {
-                    log("ERROR", e);
-                    return Json(ApiResponse {
-                        success: false,
-                        error: Some(format!(
-                            "Не удалось запустить {}{}",
-                            &cur_name[..1].to_uppercase(),
-                            &cur_name[1..]
-                        )),
-                        data: None,
-                    });
-                }
+            if (a == "start" || a == "hardRestart")
+                && let Err(e) = check_core_config(&cur_name).await {
+                log("ERROR", e);
+                return Json(ApiResponse {
+                    success: false,
+                    error: Some(format!(
+                        "Не удалось запустить {}{}",
+                        cur_name[..1].to_uppercase(),
+                        &cur_name[1..]
+                    )),
+                    data: None,
+                });
             }
             if cur_name == "mihomo" && (a == "start" || a == "hardRestart") {
                 _ = fs::write(error_log_path(), b"").await;

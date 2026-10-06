@@ -11,7 +11,9 @@ use crate::types::{ApiResponse, AppState, MIHOMO_CONF_DIR};
 
 const MIHOMO_CONF_DIRIG_PATH: &str = opt_path!("/etc/mihomo/config.yaml");
 
-static MIHOMO_YAML_CACHE: LazyLock<RwLock<Option<(SystemTime, Arc<Vec<Yaml>>)>>> = LazyLock::new(|| RwLock::new(None));
+type CachedMihomoYaml = Option<(SystemTime, Arc<Vec<Yaml>>)>;
+
+static MIHOMO_YAML_CACHE: LazyLock<RwLock<CachedMihomoYaml>> = LazyLock::new(|| RwLock::new(None));
 
 /// Общий кэш `config.yaml` mihomo по mtime — используется и этим модулем, и `route_test::mihomo`
 /// (нужен движку тестера маршрутов, чтобы не парсить YAML на каждый запрос).

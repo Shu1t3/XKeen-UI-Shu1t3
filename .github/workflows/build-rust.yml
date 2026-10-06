@@ -1,17 +1,34 @@
 name: Build Rust binaries
 on:
+  push:
+    branches: [main]
+    paths: ['backend/**', 'frontend/**', 'scripts/**', 'rust-toolchain.toml', '.github/workflows/build-rust.yml', '.github/scripts/**']
+  pull_request:
+    paths: ['backend/**', 'frontend/**', 'scripts/**', 'rust-toolchain.toml', '.github/workflows/build-rust.yml', '.github/scripts/**']
   workflow_dispatch:
     inputs:
       version:
         description: "Release version (e.g. v1.0.0)"
         required: true
         type: string
+      publish:
+        description: "Publish prerelease after all checks and builds"
+        type: boolean
+        default: true
+permissions:
+  contents: read
+env:
+  RUST_STABLE: '1.99.0'
+  RUST_NIGHTLY: 'nightly-2026-10-06'
+  CROSS_REV: '74e99b2223de06166f8cdcc1af7f1308ec52baf4'
+  XKEEN_UI_VERSION: ${{ inputs.version || 'v0.0.0' }}
 jobs:
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Require release notes
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
@@ -20,128 +37,122 @@ jobs:
           test -s "$notes" || { echo "Missing release notes: $notes"; exit 1; }
           grep -q '^## Исправления$' "$notes" || { echo "Release notes must describe fixes"; exit 1; }
           grep -q '^- ' "$notes" || { echo "Release notes must contain changes"; exit 1; }
-      - name: Test installer release selection
+      - name: Test installer transactions
         run: |
           sh scripts/test-release-source.sh
           sh scripts/test-installer-transaction.sh
           sh scripts/test-self-update.sh
-      - uses: oven-sh/setup-bun@v2
-      - name: Build frontend
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26.7.0'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.2'
+      - name: Build and test frontend
         working-directory: frontend
         run: bun install --frozen-lockfile && bunx eslint . --max-warnings 0 && bun test tests && bun run build
-      - name: Install Rust for tests
-        run: rustup toolchain install stable --profile minimal
-      - uses: swatinem/rust-cache@v2
+      - name: Install Rust for checks
+        run: rustup toolchain install "$RUST_STABLE" --profile minimal -c clippy
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: backend
-          key: tests
-      - name: Test backend
+          key: tests-locked
+      - name: Check backend
         working-directory: backend
-        run: cargo +stable test && cargo +stable test --features local-dev
-      - uses: actions/upload-artifact@v7
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --features local-dev -- -D warnings
+          cargo test --locked
+          cargo test --locked --features local-dev
+          git diff --exit-code -- Cargo.lock
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: frontend-dist
           path: frontend/dist
+          if-no-files-found: error
 
   build:
     needs: frontend
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
           - target: aarch64-unknown-linux-musl
             name: arm64-v8a
-            toolchain: stable
+            channel: stable
           - target: mipsel-unknown-linux-musl
             name: mips32le
-            toolchain: nightly
+            channel: nightly
             rustflags: "-C target-feature=+crt-static -L /usr/local/mipsel-linux-muslsf/lib -L /usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0"
           - target: mips-unknown-linux-musl
             name: mips32
-            toolchain: nightly
+            channel: nightly
             rustflags: "-C target-feature=+crt-static -L /usr/local/mips-linux-muslsf/lib -L /usr/local/lib/gcc/mips-linux-muslsf/9.2.0"
-          # - target: mipsel-unknown-linux-gnu
-          #   name: mips32le-gnu
-          #   toolchain: nightly
-          #   rustflags: "-C target-feature=+crt-static"
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: frontend-dist
           path: frontend/dist
-
-      - name: Set version
+      - name: Install pinned Rust
+        env:
+          CHANNEL: ${{ matrix.channel }}
         run: |
-          sed -i 's/^version = .*/version = "${{ inputs.version }}"/' backend/Cargo.toml
-          sed -i 's/version = "v/version = "/' backend/Cargo.toml
-          cat backend/Cargo.toml
-
-      - name: Install Rust
-        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal -c rust-src
-
-      - uses: swatinem/rust-cache@v2
+          toolchain="$RUST_STABLE"
+          if [ "$CHANNEL" = nightly ]; then toolchain="$RUST_NIGHTLY"; fi
+          rustup toolchain install "$RUST_STABLE" --profile minimal
+          rustup toolchain install "$toolchain" --profile minimal -c rust-src
+          echo "BUILD_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: backend
-          key: ${{ matrix.target }}
-
-      - name: Install cross
-        run: type cross || cargo install cross --git https://github.com/cross-rs/cross
-
-      # - name: Setup Cross.toml
-      #   working-directory: backend
-      #   run: |
-      #     cat <<'EOF' > Cross.toml
-      #     [target.mips-unknown-linux-musl]
-      #     image = "ghcr.io/cross-rs/mips-unknown-linux-musl:edge"
-      #     build-std = ["std", "panic_abort", "proc_macro"]
-      #
-      #     [target.mipsel-unknown-linux-musl]
-      #     image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge"
-      #     build-std = ["std", "panic_abort", "proc_macro"]
-      #
-      #     [target.mipsel-unknown-linux-gnu]
-      #     build-std = ["std", "panic_abort", "proc_macro"]
-      #     EOF
-      #
-      - name: Check metadata
+          key: locked-${{ matrix.target }}
+      - name: Install pinned cross in isolated root
+        run: |
+          cargo +"$RUST_STABLE" install --locked --git https://github.com/cross-rs/cross --rev "$CROSS_REV" --root "$RUNNER_TEMP/pinned-cross" cross
+          echo "$RUNNER_TEMP/pinned-cross/bin" >> "$GITHUB_PATH"
+      - name: Check locked metadata
         working-directory: backend
-        run: cargo metadata --format-version 1
-
+        run: cargo +"$BUILD_TOOLCHAIN" metadata --locked --format-version 1 > /dev/null
       - name: Inject frontend dist for cross
         working-directory: backend
         run: |
           cp -r ../frontend/dist ./dist
           sed -i 's|\.\./frontend/dist|./dist|' src/frontend_embedder.rs
-
-      - name: Build binary
+      - name: Build and smoke-test router binary
         working-directory: backend
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          BUILD_TARGET: ${{ matrix.target }}
+          ASSET_NAME: ${{ matrix.name }}
         run: |
-          cross +${{ matrix.toolchain }} build --release --target ${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/xkeen-ui ../xkeen-ui-${{ matrix.name }}
-
-      - uses: actions/upload-artifact@v7
+          cross +"$BUILD_TOOLCHAIN" build --locked --release --target "$BUILD_TARGET"
+          timeout 60 cross +"$BUILD_TOOLCHAIN" run --locked --release --target "$BUILD_TARGET" -- --version | tee ../version-output.txt
+          grep -F "$XKEEN_UI_VERSION" ../version-output.txt
+          git diff --exit-code -- Cargo.lock
+          cp "target/$BUILD_TARGET/release/xkeen-ui" "../xkeen-ui-$ASSET_NAME"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: xkeen-ui-${{ matrix.name }}
           path: xkeen-ui-${{ matrix.name }}
+          if-no-files-found: error
 
   release:
-    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-24.04
     needs: build
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          pattern: xkeen-ui-*
           path: artifacts
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ inputs.version }}
           target_commitish: ${{ github.sha }}
@@ -149,7 +160,6 @@ jobs:
           fail_on_unmatched_files: true
           prerelease: true
           files: artifacts/xkeen-ui-*/*
-
       - name: Verify published GitHub digests
         env:
           GH_TOKEN: ${{ github.token }}

@@ -22,7 +22,7 @@ impl LogClient {
         let mut lifecycle = state.log_watcher.lock().unwrap();
         lifecycle.clients += 1;
         if state.debug { println!("{} [INFO] WS Connected (Total: {})", crate::logger::ts(), lifecycle.clients); }
-        if lifecycle.handle.as_ref().map_or(true, |h| h.is_finished()) {
+        if lifecycle.handle.as_ref().is_none_or(|h| h.is_finished()) {
             lifecycle.handle = Some(spawn_log_watcher(state));
         }
         Self { lifecycle: state.log_watcher.clone() }
@@ -33,9 +33,8 @@ impl Drop for LogClient {
     fn drop(&mut self) {
         let mut lifecycle = self.lifecycle.lock().unwrap();
         lifecycle.clients -= 1;
-        if lifecycle.clients == 0 {
-            if let Some(handle) = lifecycle.handle.take() { handle.abort(); }
-        }
+        if lifecycle.clients == 0
+            && let Some(handle) = lifecycle.handle.take() { handle.abort(); }
     }
 }
 
@@ -44,11 +43,10 @@ fn spawn_log_watcher(state: &AppState) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let (mpsc_tx, mut mpsc_rx) = tokio::sync::mpsc::channel::<String>(32);
         let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            if let Ok(e) = res {
-                if e.kind.is_modify() {
-                    for path in e.paths {
-                        let _ = mpsc_tx.try_send(path.to_string_lossy().to_string());
-                    }
+            if let Ok(e) = res
+                && e.kind.is_modify() {
+                for path in e.paths {
+                    let _ = mpsc_tx.try_send(path.to_string_lossy().to_string());
                 }
             }
         }) {
@@ -232,9 +230,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, session: crate::auth:
                     if !l.is_empty() {
                         let content = l.join("\n");
                         if tx.send(Message::Text(serde_json::json!({"type": t, "content": content}).to_string().into())).await.is_err() { break; }
-                    } else if t == "clear" {
-                         if tx.send(Message::Text(serde_json::json!({"type": "clear"}).to_string().into())).await.is_err() { break; }
-                    }
+                    } else if t == "clear"
+                         && tx.send(Message::Text(serde_json::json!({"type": "clear"}).to_string().into())).await.is_err() { break; }
                 }
             }
         }

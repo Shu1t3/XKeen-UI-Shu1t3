@@ -128,6 +128,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_asset(url: String, expected: &[u8]) -> TrustedAsset {
+    TrustedAsset { url, hash: hex(&Sha256::digest(expected)) }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -262,9 +267,4 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         server.abort();
     }
-}
-
-#[cfg(test)]
-pub(crate) fn fixture_asset(url: String, expected: &[u8]) -> TrustedAsset {
-    TrustedAsset { url, hash: hex(&Sha256::digest(expected)) }
 }

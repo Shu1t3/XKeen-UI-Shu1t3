@@ -34,8 +34,7 @@ async fn stage(path: &Path, bytes: &[u8], permissions: std::fs::Permissions) -> 
 
 pub async fn transact<P, PF, C, CF, S>(
     init: &Path,
-    old: &str,
-    new: &str,
+    cores: (&str, &str),
     was_running: bool,
     work: &mut Workspace,
     preflight: P,
@@ -49,6 +48,7 @@ where
     CF: Future<Output = Result<(), String>>,
     S: Fn(&str),
 {
+    let (old, new) = cores;
     preflight().await?;
     let original = fs::read(init)
         .await

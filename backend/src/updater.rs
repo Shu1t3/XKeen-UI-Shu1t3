@@ -39,7 +39,7 @@ struct GhRelease {
 }
 
 enum DownloadResult {
-    RAM(Vec<u8>),
+    Ram(Vec<u8>),
     Disk(PathBuf),
 }
 
@@ -164,7 +164,7 @@ pub async fn fetch_latest_version(
         if res
             .headers()
             .get("content-type")
-            .map_or(false, |v| v.to_str().unwrap_or("").contains("text/html"))
+            .is_some_and(|v| v.to_str().unwrap_or("").contains("text/html"))
         {
             continue;
         }
@@ -181,16 +181,15 @@ pub async fn fetch_latest_version(
 }
 
 fn select_latest_release(rels: Vec<GhRelease>, core: &str, current_ver: Option<&str>) -> Option<(String, String)> {
-    if current_ver.map_or(false, |v| v.contains("alpha")) && core == "mihomo" {
-        if let Some(r) = rels.iter().find(|r| !r.draft && r.tag_name == "Prerelease-Alpha") {
-            for asset in &r.assets {
-                if let Some(hash) = asset
-                    .name
-                    .find("alpha-")
-                    .and_then(|index| asset.name[index..].split('.').next())
-                {
-                    return Some((hash.to_string(), "Prerelease-Alpha".into()));
-                }
+    if current_ver.is_some_and(|v| v.contains("alpha")) && core == "mihomo"
+        && let Some(r) = rels.iter().find(|r| !r.draft && r.tag_name == "Prerelease-Alpha") {
+        for asset in &r.assets {
+            if let Some(hash) = asset
+                .name
+                .find("alpha-")
+                .and_then(|index| asset.name[index..].split('.').next())
+            {
+                return Some((hash.to_string(), "Prerelease-Alpha".into()));
             }
         }
     }
@@ -218,7 +217,7 @@ async fn download_verified(repo: &str, tag: &str, name: &str, proxies: &[String]
 async fn download_with_trusted_asset(trusted: crate::release_integrity::TrustedAsset, proxies: &[String], path: &Path) -> Result<DownloadResult, String> {
     let result = download(&trusted.url, proxies, path).await?;
     match &result {
-        DownloadResult::RAM(bytes) => trusted.verify_bytes(bytes)?,
+        DownloadResult::Ram(bytes) => trusted.verify_bytes(bytes)?,
         DownloadResult::Disk(file) => {
             let file = file.clone();
             tokio::task::spawn_blocking(move || trusted.verify_file(&file)).await.map_err(|e| e.to_string())??;
@@ -284,7 +283,7 @@ async fn download_with_client(
                     return Some(if is_disk {
                         DownloadResult::Disk(path.to_path_buf())
                     } else {
-                        DownloadResult::RAM(buf)
+                        DownloadResult::Ram(buf)
                     });
                 }
                 Ok(Some(Err(e))) => {
@@ -333,7 +332,7 @@ async fn download_with_client(
             Ok(Ok(r)) if r.status().is_success() => {
                 if r.headers()
                     .get("content-type")
-                    .map_or(false, |v| v.to_str().unwrap_or("").contains("text/html"))
+                    .is_some_and(|v| v.to_str().unwrap_or("").contains("text/html"))
                 {
                     log(
                         "WARN",
@@ -374,7 +373,7 @@ async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
         let mut out = File::create(&out_path)?;
         match dl {
-            DownloadResult::RAM(d) => out.write_all(&d)?,
+            DownloadResult::Ram(d) => out.write_all(&d)?,
             DownloadResult::Disk(p) => {
                 std::io::copy(&mut File::open(&p)?, &mut out)?;
                 _ = std::fs::remove_file(p);
@@ -383,7 +382,7 @@ async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
         out.sync_data()
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+    .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 async fn install_jq() -> Result<(), String> {
@@ -624,11 +623,10 @@ async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Val
             if entry.is_none() {
                 let mut files: Vec<String> = Vec::new();
                 for i in 0..archive.len() {
-                    if let Ok(f) = archive.by_index(i) {
-                        if !f.is_dir() {
+                    if let Ok(f) = archive.by_index(i)
+                        && !f.is_dir() {
                             files.push(f.name().to_string());
                         }
-                    }
                 }
                 if files.len() == 1 {
                     entry = files.into_iter().next();
@@ -649,7 +647,7 @@ async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Val
     let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bin = unpack_dir.join(&tmp_name);
         match dl_res {
-            DownloadResult::RAM(d) => unpack(Cursor::new(d), &bin, &core_name, is_zip)?,
+            DownloadResult::Ram(d) => unpack(Cursor::new(d), &bin, &core_name, is_zip)?,
             DownloadResult::Disk(p) => {
                 unpack(File::open(&p)?, &bin, &core_name, is_zip)?;
                 _ = std::fs::remove_file(p);
@@ -659,7 +657,7 @@ async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Val
     })
     .await;
 
-    if let Ok(Err(e)) | Err(e) = unpack.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) {
+    if let Ok(Err(e)) | Err(e) = unpack.map_err(|e| std::io::Error::other(e.to_string())) {
         return response(false, Some(format!("Ошибка распаковки: {}", e)));
     }
 
@@ -721,7 +719,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             tokio::time::sleep(header_delay).await;
             if socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcd")
@@ -744,7 +742,7 @@ mod tests {
     async fn download_accepts_response_headers_after_five_seconds() {
         let (url, server) = download_server(Duration::from_secs(6), Duration::ZERO).await;
         let result = download(&url, &[], &download_test_path()).await.unwrap();
-        assert!(matches!(result, DownloadResult::RAM(ref bytes) if bytes == b"abcdefgh"));
+        assert!(matches!(result, DownloadResult::Ram(ref bytes) if bytes == b"abcdefgh"));
         server.await.unwrap();
     }
 
@@ -752,7 +750,7 @@ mod tests {
     async fn download_accepts_body_pauses_longer_than_five_seconds() {
         let (url, server) = download_server(Duration::ZERO, Duration::from_secs(6)).await;
         let result = download(&url, &[], &download_test_path()).await.unwrap();
-        assert!(matches!(result, DownloadResult::RAM(ref bytes) if bytes == b"abcdefgh"));
+        assert!(matches!(result, DownloadResult::Ram(ref bytes) if bytes == b"abcdefgh"));
         server.await.unwrap();
     }
 
@@ -770,7 +768,7 @@ mod tests {
         let result = download_with_client(&client, &url, &[proxy_base], &download_test_path())
             .await
             .unwrap();
-        assert!(matches!(result, DownloadResult::RAM(ref bytes) if bytes == b"abcdefgh"));
+        assert!(matches!(result, DownloadResult::Ram(ref bytes) if bytes == b"abcdefgh"));
         proxy.await.unwrap();
         stalled.abort();
         let _ = stalled.await;
@@ -801,9 +799,11 @@ mod tests {
         assert_eq!(select_latest_release(vec![], "self", Some("0.0.1-fork.5")), None);
         let draft = serde_json::from_str(r#"[{"tag_name":"v9.0.0", "draft":true}]"#).unwrap();
         assert_eq!(select_latest_release(draft, "self", None), None);
-        let mut settings = UpdaterSettings::default();
-        settings.xray_repo = "https://github.com/zxc-rv/XKeen-UI".into();
-        settings.mihomo_repo = "https://github.com/zxc-rv/XKeen-UI".into();
+        let settings = UpdaterSettings {
+            xray_repo: "https://github.com/zxc-rv/XKeen-UI".into(),
+            mihomo_repo: "https://github.com/zxc-rv/XKeen-UI".into(),
+            ..UpdaterSettings::default()
+        };
         assert_eq!(
             get_repo(&settings, "self").unwrap(),
             crate::release_source::UI_RELEASE_SOURCE.repository
