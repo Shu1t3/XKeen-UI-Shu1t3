@@ -326,6 +326,10 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
 
   const configsRef = useRef(configs)
   const activeIndexRef = useRef(activeConfigIndex)
+  const activeConfig = configs[activeConfigIndex]
+  const currentActiveFile = activeConfig?.file ?? activeConfigFile
+  const activeConfigFileRef = useRef(currentActiveFile)
+  activeConfigFileRef.current = currentActiveFile
   const viewStatesRef = useRef<Record<string, any>>({})
 
   useEffect(() => {
@@ -396,7 +400,6 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     [activeClashApiPort, clashApiSecret, activeClashApiUnix, mode]
   )
 
-  const activeConfig = configs[activeConfigIndex]
   const fileLanguage = activeConfig ? getFileLanguage(activeConfig.file) : null
   const isJsonOrYaml = fileLanguage === 'json' || fileLanguage === 'yaml'
   const canSave = !!(activeConfig?.isDirty && validationState?.isValid)
@@ -437,9 +440,16 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   const savedContentKey = activeConfig?.savedContent
   useEffect(() => {
     const config = configsRef.current[activeConfigIndex]
-    if (editorRef.current && config) {
-      loadConfigIntoEditor(config)
+    if (!editorRef.current || !config) return
+
+    if (editorRef.current.getValue() === config.content) {
+      editorRef.current.setSavedContent(config.savedContent)
+      return
     }
+
+    if (config.isDirty) return
+
+    loadConfigIntoEditor(config)
   }, [activeConfigIndex, savedContentKey, loadConfigIntoEditor, editorRef])
 
   const handleEditorReady = useCallback(() => {
@@ -455,7 +465,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       const current = configsRef.current[index]
       if (!current) return
       if (current.content === content && current.isDirty === isDirty) return
-      dispatch({ type: 'UPDATE_CONFIG_DIRTY', index, isDirty, content })
+      dispatch({ type: 'UPDATE_CONFIG_DIRTY', index, isDirty, content, file: current.file })
     },
     [dispatch]
   )
@@ -508,6 +518,9 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   }, [configActionsRef, switchTab])
 
   async function executeSave(targets: readonly RouterTarget[], cfg: Config, content: string) {
+    const currentCfg = configsRef.current.find((c) => c.file === cfg.file) ?? cfg
+    const saveRevision = currentCfg.revision ?? 0
+
     const results = await runMassTask(targets, async (_id, baseUrl) => {
       const result = await apiCall<{ success: boolean; error?: string }>(
         'PUT',
@@ -518,11 +531,26 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       if (!result.success) throw new Error(result.error || 'ошибка сохранения')
     })
 
-    const localOk = results.find((r) => r.id === LOCAL_ROUTER_ID)?.ok
-    if (targets.some((target) => target.id === LOCAL_ROUTER_ID) ? localOk : results.some((r) => r.ok)) {
-      editorRef.current?.setSavedContent(content)
-      dispatch({ type: 'SAVE_CONFIG', index: activeIndexRef.current, content })
-      saveViewState(cfg.file, false)
+    const localTarget = targets.find((t) => t.id === LOCAL_ROUTER_ID)
+    const localResult = results.find((r) => r.id === LOCAL_ROUTER_ID)
+    const localCommitted = Boolean(localTarget && localResult?.ok)
+
+    if (localCommitted) {
+      dispatch({ type: 'SAVE_CONFIG', file: cfg.file, content, savedRevision: saveRevision })
+      if (activeConfigFileRef.current === cfg.file) {
+        editorRef.current?.setSavedContent(content)
+        const isStillDirty = editorRef.current ? editorRef.current.getValue() !== content : false
+        saveViewState(cfg.file, isStillDirty)
+      } else {
+        const inMemory = viewStatesRef.current[cfg.file]
+        if (inMemory?.folds) {
+          try {
+            localStorage.setItem(`editor-folds:${cfg.file}`, JSON.stringify(inMemory.folds))
+          } catch {
+            /* */
+          }
+        }
+      }
     }
 
     const summary = summarizeFanOut(results)
@@ -640,16 +668,34 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   }
 
   async function executeApply(targets: readonly RouterTarget[], cfg: Config, content: string) {
+    const currentCfg = configsRef.current.find((c) => c.file === cfg.file) ?? cfg
+    const saveRevision = currentCfg.revision ?? 0
+
     dispatch({ type: 'SET_SERVICE_STATUS', status: 'pending', pendingText: 'Применение...' })
     const results = await runMassTask(targets, async (_id, baseUrl) => {
       await applyToHost(baseUrl, cfg, content)
     })
 
-    const localOk = results.find((r) => r.id === LOCAL_ROUTER_ID)?.ok
-    if (targets.some((target) => target.id === LOCAL_ROUTER_ID) ? localOk : results.some((r) => r.ok)) {
-      editorRef.current?.setSavedContent(content)
-      dispatch({ type: 'SAVE_CONFIG', index: activeIndexRef.current, content })
-      saveViewState(cfg.file, false)
+    const localTarget = targets.find((t) => t.id === LOCAL_ROUTER_ID)
+    const localResult = results.find((r) => r.id === LOCAL_ROUTER_ID)
+    const localCommitted = Boolean(localTarget && localResult?.ok)
+
+    if (localCommitted) {
+      dispatch({ type: 'SAVE_CONFIG', file: cfg.file, content, savedRevision: saveRevision })
+      if (activeConfigFileRef.current === cfg.file) {
+        editorRef.current?.setSavedContent(content)
+        const isStillDirty = editorRef.current ? editorRef.current.getValue() !== content : false
+        saveViewState(cfg.file, isStillDirty)
+      } else {
+        const inMemory = viewStatesRef.current[cfg.file]
+        if (inMemory?.folds) {
+          try {
+            localStorage.setItem(`editor-folds:${cfg.file}`, JSON.stringify(inMemory.folds))
+          } catch {
+            /* */
+          }
+        }
+      }
     }
 
     const summary = summarizeFanOut(results)
@@ -668,12 +714,12 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       )
     }
 
-    if (targets.some((target) => target.id === LOCAL_ROUTER_ID)) {
+    if (localTarget) {
       dispatch({
         type: 'SET_SERVICE_STATUS',
-        status: localOk === false ? 'stopped' : isRunning || localOk ? 'running' : 'stopped',
+        status: localResult?.ok === false ? 'stopped' : isRunning || localResult?.ok ? 'running' : 'stopped',
       })
-      if (localOk !== false) syncClashApiPort(200)
+      if (localResult?.ok) syncClashApiPort(200)
     } else {
       dispatch({ type: 'SET_SERVICE_STATUS', status: isRunning ? 'running' : 'stopped' })
     }

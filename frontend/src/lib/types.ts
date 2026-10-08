@@ -10,6 +10,8 @@ export interface Config {
   content: string
   savedContent: string
   isDirty: boolean
+  revision?: number
+  savedRevision?: number
 }
 
 export type ProxySortOrder = 'default' | 'name' | 'ping'
@@ -137,8 +139,8 @@ export type AppAction =
   }
   | { type: 'SET_CONFIGS_LOADING'; loading: boolean }
   | { type: 'SET_CONFIGS'; configs: Config[] }
-  | { type: 'UPDATE_CONFIG_DIRTY'; index: number; isDirty: boolean; content?: string }
-  | { type: 'SAVE_CONFIG'; index: number; content: string }
+  | { type: 'UPDATE_CONFIG_DIRTY'; index: number; isDirty: boolean; content?: string; file?: string }
+  | { type: 'SAVE_CONFIG'; content: string; file?: string; index?: number; savedRevision?: number }
   | { type: 'SET_SETTINGS'; settings: Partial<AppSettings> }
   | { type: 'SET_VERSION'; version: string; isOutdatedUI: boolean; isOutdatedCore: boolean }
   | { type: 'SET_DASHBOARD_PORT'; port: string | null; secret?: string | null; unix?: string | null }

@@ -92,26 +92,81 @@ const useStore = create<StoreState>((set) => ({
         case 'SET_CONFIGS_LOADING':
           return { isConfigsLoading: action.loading }
         case 'SET_CONFIGS':
-          return { configs: action.configs, isConfigsLoading: false }
+          return {
+            configs: action.configs.map((c) => ({
+              ...c,
+              revision: c.revision ?? 0,
+              savedRevision: c.savedRevision ?? 0,
+            })),
+            isConfigsLoading: false,
+          }
         case 'UPDATE_CONFIG_DIRTY': {
-          const prevConfig = state.configs[action.index]
+          const index =
+            action.file !== undefined
+              ? state.configs.findIndex((c) => c.file === action.file)
+              : action.index
+          const prevConfig = state.configs[index]
           if (!prevConfig) return {}
           const nextContent = action.content !== undefined ? action.content : prevConfig.content
           if (prevConfig.isDirty === action.isDirty && prevConfig.content === nextContent) return {}
+          const contentChanged = action.content !== undefined && action.content !== prevConfig.content
+          const nextRevision = contentChanged ? (prevConfig.revision ?? 0) + 1 : (prevConfig.revision ?? 0)
           const configs = [...state.configs]
-          configs[action.index] = {
+          configs[index] = {
             ...prevConfig,
             isDirty: action.isDirty,
             ...(action.content !== undefined && { content: action.content }),
+            revision: nextRevision,
           }
           return { configs }
         }
         case 'SAVE_CONFIG': {
-          const prevConfig = state.configs[action.index]
-          if (!prevConfig || (prevConfig.content === action.content && prevConfig.savedContent === action.content && !prevConfig.isDirty))
+          const index =
+            action.file !== undefined
+              ? state.configs.findIndex((c) => c.file === action.file)
+              : action.index !== undefined
+                ? action.index
+                : -1
+          if (index < 0 || index >= state.configs.length) return {}
+          const prevConfig = state.configs[index]
+          if (!prevConfig) return {}
+
+          if (
+            action.savedRevision !== undefined &&
+            prevConfig.savedRevision !== undefined &&
+            action.savedRevision < prevConfig.savedRevision
+          ) {
             return {}
+          }
+
+          const savedContent = action.content
+          const currentRevision = prevConfig.revision ?? 0
+          const savedRevision =
+            action.savedRevision !== undefined
+              ? Math.max(action.savedRevision, prevConfig.savedRevision ?? 0)
+              : (prevConfig.savedRevision ?? currentRevision)
+
+          const hasNewerEdits = prevConfig.content !== savedContent
+          const nextContent = hasNewerEdits ? prevConfig.content : savedContent
+          const nextIsDirty = hasNewerEdits
+
+          if (
+            prevConfig.savedContent === savedContent &&
+            prevConfig.content === nextContent &&
+            prevConfig.isDirty === nextIsDirty &&
+            prevConfig.savedRevision === savedRevision
+          ) {
+            return {}
+          }
+
           const configs = [...state.configs]
-          configs[action.index] = { ...prevConfig, content: action.content, savedContent: action.content, isDirty: false }
+          configs[index] = {
+            ...prevConfig,
+            content: nextContent,
+            savedContent,
+            isDirty: nextIsDirty,
+            savedRevision,
+          }
           return { configs }
         }
         case 'SET_SETTINGS':

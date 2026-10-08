@@ -364,7 +364,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
       const content = await res.text()
       if (editorRef.current) {
         editorRef.current.setValue(content)
-        dispatch({ type: 'UPDATE_CONFIG_DIRTY', index: activeIndex, isDirty: true, content })
+        dispatch({ type: 'UPDATE_CONFIG_DIRTY', index: activeIndex, isDirty: true, content, file: active?.file })
       }
       showToast('Шаблон импортирован')
     },

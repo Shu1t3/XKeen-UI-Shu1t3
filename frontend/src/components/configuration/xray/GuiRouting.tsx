@@ -184,6 +184,7 @@ export function GuiRouting({ editorRef, configs, activeConfigIndex }: Props) {
             })
             dispatch({
               type: 'SAVE_CONFIG',
+              file: activeConfig.file,
               index: activeIndex,
               content,
             })
