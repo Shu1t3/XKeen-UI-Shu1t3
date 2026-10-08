@@ -104,13 +104,16 @@ resolve_meta() {
     fi
   else
     version="$REF_NAME"
-    if [[ "$version" =~ - ]]; then
-      prerelease="true"
-      make_latest="false"
-    else
-      prerelease="false"
-      make_latest="true"
-    fi
+    case "$version" in
+      *-*)
+        prerelease="true"
+        make_latest="false"
+        ;;
+      *)
+        prerelease="false"
+        make_latest="true"
+        ;;
+    esac
   fi
   printf '%s:%s:%s' "$version" "$prerelease" "$make_latest"
 }
@@ -122,7 +125,7 @@ test "$(resolve_meta push '' '' v1.2.3-rc.1)" = "v1.2.3-rc.1:true:false"
 
 validate_release_notes() {
   local RELEASE_VERSION=$1 NOTES_DIR=$2
-  [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+  printf '%s\n' "$RELEASE_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || return 1
   local notes="$NOTES_DIR/$RELEASE_VERSION.md"
   test -s "$notes" || return 1
   grep -q '^## Исправления$' "$notes" || return 1
