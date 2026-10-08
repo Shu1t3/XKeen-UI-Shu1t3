@@ -74,3 +74,72 @@ sed '/^clear$/,$d' setup.sh > "$CHECK_ROOT/setup-functions"
 sh -c 'source_file=$1; set -- --local; . "$source_file"; test "$LOCAL" = true' sh "$CHECK_ROOT/setup-functions"
 sh -c 'source_file=$1; set -- latest; . "$source_file"; test "$LOCAL" = false; replace_xkeenui() { test "$LOCAL" = false; }; finish_setup() { :; }; install_xkeenui' sh "$CHECK_ROOT/setup-functions"
 printf 'PASS explicit local trust and remote default\n'
+
+# Unified release workflow validation (R32)
+test ! -f .github/workflows/build-go.yml
+python3 -c '
+import yaml
+with open(".github/workflows/build-rust.yml") as f:
+    cfg = yaml.safe_load(f)
+on = cfg[True] if True in cfg else cfg["on"]
+assert "v*" in on["push"]["tags"], "push tags missing v*"
+inputs = on["workflow_dispatch"]["inputs"]
+assert inputs["channel"]["type"] == "choice", "channel choice missing"
+assert inputs["channel"]["options"] == ["beta", "stable"], "channel options invalid"
+assert inputs["channel"]["default"] == "beta", "channel default must be beta"
+assert inputs["publish"]["type"] == "boolean", "publish boolean missing"
+assert inputs["version"]["required"] is True, "version must be required"
+'
+resolve_meta() {
+  local EVENT_NAME=$1 INPUT_VERSION=$2 INPUT_CHANNEL=$3 REF_NAME=$4
+  local version prerelease make_latest
+  if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+    version="$INPUT_VERSION"
+    if [ "$INPUT_CHANNEL" = "stable" ]; then
+      prerelease="false"
+      make_latest="true"
+    else
+      prerelease="true"
+      make_latest="false"
+    fi
+  else
+    version="$REF_NAME"
+    if [[ "$version" =~ - ]]; then
+      prerelease="true"
+      make_latest="false"
+    else
+      prerelease="false"
+      make_latest="true"
+    fi
+  fi
+  printf '%s:%s:%s' "$version" "$prerelease" "$make_latest"
+}
+test "$(resolve_meta workflow_dispatch v1.0.0 stable '')" = "v1.0.0:false:true"
+test "$(resolve_meta workflow_dispatch v0.0.1-fork.10 beta '')" = "v0.0.1-fork.10:true:false"
+test "$(resolve_meta push '' '' v0.0.1-fork.10)" = "v0.0.1-fork.10:true:false"
+test "$(resolve_meta push '' '' v1.0.0)" = "v1.0.0:false:true"
+test "$(resolve_meta push '' '' v1.2.3-rc.1)" = "v1.2.3-rc.1:true:false"
+
+validate_release_notes() {
+  local RELEASE_VERSION=$1 NOTES_DIR=$2
+  [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+  local notes="$NOTES_DIR/$RELEASE_VERSION.md"
+  test -s "$notes" || return 1
+  grep -q '^## Исправления$' "$notes" || return 1
+  grep -q '^- ' "$notes" || return 1
+}
+NOTES_TMP="$CHECK_ROOT/notes"
+mkdir -p "$NOTES_TMP"
+printf '## Исправления\n- Fix something\n' > "$NOTES_TMP/v1.0.0.md"
+validate_release_notes "v1.0.0" "$NOTES_TMP"
+validate_release_notes "v0.0.1-fork.9" "docs/releases"
+validate_release_notes "v0.0.1-fork.10" "docs/releases"
+if validate_release_notes "invalid" "$NOTES_TMP"; then exit 1; fi
+if validate_release_notes "v1.0" "$NOTES_TMP"; then exit 1; fi
+if validate_release_notes "v1.0.0-missing" "$NOTES_TMP"; then exit 1; fi
+printf 'Invalid notes' > "$NOTES_TMP/v2.0.0.md"
+if validate_release_notes "v2.0.0" "$NOTES_TMP"; then exit 1; fi
+printf '## Исправления\n' > "$NOTES_TMP/v3.0.0.md"
+if validate_release_notes "v3.0.0" "$NOTES_TMP"; then exit 1; fi
+printf 'PASS unified release pipeline and release metadata resolution\n'
+

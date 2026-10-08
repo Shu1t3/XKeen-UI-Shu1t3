@@ -2,6 +2,7 @@ name: Build Rust binaries
 on:
   push:
     branches: [main]
+    tags: ['v*']
     paths: ['backend/**', 'frontend/**', 'scripts/**', 'rust-toolchain.toml', '.github/workflows/build-rust.yml', '.github/scripts/**']
   pull_request:
     paths: ['backend/**', 'frontend/**', 'scripts/**', 'rust-toolchain.toml', '.github/workflows/build-rust.yml', '.github/scripts/**']
@@ -11,8 +12,16 @@ on:
         description: "Release version (e.g. v1.0.0)"
         required: true
         type: string
+      channel:
+        description: "Release channel (beta or stable)"
+        required: true
+        type: choice
+        options:
+          - beta
+          - stable
+        default: beta
       publish:
-        description: "Publish prerelease after all checks and builds"
+        description: "Publish release after all checks and builds"
         type: boolean
         default: true
 permissions:
@@ -21,16 +30,16 @@ env:
   RUST_STABLE: '1.99.0'
   RUST_NIGHTLY: 'nightly-2026-10-06'
   CROSS_REV: '74e99b2223de06166f8cdcc1af7f1308ec52baf4'
-  XKEEN_UI_VERSION: ${{ inputs.version || 'v0.0.0' }}
+  XKEEN_UI_VERSION: ${{ inputs.version || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'v0.0.0' }}
 jobs:
   frontend:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Require release notes
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        if: (github.event_name == 'workflow_dispatch' && inputs.publish) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         env:
-          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "Invalid release version"; exit 1; }
           notes="docs/releases/$RELEASE_VERSION.md"
@@ -139,7 +148,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: (github.event_name == 'workflow_dispatch' && inputs.publish) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
     needs: build
     permissions:
@@ -148,22 +157,53 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      - name: Determine release metadata
+        id: meta
+        env:
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            if [ "$INPUT_CHANNEL" = "stable" ]; then
+              prerelease="false"
+              make_latest="true"
+            else
+              prerelease="true"
+              make_latest="false"
+            fi
+          else
+            version="$REF_NAME"
+            if [[ "$version" =~ - ]]; then
+              prerelease="true"
+              make_latest="false"
+            else
+              prerelease="false"
+              make_latest="true"
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "make_latest=$make_latest" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: xkeen-ui-*
           path: artifacts
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: ${{ inputs.version }}
+          tag_name: ${{ steps.meta.outputs.version }}
           target_commitish: ${{ github.sha }}
-          body_path: docs/releases/${{ inputs.version }}.md
+          body_path: docs/releases/${{ steps.meta.outputs.version }}.md
           fail_on_unmatched_files: true
-          prerelease: true
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.meta.outputs.make_latest }}
           files: artifacts/xkeen-ui-*/*
       - name: Verify published GitHub digests
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.version }}
+          RELEASE_TAG: ${{ steps.meta.outputs.version }}
           HTTPS_PROXY: ''
           HTTP_PROXY: ''
           ALL_PROXY: ''
