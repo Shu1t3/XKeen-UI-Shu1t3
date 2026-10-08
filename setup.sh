@@ -14,12 +14,25 @@ ERROR="\n${RED} ❌${RED_BOLD}"
 SUCCESS="\n${GREEN} ✅${GREEN_BOLD}"
 INFO="\n${CYAN} ℹ️ "
 
-XKEENUI_BIN="/opt/sbin/xkeen-ui"
-XKEENUI_INIT="/opt/etc/init.d/S99xkeen-ui"
-STATIC_DIR="/opt/share/www/XKeen-UI"
-LIGHTTPD_INIT="/opt/etc/init.d/S80lighttpd"
-LIGHTTPD_DIR="/opt/etc/lighttpd"
-LIGHTTPD_CONF="$LIGHTTPD_DIR/conf.d/90-xkeenui.conf"
+XKEENUI_BIN="${XKEENUI_BIN:-/opt/sbin/xkeen-ui}"
+XKEENUI_INIT="${XKEENUI_INIT:-/opt/etc/init.d/S99xkeen-ui}"
+STATIC_DIR="${STATIC_DIR:-/opt/share/www/XKeen-UI}"
+LIGHTTPD_INIT="${LIGHTTPD_INIT:-/opt/etc/init.d/S80lighttpd}"
+LIGHTTPD_DIR="${LIGHTTPD_DIR:-/opt/etc/lighttpd}"
+LIGHTTPD_CONF="${LIGHTTPD_CONF:-$LIGHTTPD_DIR/conf.d/90-xkeenui.conf}"
+
+prompt_user() {
+  local prompt=$1
+  if [ -n "${FORCE_RESPONSE:-}" ]; then
+    response="$FORCE_RESPONSE"
+    return 0
+  fi
+  if [ -r /dev/tty ]; then
+    read -p "$prompt" response < /dev/tty 2>/dev/null || response=''
+  else
+    read -p "$prompt" response 2>/dev/null || response=''
+  fi
+}
 
 # Standalone mirror of backend/release-source.json; checked by backend tests.
 UI_REPOSITORY='Shu1t3/XKeen-UI-Shu1t3'
@@ -222,19 +235,21 @@ replace_xkeenui() (
 )
 
 install_xkeenui() {
+  legacy_installation_check || return 1
   replace_xkeenui || return 1
   finish_setup "установлен"
 }
 
 update_xkeenui() {
   [ -f "$XKEENUI_BIN" ] || { printf "${ERROR} Ошибка: XKeen UI не установлен!${NCN}"; return 1; }
+  legacy_installation_check || return 1
   replace_xkeenui || return 1
   finish_setup "обновлен"
 }
 
 uninstall_xkeenui() {
   printf "\n Данное действие ${RED_BOLD}удалит${NC} XKeen UI, его файлы и зависимости.\n\n"
-  read -p " Продолжить? [y/N]: " response < /dev/tty
+  prompt_user " Продолжить? [y/N]: "
   response=$(printf '%s' "$response" | tr -cd 'YyNn')
   case "$response" in
     [Yy]) printf "${INFO} Начинаем удаление...${NCN}";;
@@ -242,23 +257,29 @@ uninstall_xkeenui() {
   esac
 
   (
-    if [[ -f "$LIGHTTPD_INIT" && -f "$LIGHTTPD_CONF" ]]; then
-      if $LIGHTTPD_INIT status &>/dev/null; then
-          $LIGHTTPD_INIT stop &>/dev/null || :
-          opkg remove --autoremove --force-removal-of-dependent-packages lighttpd &>/dev/null
-          rm -rf $LIGHTTPD_DIR
+    if [ -f "$LIGHTTPD_CONF" ]; then
+      local lighttpd_was_running=false
+      if [ -f "$LIGHTTPD_INIT" ] && "$LIGHTTPD_INIT" status >/dev/null 2>&1; then
+        lighttpd_was_running=true
+      fi
+      rm -f "$LIGHTTPD_CONF"
+      if [ "$lighttpd_was_running" = true ]; then
+        "$LIGHTTPD_INIT" restart >/dev/null 2>&1 || {
+          "$LIGHTTPD_INIT" stop >/dev/null 2>&1 || :
+          "$LIGHTTPD_INIT" start >/dev/null 2>&1 || :
+        }
       fi
     fi
-    if [ -f $XKEENUI_INIT ]; then
-      if $XKEENUI_INIT status &>/dev/null; then
-        $XKEENUI_INIT stop &>/dev/null || :
-        killall -q -9 xkeen-ui || :
+    if [ -f "$XKEENUI_INIT" ]; then
+      if "$XKEENUI_INIT" status >/dev/null 2>&1; then
+        "$XKEENUI_INIT" stop >/dev/null 2>&1 || :
+        killall -q -9 xkeen-ui >/dev/null 2>&1 || :
       fi
     fi
   ) &
   spinner $! "Остановка XKeen UI..."
 
-  (rm -rf $STATIC_DIR; rm -f $XKEENUI_BIN $XKEENUI_INIT) &
+  (rm -rf "$STATIC_DIR"; rm -f "$XKEENUI_BIN" "$XKEENUI_INIT") &
   spinner $! "Удаление файлов XKeen UI..."
   printf "${SUCCESS} Удаление XKeen-UI завершено${NCN}"
 }
@@ -272,17 +293,56 @@ finish_setup() {
 }
 
 legacy_installation_check() {
-  if [ -f "$LIGHTTPD_CONF" ]; then
-    $LIGHTTPD_INIT status &>/dev/null && $LIGHTTPD_INIT stop
-    rm -f "$LIGHTTPD_CONF"
-    printf "${YELLOW}\n Веб-сервер lighttpd для работы XKeen UI более не используется.\n${NC}"
-    read -p " Удалить его? [Y/n]: " response < /dev/tty
-    response=$(printf '%s' "$response" | tr -cd 'YyNn')
-    case "$response" in
-      [Nn]) return;;
-      *) opkg remove --autoremove --force-removal-of-dependent-packages lighttpd; rm -rf $LIGHTTPD_DIR;;
-    esac
+  [ -f "$LIGHTTPD_CONF" ] || return 0
+  local was_running=false
+  if [ -f "$LIGHTTPD_INIT" ] && "$LIGHTTPD_INIT" status >/dev/null 2>&1; then
+    was_running=true
   fi
+
+  rm -f "$LIGHTTPD_CONF"
+
+  printf "${YELLOW}\n Веб-сервер lighttpd для работы XKeen UI более не используется.\n${NC}"
+  prompt_user " Удалить его? [y/N]: "
+  response=$(printf '%s' "$response" | tr -cd 'YyNn')
+  case "$response" in
+    [Yy])
+      local has_other_confs=false
+      if [ -d "$LIGHTTPD_DIR/conf.d" ]; then
+        for conf in "$LIGHTTPD_DIR/conf.d"/*.conf; do
+          if [ -f "$conf" ] && [ "$conf" != "$LIGHTTPD_CONF" ]; then
+            has_other_confs=true
+            break
+          fi
+        done
+      fi
+      if [ "$has_other_confs" = true ]; then
+        printf "${INFO} Обнаружены сторонние конфигурации в %s; пакет lighttpd сохранён.\n" "$LIGHTTPD_DIR/conf.d"
+        if [ "$was_running" = true ]; then
+          "$LIGHTTPD_INIT" restart >/dev/null 2>&1 || :
+        fi
+      else
+        if [ "$was_running" = true ]; then
+          "$LIGHTTPD_INIT" stop >/dev/null 2>&1 || :
+        fi
+        if opkg remove lighttpd >/dev/null 2>&1; then
+          printf "${SUCCESS} Пакет lighttpd удалён.\n"
+        else
+          printf "${INFO} Пакет lighttpd не удалён (возможно, используется другими пакетами).\n"
+          if [ "$was_running" = true ]; then
+            "$LIGHTTPD_INIT" start >/dev/null 2>&1 || :
+          fi
+        fi
+      fi
+      ;;
+    *)
+      if [ "$was_running" = true ]; then
+        "$LIGHTTPD_INIT" restart >/dev/null 2>&1 || {
+          "$LIGHTTPD_INIT" stop >/dev/null 2>&1 || :
+          "$LIGHTTPD_INIT" start >/dev/null 2>&1 || :
+        }
+      fi
+      ;;
+  esac
 }
 
 create_xkeenui_init() {
@@ -309,7 +369,7 @@ get_status() {
 
   version=${version:-"N/A"}
 
-  pidof xkeen-ui &>/dev/null && status="${GREEN_BOLD}запущена"
+  pidof xkeen-ui >/dev/null 2>&1 && status="${GREEN_BOLD}запущена"
   printf "Статус панели: $status ${NC}[$version]"
 }
 
@@ -332,7 +392,7 @@ printf "  2. Обновить\n"
 printf "  3. Удалить\n"
 printf "\n  0. Выйти\n\n"
 
-read -p "${GREEN_BOLD}>: ${NC}" response < /dev/tty
+prompt_user "${GREEN_BOLD}>: ${NC}"
 
 case $response in
   1) install_xkeenui;;

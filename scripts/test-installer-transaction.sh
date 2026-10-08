@@ -172,3 +172,160 @@ for FAULT in start none; do
   printf 'PASS first install %s\n' "$FAULT"
 done
 printf 'Installer transaction tests passed\n'
+
+# Shared service (lighttpd) safety tests (R35)
+eval "$(sed -n '/^uninstall_xkeenui() {$/,/^}/p' "$ROOT/functions")"
+LIGHT_CASE=$ROOT/case-lighttpd; mkdir -p "$LIGHT_CASE"
+LIGHTTPD_DIR=$LIGHT_CASE/lighttpd
+LIGHTTPD_CONF=$LIGHTTPD_DIR/conf.d/90-xkeenui.conf
+LIGHTTPD_INIT=$LIGHT_CASE/init-lighttpd
+XKEENUI_BIN=$LIGHT_CASE/xkeen-ui
+XKEENUI_INIT=$LIGHT_CASE/init-xkeenui
+STATIC_DIR=$LIGHT_CASE/www
+export LIGHTTPD_DIR LIGHTTPD_CONF LIGHTTPD_INIT XKEENUI_BIN XKEENUI_INIT STATIC_DIR
+spinner() { wait "$1" 2>/dev/null || :; }
+
+cat > "$LIGHTTPD_INIT" <<INIT
+#!/bin/sh
+case "\$1" in
+  status) test -f "$LIGHT_CASE/running" ;;
+  start) touch "$LIGHT_CASE/running" "$LIGHT_CASE/started" ;;
+  stop) rm -f "$LIGHT_CASE/running"; touch "$LIGHT_CASE/stopped" ;;
+  restart) touch "$LIGHT_CASE/running" "$LIGHT_CASE/restarted" ;;
+esac
+INIT
+chmod 755 "$LIGHTTPD_INIT"
+
+reset_light_test() {
+  rm -rf "$LIGHTTPD_DIR" "$STATIC_DIR" "$LIGHT_CASE"/*-called "$LIGHT_CASE"/started "$LIGHT_CASE"/stopped "$LIGHT_CASE"/restarted
+  mkdir -p "$LIGHTTPD_DIR/conf.d" "$STATIC_DIR"
+  printf 'server.port := 1000\n' > "$LIGHTTPD_CONF"
+  printf 'server.modules += ( "mod_status" )\n' > "$LIGHTTPD_DIR/conf.d/10-other.conf"
+  printf 'server.document-root = "/var/www"\n' > "$LIGHTTPD_DIR/lighttpd.conf"
+  printf 'xkeen-binary' > "$XKEENUI_BIN"; chmod 755 "$XKEENUI_BIN"
+  printf '#!/bin/sh\nexit 0\n' > "$XKEENUI_INIT"; chmod 755 "$XKEENUI_INIT"
+  printf '<html></html>' > "$STATIC_DIR/index.html"
+}
+
+# 1. uninstall_xkeenui with running lighttpd preserves other configs and restarts server
+reset_light_test
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='y'
+opkg() { touch "$LIGHT_CASE/opkg-called"; return 1; }
+uninstall_xkeenui
+test ! -f "$LIGHTTPD_CONF"
+test -f "$LIGHTTPD_DIR/conf.d/10-other.conf"
+test -f "$LIGHTTPD_DIR/lighttpd.conf"
+test -d "$LIGHTTPD_DIR"
+test -f "$LIGHT_CASE/running"
+test -f "$LIGHT_CASE/restarted"
+test ! -f "$LIGHT_CASE/opkg-called"
+test ! -f "$XKEENUI_BIN"
+test ! -f "$XKEENUI_INIT"
+test ! -d "$STATIC_DIR"
+printf 'PASS uninstall preserves shared lighttpd and other configs\n'
+
+# 2. uninstall_xkeenui with stopped lighttpd preserves stopped state
+reset_light_test
+rm -f "$LIGHT_CASE/running"
+FORCE_RESPONSE='y'
+uninstall_xkeenui
+test ! -f "$LIGHTTPD_CONF"
+test -f "$LIGHTTPD_DIR/conf.d/10-other.conf"
+test ! -f "$LIGHT_CASE/running"
+test ! -f "$LIGHT_CASE/started"
+test ! -f "$LIGHT_CASE/opkg-called"
+printf 'PASS uninstall preserves stopped lighttpd state\n'
+
+# 3. legacy_installation_check with running lighttpd, response 'n'
+reset_light_test
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='n'
+legacy_installation_check
+test ! -f "$LIGHTTPD_CONF"
+test -f "$LIGHTTPD_DIR/conf.d/10-other.conf"
+test -f "$LIGHTTPD_DIR/lighttpd.conf"
+test -d "$LIGHTTPD_DIR"
+test -f "$LIGHT_CASE/running"
+test -f "$LIGHT_CASE/restarted"
+test ! -f "$LIGHT_CASE/opkg-called"
+printf 'PASS legacy migration with answer N restarts lighttpd without opkg\n'
+
+# 4. legacy_installation_check with stopped lighttpd, response 'n'
+reset_light_test
+rm -f "$LIGHT_CASE/running"
+FORCE_RESPONSE='n'
+legacy_installation_check
+test ! -f "$LIGHTTPD_CONF"
+test ! -f "$LIGHT_CASE/running"
+test ! -f "$LIGHT_CASE/started"
+test ! -f "$LIGHT_CASE/opkg-called"
+printf 'PASS legacy migration with answer N keeps stopped lighttpd\n'
+
+# 5. legacy_installation_check with response 'y', but other configs exist
+reset_light_test
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='y'
+legacy_installation_check
+test ! -f "$LIGHTTPD_CONF"
+test -f "$LIGHTTPD_DIR/conf.d/10-other.conf"
+test ! -f "$LIGHT_CASE/opkg-called"
+test -f "$LIGHT_CASE/running"
+printf 'PASS legacy migration protects lighttpd when other configs exist\n'
+
+# 6. legacy_installation_check with response 'y', no other configs, but opkg remove fails
+reset_light_test
+rm -f "$LIGHTTPD_DIR/conf.d/10-other.conf"
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='y'
+opkg() {
+  test "$1" = remove && test "$2" = lighttpd && test "$#" -eq 2 || return 99
+  touch "$LIGHT_CASE/opkg-safe-called"
+  return 1
+}
+legacy_installation_check
+test ! -f "$LIGHTTPD_CONF"
+test -d "$LIGHTTPD_DIR"
+test -f "$LIGHT_CASE/opkg-safe-called"
+test -f "$LIGHT_CASE/running"
+printf 'PASS legacy migration restores running lighttpd on opkg failure\n'
+
+# 7. legacy_installation_check with response 'y', no other configs, and opkg remove succeeds
+reset_light_test
+rm -f "$LIGHTTPD_DIR/conf.d/10-other.conf"
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='y'
+opkg() {
+  test "$1" = remove && test "$2" = lighttpd && test "$#" -eq 2 || return 99
+  touch "$LIGHT_CASE/opkg-safe-called"
+  rm -f "$LIGHT_CASE/running"
+  return 0
+}
+legacy_installation_check
+test ! -f "$LIGHTTPD_CONF"
+test -d "$LIGHTTPD_DIR"
+test -f "$LIGHT_CASE/opkg-safe-called"
+test ! -f "$LIGHT_CASE/running"
+printf 'PASS legacy migration safe opkg remove never wipes shared directory\n'
+
+# 8. update_xkeenui triggers legacy migration and cleans owned config
+reset_light_test
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='n'
+replace_xkeenui() { :; }
+finish_setup() { :; }
+update_xkeenui
+test ! -f "$LIGHTTPD_CONF"
+test -f "$LIGHT_CASE/running"
+test -f "$LIGHT_CASE/restarted"
+printf 'PASS update_xkeenui cleans legacy lighttpd config\n'
+
+# 9. install_xkeenui triggers legacy migration and cleans owned config
+reset_light_test
+touch "$LIGHT_CASE/running"
+FORCE_RESPONSE='n'
+install_xkeenui
+test ! -f "$LIGHTTPD_CONF"
+test -f "$LIGHT_CASE/running"
+test -f "$LIGHT_CASE/restarted"
+printf 'PASS install_xkeenui cleans legacy lighttpd config\n'
