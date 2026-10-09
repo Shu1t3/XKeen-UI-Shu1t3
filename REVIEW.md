@@ -317,10 +317,10 @@ upstream Set-Cookie/Set-Cookie2 не передаются браузеру. От
 ### R09 — HIGH — Системный DNS сохраняется до готовности Mihomo
 
 **Статус:** Confirmed. **Категория:** DNS state transition / availability.
-**Локация:** backend/src/dns.rs:213,226,280,293,307;
+**Локация:** backend/src/dns.rs:309,350,365,392,408;
 frontend/src/components/configuration/mihomo/DnsPanel.tsx:360.
 
-- **Сценарий:** setup_filter=true: удаляются DoH/DoT и name-server, задаётся br0:53,
+- **Сценарий:** setup_filter=true: удаляются DoH/DoT и name-server, задаются адреса локальных LAN-сегментов (br0, br1, ...) на порту 53,
   включается override, конфигурация роутера сохраняется. Затем YAML не записался либо frontend не смог reload Mihomo.
 - **Влияние:** устойчивое нарушение DNS, внутренних доменов и, в зависимости от канала управления, удалённого доступа.
 - **Доказательство:** RCI шаги выполнены перед записью YAML; ошибка записи только логируется,
@@ -712,7 +712,7 @@ backend/src/auth.rs:311,328,339.
 ### R23 — MEDIUM — DNS пишет первый YAML вместо фактически используемого конфига
 
 **Статус:** Confirmed. **Категория:** configuration targeting.
-**Локация:** backend/src/dns.rs:187,293.
+**Локация:** backend/src/dns.rs:286,392.
 
 - **Сценарий:** рядом с config.yaml в /opt/etc/mihomo находится provider.yaml или другой YAML.
 - **Влияние:** возможна перезапись provider-файла полной конфигурацией;
@@ -723,12 +723,12 @@ backend/src/auth.rs:311,328,339.
 ### R24 — MEDIUM — Отключение DNS уничтожает корпоративные resolver-настройки
 
 **Статус:** Confirmed. **Категория:** DNS recovery / configuration preservation.
-**Локация:** backend/src/dns.rs:241,330,338,351.
+**Локация:** backend/src/dns.rs:423,434,449,469.
 
 - **Сценарий:** включить DNS с setup_filter, затем отключить функцию.
 - **Влияние:** исходные корпоративные name-server/DoH/DoT не возвращаются;
   все name-server заменяются на 77.88.8.8, внутренние домены могут перестать разрешаться.
-- **Доказательство:** enable удаляет исходные настройки без snapshot; disable использует hardcoded public resolver.
+- **Доказательство:** enable удаляет исходные настройки без snapshot; delete_dns проверяет opkg dns-override и адреса сегментов сети роутера, однако disable по-прежнему использует hardcoded public resolver 77.88.8.8.
 - **Минимальная рекомендация:** восстановление исходного snapshot либо явно настроенный corporate fallback.
 
 ### R25 — MEDIUM — Две setup-заявки одновременно получают действующие сессии

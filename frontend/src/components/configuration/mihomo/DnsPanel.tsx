@@ -684,7 +684,7 @@ export const DnsPanel = memo(function DnsPanel() {
               />
             </div>
             <p className="text-muted-foreground text-xs">
-              Будет выполнена очистка DoU, DoT и DoH резолверов и добавлен IPv4 адрес br0 интерфейса для перенаправления запросов в Mihomo
+              Будет выполнена очистка DoU, DoT и DoH резолверов и добавлены локальные IPv4 адреса всех сегментов сети для перенаправления запросов в Mihomo
             </p>
           </div>
           <AlertDialogFooter>

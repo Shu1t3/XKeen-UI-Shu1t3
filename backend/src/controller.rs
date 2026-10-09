@@ -136,6 +136,7 @@ pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), Str
                 let running = tokio::task::spawn_blocking(move || !get_pid(&probe_core).is_empty())
                     .await.map_err(|e| e.to_string())?;
                 ensure_running(&core, running)?;
+                flush_network_state().await;
             }
             Ok(())
         },
@@ -145,6 +146,57 @@ pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), Str
             Err(format!("{path}: {e}"))
         }
     }
+}
+
+pub async fn flush_network_state() {
+    let _ = Command::new("ip")
+        .args(["route", "flush", "cache"])
+        .output()
+        .await;
+
+    let conntrack_binaries = [
+        opt_path!("/sbin/conntrack"),
+        opt_path!("/usr/sbin/conntrack"),
+        "/usr/sbin/conntrack",
+        "/sbin/conntrack",
+        "conntrack",
+    ];
+
+    for bin in conntrack_binaries {
+        if bin == "conntrack" || Path::new(bin).exists() {
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                Command::new(bin).arg("-F").output(),
+            )
+            .await;
+            if let Ok(Ok(out)) = res
+                && out.status.success()
+            {
+                break;
+            }
+        }
+    }
+}
+
+async fn stop_core_gracefully(name: &str) {
+    let pids = get_pid(name);
+    if pids.is_empty() {
+        return;
+    }
+    for &pid in &pids {
+        _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if get_pid(name).is_empty() {
+            return;
+        }
+    }
+    for &pid in &get_pid(name) {
+        _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
 fn ensure_running(core: &str, running: bool) -> Result<(), String> {
@@ -197,20 +249,20 @@ pub async fn soft_restart(core: &str) -> Result<(), String> {
 }
 
 async fn soft_restart_core(core: Core) -> Result<(), String> {
-    for pid in get_pid(core.name()) {
-        _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-    }
+    stop_core_gracefully(core.name()).await;
 
     let mut cmd = Command::new(core.executable());
     match core {
         Core::Mihomo => {
             cmd.env("CLASH_HOME_DIR", MIHOMO_CONF_DIR);
+            cmd.args(["-d", MIHOMO_CONF_DIR]);
         }
         Core::Xray => {
             cmd.envs([
                 ("XRAY_LOCATION_CONFDIR", XRAY_CONF_DIR),
                 ("XRAY_LOCATION_ASSET", XRAY_ASSET_DIR),
             ]);
+            cmd.args(["run", "-confdir", XRAY_CONF_DIR]);
         }
     }
 
@@ -237,6 +289,9 @@ async fn soft_restart_core(core: Core) -> Result<(), String> {
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
+
+    flush_network_state().await;
+
     Ok(())
 }
 
@@ -736,5 +791,15 @@ mod tests {
         assert!(get_pid(&nonexistent_1).is_empty());
     }
 
+    #[tokio::test]
+    async fn flush_network_state_runs_without_panic() {
+        flush_network_state().await;
+    }
+
+    #[tokio::test]
+    async fn stop_core_gracefully_handles_nonexistent_process() {
+        stop_core_gracefully("nonexistent_core_process_xyz").await;
+    }
 }
+
 

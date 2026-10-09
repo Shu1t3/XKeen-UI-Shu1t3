@@ -173,10 +173,14 @@ export function StatusBar({
     }
     syncClashApiPort()
     if (settings.autoDns !== 'disabled' && state.currentCore === 'mihomo') {
-      await applyAutoDns(settings.autoDns === 'with_filter')
-      const { clashApiPort, clashApiSecret, clashApiUnix } = getAppState()
-      await clashFetch(clashApiPort ?? '', 'configs', { method: 'PUT', secret: clashApiSecret, unix: clashApiUnix, body: {} })
-      bumpDnsRefresh()
+      const cached = useDnsStatusStore.getState().status
+      const alreadyConfigured = !!cached && cached.dnsOverride && cached.dnsMihomo
+      if (!alreadyConfigured) {
+        await applyAutoDns(settings.autoDns === 'with_filter')
+        const { clashApiPort, clashApiSecret, clashApiUnix } = getAppState()
+        await clashFetch(clashApiPort ?? '', 'configs', { method: 'PUT', secret: clashApiSecret, unix: clashApiUnix, body: {} })
+        bumpDnsRefresh()
+      }
     }
     dispatch({ type: 'SET_SERVICE_STATUS', status: 'running' })
     onRefreshStatus()
