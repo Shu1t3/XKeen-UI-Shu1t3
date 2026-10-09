@@ -102,15 +102,32 @@ export function StatusBar({
   }, [fetchDnsStatus, currentCore])
 
   useEffect(() => {
-    const interval = setInterval(() => {
+    const pollControl = () => {
+      if (typeof document !== 'undefined' && document.hidden) return
       if (state.serviceStatus !== 'pending') onRefreshStatus()
-    }, 3000)
-    return () => clearInterval(interval)
+    }
+    const interval = setInterval(pollControl, 3000)
+    const onVisibilityChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden && state.serviceStatus !== 'pending') {
+        onRefreshStatus()
+      }
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    }
+    return () => {
+      clearInterval(interval)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange)
+      }
+    }
   }, [state.serviceStatus, onRefreshStatus])
 
   useEffect(() => {
     let mounted = true
     const refreshSystemStats = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return
+      if (state.serviceStatus === 'pending') return
       try {
         const result = await apiCall<{ success: boolean } & SystemStats>('GET', 'system')
         if (mounted && result.success) setSystemStats(result)
@@ -119,12 +136,23 @@ export function StatusBar({
       }
     }
     refreshSystemStats()
-    const interval = setInterval(refreshSystemStats, 3000)
+    const interval = setInterval(refreshSystemStats, 8000)
+    const onVisibilityChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden && state.serviceStatus !== 'pending') {
+        refreshSystemStats()
+      }
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    }
     return () => {
       mounted = false
       clearInterval(interval)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange)
+      }
     }
-  }, [])
+  }, [state.serviceStatus])
 
   function setPending(text: string) {
     dispatch({

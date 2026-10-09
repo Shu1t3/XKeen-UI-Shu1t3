@@ -44,7 +44,7 @@ MOCK
 cat > "$ROOT/mocks/sleep" <<'MOCK'
 #!/bin/sh
 case "$1" in
- 30) exec /bin/sleep 30 ;;
+ 30|90) exec /bin/sleep 30 ;;
  *) exec /bin/sleep 0.02 ;;
 esac
 MOCK

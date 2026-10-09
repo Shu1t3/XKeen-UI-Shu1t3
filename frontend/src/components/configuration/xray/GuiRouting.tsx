@@ -3,12 +3,12 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { IconCheck, IconGripVertical, IconPencil, IconPlus, IconX } from '@tabler/icons-react'
 import { forwardRef, memo, useCallback, useEffect, useRef, useState } from 'react'
-import { apiCall } from '../../../lib/api'
-import { useAppActions, useCoreRuntimeState, useSettings } from '../../../lib/store'
+import { getAppState, useAppActions, useCoreRuntimeState, useSettings } from '../../../lib/store'
 import type { Config } from '../../../lib/types'
 import { cn } from '../../../lib/utils'
 import { parse as parseJsonc } from 'jsonc-parser'
 import type { CodeMirrorRef } from '../CodeMirror'
+import { applyXrayGuiConfig } from './guiAutoApply'
 
 const RULE_FIELDS = {
   domain: {
@@ -175,30 +175,15 @@ export function GuiRouting({ editorRef, configs, activeConfigIndex }: Props) {
 
         if (triggerSoftRestart && autoApplyRef.current && serviceStatusRef.current === 'running') {
           const activeIndex = activeConfigIndexRef.current
-          const activeConfig = configsRef.current[activeIndex]
+          const activeConfig = getAppState().configs[activeIndex] ?? configsRef.current[activeIndex]
           if (activeConfig) {
-            const content = wrapper.getValue()
-            await apiCall<any>('PUT', 'configs', {
+            await applyXrayGuiConfig({
+              wrapper,
               file: activeConfig.file,
-              content,
-            })
-            dispatch({
-              type: 'SAVE_CONFIG',
-              file: activeConfig.file,
-              index: activeIndex,
-              content,
-            })
-            dispatch({
-              type: 'SET_SERVICE_STATUS',
-              status: 'pending',
-              pendingText: 'Перезапуск...',
-            })
-            const r = await apiCall<any>('POST', 'control', {
-              action: 'softRestart',
               core: currentCoreRef.current,
+              dispatch,
+              showToast,
             })
-            showToast(r?.success ? 'Изменения применены' : `Ошибка: ${r?.error}`, r?.success ? 'success' : 'error')
-            dispatch({ type: 'SET_SERVICE_STATUS', status: 'running' })
           }
         }
       } catch (e: any) {

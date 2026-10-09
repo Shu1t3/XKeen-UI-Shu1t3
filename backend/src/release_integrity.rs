@@ -102,6 +102,11 @@ impl TrustedAsset {
         self.verify_hash(hex(&Sha256::digest(bytes)))
     }
     pub fn verify_file(&self, path: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        unsafe {
+            // Lower CPU priority (nice +15) during large file SHA-256 hashing to preserve responsiveness on weak MIPS devices.
+            _ = nix::libc::setpriority(nix::libc::PRIO_PROCESS, 0, 15);
+        }
         let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let mut hasher = Sha256::new();
         let mut buffer = [0; 64 * 1024];

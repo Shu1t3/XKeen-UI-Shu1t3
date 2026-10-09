@@ -255,7 +255,7 @@ mod tests {
             geo_cache: Arc::new(std::sync::RwLock::new(Default::default())),
             log_tx: Arc::new(log_tx), log_watcher: Arc::new(Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
-            app_config_lock: Arc::new(tokio::sync::Mutex::new(())), debug: false, rci_token: None,
+            app_config_lock: Arc::new(tokio::sync::Mutex::new(())), debug: false, rci_token: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 

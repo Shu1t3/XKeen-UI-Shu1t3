@@ -136,14 +136,14 @@ pub(crate) async fn check_candidate_commands(path: &Path, core: &str, version: &
                 Command::new(path)
                     .args(["run", "-test", "-confdir", crate::types::XRAY_CONF_DIR])
                     .env("XRAY_LOCATION_ASSET", crate::types::XRAY_ASSET_DIR),
-                Duration::from_secs(30),
+                Duration::from_secs(60),
             )
             .await?;
         }
         "mihomo" => {
             checked_output(
                 Command::new(path).args(["-t", "-d", crate::types::MIHOMO_CONF_DIR]),
-                Duration::from_secs(30),
+                Duration::from_secs(60),
             )
             .await?;
         }

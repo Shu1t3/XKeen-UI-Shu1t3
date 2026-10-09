@@ -645,6 +645,12 @@ async fn perform_update(state: AppState, req: UpdateReq) -> (HeaderMap, Json<Val
     let tmp_name = "new".to_string();
     let unpack_dir = tmp_dir.to_path_buf();
     let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        #[cfg(unix)]
+        unsafe {
+            // Lower process/thread scheduling priority during heavy CPU decompression (nice +15)
+            // to prevent CPU starvation for router routing and system services on weak single-core MIPS devices.
+            _ = nix::libc::setpriority(nix::libc::PRIO_PROCESS, 0, 15);
+        }
         let bin = unpack_dir.join(&tmp_name);
         match dl_res {
             DownloadResult::Ram(d) => unpack(Cursor::new(d), &bin, &core_name, is_zip)?,

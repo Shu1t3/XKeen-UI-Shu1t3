@@ -114,7 +114,15 @@ pub struct AppState {
     pub auth_changes: tokio::sync::watch::Sender<u64>,
     pub app_config_lock: Arc<Mutex<()>>,
     pub debug: bool,
-    pub rci_token: Option<String>,
+    pub rci_token: Arc<RwLock<Option<String>>>,
+}
+
+pub fn load_rci_token() -> Option<String> {
+    let xkeen_config_path = XKEEN_CONF;
+    std::fs::read_to_string(xkeen_config_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|json| json.get("xkeen")?.get("rci_token")?.as_str().map(String::from))
 }
 
 #[derive(Clone, Default)]

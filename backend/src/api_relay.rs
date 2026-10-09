@@ -34,7 +34,8 @@ pub async fn get_device_list(State(state): State<AppState>) -> impl IntoResponse
         .http_client
         .get("http://127.0.0.1:79/rci/show/device-list")
         .timeout(Duration::from_secs(5));
-    if let Some(ref token) = state.rci_token {
+    let token = state.rci_token.read().unwrap().clone();
+    if let Some(ref token) = token {
         req = req.header("X-Ndma-Tkn", token);
     }
     let response = match req.send().await {
@@ -456,7 +457,7 @@ mod tests {
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
             debug: false,
-            rci_token: None,
+            rci_token: Arc::new(RwLock::new(None)),
         }
     }
 

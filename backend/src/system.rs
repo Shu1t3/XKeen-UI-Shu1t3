@@ -12,7 +12,8 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Json<serde_json:
         .http_client
         .get("http://127.0.0.1:79/rci/show/system")
         .timeout(Duration::from_secs(5));
-    if let Some(token) = state.rci_token.as_ref() {
+    let token = state.rci_token.read().unwrap().clone();
+    if let Some(ref token) = token {
         request = request.header("X-Ndma-Tkn", token);
     }
 

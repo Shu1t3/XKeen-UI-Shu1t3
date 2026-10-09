@@ -1,6 +1,46 @@
+use crate::logger::log;
 use crate::types::*;
 use axum::extract::State;
 use axum::response::{IntoResponse, Json};
+
+pub fn load_settings() -> AppSettings {
+    let (content, path) = match std::fs::read_to_string(APP_CONFIG) {
+        Ok(c) => (c, APP_CONFIG),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Ok(c) = std::fs::read_to_string(APP_CONFIG_LEGACY) {
+                if let Err(e) = std::fs::create_dir_all(XKEEN_CONF_DIR) {
+                    log("WARN", format!("Не удалось создать {}: {}", XKEEN_CONF_DIR, e));
+                }
+                if std::fs::rename(APP_CONFIG_LEGACY, APP_CONFIG).is_ok() {
+                    log(
+                        "INFO",
+                        format!("Успешная миграция конфига: {} -> {}", APP_CONFIG_LEGACY, APP_CONFIG),
+                    );
+                } else {
+                    log("WARN", "Не удалось выполнить миграцию конфига".into());
+                }
+                (c, APP_CONFIG_LEGACY)
+            } else {
+                return AppSettings::default();
+            }
+        }
+        Err(e) => {
+            log("ERROR", format!("Ошибка чтения {}: {}", APP_CONFIG, e));
+            return AppSettings::default();
+        }
+    };
+
+    match serde_json::from_str::<AppSettings>(&content) {
+        Ok(mut s) => {
+            s.normalize_proxies();
+            s
+        }
+        Err(e) => {
+            log("ERROR", format!("Ошибка парсинга {}: {}", path, e));
+            AppSettings::default()
+        }
+    }
+}
 
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let s = state.settings.read().unwrap();

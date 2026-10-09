@@ -87,7 +87,8 @@ async fn fetch_rci(state: &AppState, endpoint: &str) -> Result<serde_json::Value
         .http_client
         .get(format!("http://127.0.0.1:79/rci/show/{endpoint}"))
         .timeout(Duration::from_secs(5));
-    if let Some(ref token) = state.rci_token {
+    let token = state.rci_token.read().unwrap().clone();
+    if let Some(ref token) = token {
         req = req.header("X-Ndma-Tkn", token);
     }
 
@@ -130,7 +131,8 @@ async fn req_rci(
         .json(&payload)
         .timeout(Duration::from_secs(5));
 
-    if let Some(ref token) = state.rci_token {
+    let token = state.rci_token.read().unwrap().clone();
+    if let Some(ref token) = token {
         req = req.header("X-Ndma-Tkn", token);
     }
 

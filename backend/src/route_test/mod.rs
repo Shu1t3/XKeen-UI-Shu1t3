@@ -343,9 +343,12 @@ fn normalize_and_dedupe(raw_targets: Vec<String>) -> Vec<ParsedTarget> {
     out
 }
 
-/// Сколько целей вычисляется одновременно — не топим mihomo/файловую систему 500 параллельными
-/// запросами разом, но и не ждём их строго по очереди (mihomo A+AAAA до 2×3с, DoH-фолбэк до 4с —
-/// см. `dns.rs` — то есть до ~10с на одну цель в худшем случае).
+/// Сколько целей вычисляется одновременно. На одноядерных MIPS-роутерах (KN-1713)
+/// ограничиваем параллелизм до 2, чтобы не перегружать слабый CPU переключениями контекста.
+#[cfg(target_arch = "mips")]
+const MAX_CONCURRENCY: usize = 2;
+
+#[cfg(not(target_arch = "mips"))]
 const MAX_CONCURRENCY: usize = 8;
 /// Максимум на одну цель — жёсткий бэкстоп поверх таймаутов внутри `dns.rs`/geodb.
 const PER_TARGET_TIMEOUT: Duration = Duration::from_secs(10);

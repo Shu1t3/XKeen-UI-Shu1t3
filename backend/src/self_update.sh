@@ -20,7 +20,7 @@ bounded_init() (
     "$init" "$1" &
     child=$!
     (
-        sleep 30 &
+        sleep 90 &
         sleeper=$!
         trap 'kill "$sleeper" 2>/dev/null || :; exit 0' HUP INT TERM
         wait "$sleeper" || exit 0
@@ -38,12 +38,12 @@ healthy() {
         if [ "$(readlink "$proc_root/$pid/exe" 2>/dev/null)" = "$target" ]; then found=1; fi
     done
     [ "$found" = 1 ] || return 1
-    curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 "http://127.0.0.1:$port/api/auth/login" >/dev/null
+    curl -fsS --noproxy '*' --connect-timeout 3 --max-time 5 "http://127.0.0.1:$port/api/auth/login" >/dev/null
 }
 wait_healthy() {
     tries=0
     stable=0
-    while [ "$tries" -lt 15 ]; do
+    while [ "$tries" -lt 25 ]; do
         if healthy; then stable=$((stable + 1)); else stable=0; fi
         [ "$stable" -ge 3 ] && return 0
         tries=$((tries + 1))

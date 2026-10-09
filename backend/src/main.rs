@@ -432,15 +432,11 @@ async fn main() {
     let (log_tx, _) = broadcast::channel::<String>(16);
     let log_tx_arc = Arc::new(log_tx);
 
-    let xkeen_config_path = XKEEN_CONF;
-    let rci_token = std::fs::read_to_string(xkeen_config_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .and_then(|json| json.get("xkeen")?.get("rci_token")?.as_str().map(String::from));
+    let rci_token = types::load_rci_token();
 
     let state = AppState {
         core: Arc::new(RwLock::new(detect_core(init_file.as_deref()))),
-        settings: Arc::new(RwLock::new(load_settings())),
+        settings: Arc::new(RwLock::new(settings::load_settings())),
         init_file: Arc::new(RwLock::new(init_file)),
         http_client: reqwest::Client::builder()
             .user_agent("XKeen-UI")
@@ -455,13 +451,13 @@ async fn main() {
         auth_changes: tokio::sync::watch::channel(0).0,
         app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
         debug: cli.debug,
-        rci_token,
+        rci_token: Arc::new(RwLock::new(rci_token)),
     };
     if !cfg!(feature = "local-dev") {
         version::start_update_checker(state.clone());
     }
 
-    if let Some(ref _token) = state.rci_token {
+    if let Some(ref _token) = *state.rci_token.read().unwrap() {
         log("INFO", "RCI токен успешно загружен".into());
     } else if !cfg!(feature = "local-dev") {
         match state
@@ -578,7 +574,7 @@ fn get_arch() -> String {
     format!("{}/{}", arch, libc)
 }
 
-fn detect_core(init_file: Option<&str>) -> CoreInfo {
+pub fn detect_core(init_file: Option<&str>) -> CoreInfo {
     let content = init_file
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
@@ -593,45 +589,6 @@ fn detect_core(init_file: Option<&str>) -> CoreInfo {
             name: "xray".into(),
             conf_dir: XRAY_CONF_DIR.into(),
             is_json: true,
-        }
-    }
-}
-
-fn load_settings() -> AppSettings {
-    let (content, path) = match std::fs::read_to_string(APP_CONFIG) {
-        Ok(c) => (c, APP_CONFIG),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Ok(c) = std::fs::read_to_string(APP_CONFIG_LEGACY) {
-                if let Err(e) = std::fs::create_dir_all(XKEEN_CONF_DIR) {
-                    log("WARN", format!("Не удалось создать {}: {}", XKEEN_CONF_DIR, e));
-                }
-                if std::fs::rename(APP_CONFIG_LEGACY, APP_CONFIG).is_ok() {
-                    log(
-                        "INFO",
-                        format!("Успешная миграция конфига: {} -> {}", APP_CONFIG_LEGACY, APP_CONFIG),
-                    );
-                } else {
-                    log("WARN", "Не удалось выполнить миграцию конфига".into());
-                }
-                (c, APP_CONFIG_LEGACY)
-            } else {
-                return AppSettings::default();
-            }
-        }
-        Err(e) => {
-            log("ERROR", format!("Ошибка чтения {}: {}", APP_CONFIG, e));
-            return AppSettings::default();
-        }
-    };
-
-    match serde_json::from_str::<AppSettings>(&content) {
-        Ok(mut s) => {
-            s.normalize_proxies();
-            s
-        }
-        Err(e) => {
-            log("ERROR", format!("Ошибка парсинга {}: {}", path, e));
-            AppSettings::default()
         }
     }
 }

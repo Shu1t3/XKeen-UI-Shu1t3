@@ -558,7 +558,7 @@ mod tests {
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
             debug: false,
-            rci_token: None,
+            rci_token: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
             .route("/api/auth/login", post(post_login))

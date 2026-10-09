@@ -1,11 +1,11 @@
 import { Switch } from '@/components/ui/switch'
-import { useCallback, useState } from 'react'
-import { apiCall } from '../../../lib/api'
-import { useAppActions, useCoreRuntimeState, useSettings } from '../../../lib/store'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { getAppState, useAppActions, useCoreRuntimeState, useSettings } from '../../../lib/store'
 import type { Config } from '../../../lib/types'
 import { cn } from '../../../lib/utils'
 import { parse as parseJsonc } from 'jsonc-parser'
 import type { CodeMirrorRef } from '../CodeMirror'
+import { applyXrayGuiConfig } from './guiAutoApply'
 
 const LOG_LEVELS = ['none', 'error', 'warning', 'info', 'debug'] as const
 type LogLevel = (typeof LOG_LEVELS)[number]
@@ -53,6 +53,26 @@ export function GuiLog({ editorRef, configs, activeConfigIndex }: Props) {
   const { showToast, dispatch } = useAppActions()
   const { serviceStatus, currentCore } = useCoreRuntimeState()
   const autoApply = useSettings((s) => s.autoApply)
+  const configsRef = useRef(configs)
+  const activeConfigIndexRef = useRef(activeConfigIndex)
+  const autoApplyRef = useRef(autoApply)
+  const serviceStatusRef = useRef(serviceStatus)
+  const currentCoreRef = useRef(currentCore)
+
+  useEffect(() => {
+    configsRef.current = configs
+    activeConfigIndexRef.current = activeConfigIndex
+  }, [configs, activeConfigIndex])
+
+  useEffect(() => {
+    autoApplyRef.current = autoApply
+  }, [autoApply])
+
+  useEffect(() => {
+    serviceStatusRef.current = serviceStatus
+    currentCoreRef.current = currentCore
+  }, [serviceStatus, currentCore])
+
   const [cfg, setCfg] = useState<LogConfig>(() => {
     const content = configs[activeConfigIndex]?.content ?? ''
     return (
@@ -105,35 +125,24 @@ export function GuiLog({ editorRef, configs, activeConfigIndex }: Props) {
         }
         wrapper.replaceAll(text)
 
-        if (triggerRestart && autoApply && serviceStatus === 'running') {
-          const activeConfig = configs[activeConfigIndex]
+        if (triggerRestart && autoApplyRef.current && serviceStatusRef.current === 'running') {
+          const activeIndex = activeConfigIndexRef.current
+          const activeConfig = getAppState().configs[activeIndex] ?? configsRef.current[activeIndex]
           if (activeConfig) {
-            const content = wrapper.getValue()
-            await apiCall<{ success: boolean; error?: string }>('PUT', 'configs', { file: activeConfig.file, content })
-            dispatch({
-              type: 'SAVE_CONFIG',
+            await applyXrayGuiConfig({
+              wrapper,
               file: activeConfig.file,
-              index: activeConfigIndex,
-              content,
+              core: currentCoreRef.current,
+              dispatch,
+              showToast,
             })
-            dispatch({
-              type: 'SET_SERVICE_STATUS',
-              status: 'pending',
-              pendingText: 'Перезапуск...',
-            })
-            const r = await apiCall<{ success: boolean; error?: string }>('POST', 'control', {
-              action: 'softRestart',
-              core: currentCore,
-            })
-            showToast(r?.success ? 'Изменения применены' : `Ошибка: ${r?.error}`, r?.success ? 'success' : 'error')
-            dispatch({ type: 'SET_SERVICE_STATUS', status: 'running' })
           }
         }
       } catch (e: any) {
         showToast(`Ошибка синхронизации: ${e.message}`, 'error')
       }
     },
-    [editorRef, showToast, autoApply, serviceStatus, currentCore, configs, activeConfigIndex, dispatch]
+    [editorRef, showToast, dispatch]
   )
 
   function update(partial: Partial<LogConfig>, triggerRestart = false) {

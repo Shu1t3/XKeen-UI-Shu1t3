@@ -201,7 +201,7 @@ const useStore = create<StoreState>((set) => ({
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
-type ShowToastFn = (message: string | { title: string; body: string; persistent?: boolean; id?: string; action?: { url: string } }, type?: 'success' | 'error') => void
+export type ShowToastFn = (message: string | { title: string; body: string; persistent?: boolean; id?: string; action?: { url: string } }, type?: 'success' | 'error') => void
 
 type CoreState = Omit<
   AppState,

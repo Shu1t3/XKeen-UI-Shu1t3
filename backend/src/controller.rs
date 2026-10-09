@@ -105,6 +105,16 @@ async fn resolve_init_file(state: &AppState) -> Result<String, String> {
     Ok(new_path)
 }
 
+pub(crate) fn init_timeout_for_args(args: &[&str]) -> u64 {
+    // Operations that configure iptables, ipset, and spawn cores take 40-60s on single-core MIPS (e.g. KN-1713).
+    // Differentiate timeout: 120s for start/restart, 30s for quick stop/status operations.
+    if args.iter().any(|&a| a == "start" || a == "restart") {
+        120
+    } else {
+        30
+    }
+}
+
 pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), String> {
     let path = resolve_init_file(state).await?;
     let mut command = Command::new(&path);
@@ -114,8 +124,9 @@ pub async fn run_init_command(state: &AppState, args: &[&str]) -> Result<(), Str
     {
         command.stdout(f.try_clone().map_err(|e| e.to_string())?).stderr(f);
     }
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), command.status())
-        .await.map_err(|_| format!("Таймаут init: {path}"))?;
+    let timeout_secs = init_timeout_for_args(args);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), command.status())
+        .await.map_err(|_| format!("Таймаут init ({timeout_secs} с): {path}"))?;
     match result {
         Ok(status) if status.success() => {
             if matches!(args.first(), Some(&"start") | Some(&"restart")) {
@@ -155,18 +166,30 @@ fn get_core_info(name: &str) -> CoreInfo {
     }
 }
 
-pub fn get_pid(name: &str) -> Vec<i32> {
+pub fn get_pids_for(names: &[&str]) -> std::collections::HashMap<String, Vec<i32>> {
+    let mut map: std::collections::HashMap<String, Vec<i32>> = names
+        .iter()
+        .map(|n| (n.to_string(), Vec::new()))
+        .collect();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return vec![];
+        return map;
     };
-    entries
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let pid = path.file_name()?.to_str()?.parse::<i32>().ok()?;
-            let comm = std::fs::read_to_string(path.join("comm")).ok()?;
-            (comm.trim_end_matches('\n') == name).then_some(pid)
-        })
-        .collect()
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+            let comm = comm.trim_end_matches('\n');
+            if let Some(list) = map.get_mut(comm) {
+                list.push(pid);
+            }
+        }
+    }
+    map
+}
+
+pub fn get_pid(name: &str) -> Vec<i32> {
+    get_pids_for(&[name]).remove(name).unwrap_or_default()
 }
 
 pub async fn soft_restart(core: &str) -> Result<(), String> {
@@ -230,26 +253,25 @@ async fn confirm_started(
 
 pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
     let _control_guard = CONTROL_LOCK.lock().await;
-    let mut current_core = state.core.read().unwrap().clone();
-    let core_name = current_core.name.clone();
 
-    if tokio::task::spawn_blocking(move || get_pid(&core_name))
+    // Single-pass check of both cores in /proc avoids repeated scanning on weak MIPS CPUs.
+    let running_map = tokio::task::spawn_blocking(|| get_pids_for(&["xray", "mihomo"]))
         .await
-        .unwrap_or_default()
-        .is_empty()
-    {
-        let alt_core = if current_core.name == "mihomo" {
-            "xray"
-        } else {
-            "mihomo"
-        };
-        let alt_string = alt_core.to_string();
+        .unwrap_or_default();
+    let xray_running = running_map.get("xray").is_some_and(|pids| !pids.is_empty());
+    let mihomo_running = running_map.get("mihomo").is_some_and(|pids| !pids.is_empty());
 
-        current_core = if !tokio::task::spawn_blocking(move || get_pid(&alt_string))
-            .await
-            .unwrap_or_default()
-            .is_empty()
-        {
+    let mut current_core = state.core.read().unwrap().clone();
+    let is_current_running = if current_core.name == "mihomo" { mihomo_running } else { xray_running };
+
+    if !is_current_running {
+        let (alt_core, is_alt_running) = if current_core.name == "mihomo" {
+            ("xray", xray_running)
+        } else {
+            ("mihomo", mihomo_running)
+        };
+
+        current_core = if is_alt_running {
             get_core_info(alt_core)
         } else {
             let configuration = {
@@ -269,23 +291,9 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
         *state.core.write().unwrap() = current_core.clone();
     }
 
-    let ((xray_exists, xray_running), (mihomo_exists, mihomo_running)) = tokio::join!(
-        async {
-            let exists = tokio::fs::metadata(opt_path!("/sbin/xray")).await.is_ok();
-            let running = exists
-                && tokio::task::spawn_blocking(|| !get_pid("xray").is_empty())
-                    .await
-                    .unwrap_or(false);
-            (exists, running)
-        },
-        async {
-            let exists = tokio::fs::metadata(opt_path!("/sbin/mihomo")).await.is_ok();
-            let running = exists
-                && tokio::task::spawn_blocking(|| !get_pid("mihomo").is_empty())
-                    .await
-                    .unwrap_or(false);
-            (exists, running)
-        }
+    let (xray_exists, mihomo_exists) = tokio::join!(
+        async { tokio::fs::metadata(opt_path!("/sbin/xray")).await.is_ok() },
+        async { tokio::fs::metadata(opt_path!("/sbin/mihomo")).await.is_ok() }
     );
 
     let mut available_cores = Vec::new();
@@ -295,7 +303,7 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
     if mihomo_exists {
         available_cores.push("mihomo".to_string());
     }
-    let running_status = xray_running || mihomo_running;
+    let running_status = (xray_exists && xray_running) || (mihomo_exists && mihomo_running);
 
     Json(
         serde_json::json!({ "success": true, "cores": available_cores, "currentCore": current_core.name, "running": running_status }),
@@ -551,7 +559,7 @@ mod tests {
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(Mutex::new(())),
             debug: false,
-            rci_token: None,
+            rci_token: Arc::new(RwLock::new(None)),
         };
         // Exercise the real JSON extractor and handler without local-dev's route blocker.
         let app = Router::new()
@@ -660,7 +668,8 @@ mod tests {
             log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(Mutex::new(())),
-            debug: false, rci_token: None,
+            debug: false,
+            rci_token: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -705,4 +714,27 @@ mod tests {
         fs::remove_dir_all(temp).await.unwrap();
     }
 
+    #[test]
+    fn init_timeout_differentiates_heavy_and_quick_commands() {
+        assert_eq!(init_timeout_for_args(&["start", "on"]), 120);
+        assert_eq!(init_timeout_for_args(&["restart", "on"]), 120);
+        assert_eq!(init_timeout_for_args(&["start"]), 120);
+        assert_eq!(init_timeout_for_args(&["restart"]), 120);
+        assert_eq!(init_timeout_for_args(&["stop"]), 30);
+        assert_eq!(init_timeout_for_args(&["status"]), 30);
+        assert_eq!(init_timeout_for_args(&[]), 30);
+    }
+
+    #[test]
+    fn single_pass_proc_scanner_handles_multiple_names_and_empty_results() {
+        let nonexistent_1 = format!("none-{}", uuid::Uuid::new_v4());
+        let nonexistent_2 = format!("none-{}", uuid::Uuid::new_v4());
+        let pids = get_pids_for(&[&nonexistent_1, &nonexistent_2]);
+        assert_eq!(pids.len(), 2);
+        assert!(pids[&nonexistent_1].is_empty());
+        assert!(pids[&nonexistent_2].is_empty());
+        assert!(get_pid(&nonexistent_1).is_empty());
+    }
+
 }
+
