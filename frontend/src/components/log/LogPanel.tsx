@@ -33,7 +33,7 @@ export function LogPanel() {
   const [addRouterOpen, setAddRouterOpen] = useState(false)
   if (!multiRouter && panelTab === 'routers') setPanelTab('journal')
   const allRouterIds = [LOCAL_ROUTER_ID, ...routers.map(routerId)]
-  const selectableRouterIds = allRouterIds.filter((id) => isRouterSelectable(id, online, auth))
+  const selectableRouterIds = allRouterIds.filter((id) => isRouterSelectable(id, online, auth, routers))
   const allRoutersSelected = selectableRouterIds.length > 0 && selectableRouterIds.every((id) => applyTargets.includes(id))
   const showSelectAllRouters = multiRouter && panelTab === 'routers' && routers.length > 0
   const showRoutersToolbar = multiRouter && panelTab === 'routers'

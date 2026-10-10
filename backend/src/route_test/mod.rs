@@ -405,6 +405,36 @@ where
     stream::iter(futures).buffered(MAX_CONCURRENCY).collect().await
 }
 
+async fn query_mihomo_live_mode(target: &api_relay::ClashTarget) -> Result<mihomo::MihomoMode, String> {
+    let (url, client, secret) = match target {
+        api_relay::ClashTarget::Tcp { port, secret } => (
+            api_relay::build_url("http", *port, "configs", None),
+            api_relay::relay_http_client(None)?,
+            secret.clone(),
+        ),
+        api_relay::ClashTarget::Unix { path: socket_path } => {
+            let url = api_relay::build_url("http", 80, "configs", None);
+            let client = api_relay::relay_http_client(Some(socket_path))?;
+            (url, client, None)
+        }
+    };
+    let mut req = client.get(url).timeout(Duration::from_millis(1500));
+    if let Some(secret) = secret {
+        req = req.header("Authorization", format!("Bearer {secret}"));
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("mihomo /configs ответил {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mode_str = json["mode"]
+        .as_str()
+        .ok_or_else(|| "поле mode отсутствует в ответе".to_string())?;
+    mode_str
+        .parse::<mihomo::MihomoMode>()
+        .map_err(|_| format!("неизвестный режим: {mode_str}"))
+}
+
 /// `POST /api/route-test` — проверка списка целей активным ядром.
 pub async fn post_route_test(
     State(state): State<AppState>, headers: HeaderMap, Json(req): Json<RouteTestRequest>,
@@ -424,16 +454,49 @@ pub async fn post_route_test(
     let clash_target = api_relay::resolve_clash_target(port_override, secret_override, unix_override)
         .await
         .ok();
-    let resolver = dns::LiveResolver::new(clash_target, state.http_client.clone());
+    let resolver = dns::LiveResolver::new(clash_target.clone(), state.http_client.clone());
     // Один резолвер на весь запрос: одинаковый домен из разных целей резолвится один раз
     // (см. `dns::CachingResolver`), а не заново на каждую цель.
     let resolver = dns::CachingResolver::new(&resolver);
 
     let core_name = state.core.read().unwrap().name.clone();
-    let engine = match ActiveEngine::load(&core_name).await {
+    let mut engine = match ActiveEngine::load(&core_name).await {
         Ok(e) => e,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
+
+    if let ActiveEngine::Mihomo(ref mut m) = engine {
+        let live_mode = if let Some(ref target) = clash_target {
+            query_mihomo_live_mode(target).await.ok()
+        } else {
+            None
+        };
+
+        if let Some(live_mode) = live_mode {
+            m.set_mode(live_mode);
+            match live_mode {
+                mihomo::MihomoMode::Direct => {
+                    m.add_warning("Активен режим Mihomo direct (live): правила маршрутизации игнорируются, весь трафик направляется напрямую (DIRECT).".into());
+                }
+                mihomo::MihomoMode::Global => {
+                    m.add_warning("Активен режим Mihomo global (live): правила маршрутизации игнорируются, весь трафик направляется через группу GLOBAL.".into());
+                }
+                mihomo::MihomoMode::Rule => {}
+            }
+        } else {
+            match m.mode() {
+                mihomo::MihomoMode::Direct => {
+                    m.add_warning("В файле конфигурации Mihomo задан режим direct (snapshot): правила маршрутизации игнорируются, весь трафик направляется напрямую (DIRECT).".into());
+                }
+                mihomo::MihomoMode::Global => {
+                    m.add_warning("В файле конфигурации Mihomo задан режим global (snapshot): правила маршрутизации игнорируются, весь трафик направляется через группу GLOBAL.".into());
+                }
+                mihomo::MihomoMode::Rule => {
+                    m.add_warning("Режим маршрутизации взят из снимка config.yaml. При недоступном API Mihomo изменения runtime-режима не отслеживаются.".into());
+                }
+            }
+        }
+    }
 
     let deadline = Instant::now() + REQUEST_BUDGET;
     let results = evaluate_targets(&parsed_targets, deadline, |target: Target| {

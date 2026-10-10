@@ -25,6 +25,7 @@ interface RoutersState {
   setCommandStatus: (id: string, status: RouterCommandState) => void
   resetCommandStatuses: () => void
   getBaseUrlForId: (id: string) => string | null
+  getTokenForId: (id: string) => string | null
 }
 
 export const useRoutersStore = create<RoutersState>((set, get) => ({
@@ -43,7 +44,7 @@ export const useRoutersStore = create<RoutersState>((set, get) => ({
 
   toggleApplyTarget: (id) =>
     set((state) => {
-      if (!isRouterSelectable(id, state.online, state.auth)) return state
+      if (!isRouterSelectable(id, state.online, state.auth, state.routers)) return state
       const has = state.applyTargets.includes(id)
       return {
         applyTargets: has ? state.applyTargets.filter((t) => t !== id) : [...state.applyTargets, id],
@@ -52,7 +53,7 @@ export const useRoutersStore = create<RoutersState>((set, get) => ({
 
   setApplyTargets: (ids) =>
     set((state) => ({
-      applyTargets: ids.filter((id) => isRouterSelectable(id, state.online, state.auth)),
+      applyTargets: ids.filter((id) => isRouterSelectable(id, state.online, state.auth, state.routers)),
     })),
 
   setOnline: (id, online) => set((state) => ({ online: { ...state.online, [id]: online } })),
@@ -67,10 +68,20 @@ export const useRoutersStore = create<RoutersState>((set, get) => ({
     if (id === LOCAL_ROUTER_ID) return null
     const router = findRouter(get().routers, id)
     if (!router) throw new Error(`Роутер ${id} больше не существует`)
-    return routerBaseUrl(router.host, router.port)
+    return routerBaseUrl(router.host, router.port, router.protocol)
+  },
+
+  getTokenForId: (id) => {
+    if (id === LOCAL_ROUTER_ID) return null
+    const router = findRouter(get().routers, id)
+    return router?.token?.trim() || null
   },
 }))
 
 export function getBaseUrlForId(id: string): string | null {
   return useRoutersStore.getState().getBaseUrlForId(id)
+}
+
+export function getTokenForId(id: string): string | null {
+  return useRoutersStore.getState().getTokenForId(id)
 }

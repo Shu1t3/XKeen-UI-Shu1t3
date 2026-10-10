@@ -247,9 +247,11 @@ mod tests {
 
     fn fixture() -> AppState {
         let (log_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut settings = AppSettings::default();
+        settings.auth.enabled = false;
         AppState {
             core: Arc::new(std::sync::RwLock::new(CoreInfo { name: "mihomo".into(), conf_dir: String::new(), is_json: false })),
-            settings: Arc::new(std::sync::RwLock::new(AppSettings::default())),
+            settings: Arc::new(std::sync::RwLock::new(settings)),
             init_file: Arc::new(std::sync::RwLock::new(None)),
             http_client: reqwest::Client::new(), update_checker: UpdateChecker::default(),
             geo_cache: Arc::new(std::sync::RwLock::new(Default::default())),

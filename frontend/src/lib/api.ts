@@ -27,17 +27,23 @@ export async function apiCall<T = unknown>(
   method: string,
   endpoint: string,
   body?: unknown,
-  options?: { baseUrl?: string | null; timeoutMs?: number }
+  options?: { baseUrl?: string | null; timeoutMs?: number; token?: string | null }
 ): Promise<T> {
   const isGet = method === 'GET'
   const timeoutMs = options?.timeoutMs ?? (options?.baseUrl ? REMOTE_FETCH_TIMEOUT_MS : undefined)
   const controller = timeoutMs ? new AbortController() : null
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
 
+  const headers: Record<string, string> = {}
+  if (!isGet) headers['Content-Type'] = 'application/json'
+  if (options?.token) {
+    headers['Authorization'] = `Bearer ${options.token}`
+  }
+
   try {
     const res = await fetch(`${apiPrefix(options?.baseUrl)}/${endpoint}`, {
       method,
-      headers: !isGet ? { 'Content-Type': 'application/json' } : {},
+      headers,
       body: !isGet ? JSON.stringify(body) : undefined,
       signal: controller?.signal,
     })

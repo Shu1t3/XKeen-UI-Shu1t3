@@ -217,12 +217,24 @@ impl Default for ClashApiSettings {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
     pub enabled: bool,
     pub password_hash: Option<String>,
     pub session_ids: Vec<String>,
+    pub fleet_token: Option<String>,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            password_hash: None,
+            session_ids: Vec::new(),
+            fleet_token: None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -238,6 +250,8 @@ pub struct RemoteRouter {
     pub host: String,
     pub port: u16,
     pub name: String,
+    pub protocol: Option<String>,
+    pub token: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

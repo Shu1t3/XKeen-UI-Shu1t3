@@ -7,6 +7,8 @@ export interface RemoteRouter {
   host: string
   port: number
   name: string
+  protocol?: 'http' | 'https'
+  token?: string
 }
 
 /** `true` online, `false` offline, `null` unknown */
@@ -26,8 +28,13 @@ export function routerId(router: Pick<RemoteRouter, 'host' | 'port'>): string {
   return `${router.host}:${router.port}`
 }
 
-export function routerBaseUrl(host: string, port = DEFAULT_ROUTER_PORT): string {
-  return `http://${host}:${port}`
+export function routerBaseUrl(
+  host: string,
+  port = DEFAULT_ROUTER_PORT,
+  protocol: 'http' | 'https' = 'http'
+): string {
+  const proto = protocol === 'https' ? 'https' : 'http'
+  return `${proto}://${host}:${port}`
 }
 
 export function routerLabel(router: RemoteRouter): string {
@@ -42,10 +49,20 @@ export function findRouter(routers: RemoteRouter[], id: string): RemoteRouter | 
 export function isRouterSelectable(
   id: string,
   online: Record<string, RouterOnlineStatus>,
-  auth: Record<string, RouterAuthStatus>
+  auth: Record<string, RouterAuthStatus>,
+  routers?: RemoteRouter[] | boolean
 ): boolean {
   const isOnline = id === LOCAL_ROUTER_ID ? (online[id] ?? true) === true : online[id] === true
   if (!isOnline) return false
-  if (id !== LOCAL_ROUTER_ID && auth[id] === true) return false
+  if (id !== LOCAL_ROUTER_ID && auth[id] === true) {
+    let hasToken = false
+    if (typeof routers === 'boolean') {
+      hasToken = routers
+    } else if (Array.isArray(routers)) {
+      const router = routers.find((r) => routerId(r) === id)
+      hasToken = Boolean(router?.token?.trim())
+    }
+    if (!hasToken) return false
+  }
   return true
 }

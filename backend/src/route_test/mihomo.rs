@@ -9,6 +9,7 @@ use super::dns::{DnsSource, Resolver};
 use super::providers::{self, ParsedProvider, Providers};
 use super::{MatchedRule, Network, Outcome, RouteResult, SkippedRule, TestContext};
 use regex_lite::{Regex, RegexBuilder};
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -1351,8 +1352,40 @@ fn build_sniffer_config(doc: &Yaml) -> SnifferConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MihomoMode {
+    #[default]
+    Rule,
+    Global,
+    Direct,
+}
+
+impl std::str::FromStr for MihomoMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(MihomoMode::Direct),
+            "global" => Ok(MihomoMode::Global),
+            "rule" => Ok(MihomoMode::Rule),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for MihomoMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MihomoMode::Rule => write!(f, "rule"),
+            MihomoMode::Global => write!(f, "global"),
+            MihomoMode::Direct => write!(f, "direct"),
+        }
+    }
+}
+
 /// Загруженный и разобранный конфиг mihomo (правила, провайдеры, geo-файлы).
 pub struct Engine {
+    pub mode: MihomoMode,
     rules: Vec<TopRule>,
     providers: Providers,
     geodata_mode: bool,
@@ -1383,6 +1416,11 @@ async fn find_geo_file(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
 }
 
 async fn build_engine(doc: &Yaml, base_dir: &Path) -> Result<Engine, String> {
+    let mode = doc["mode"]
+        .as_str()
+        .and_then(|s| s.parse::<MihomoMode>().ok())
+        .unwrap_or(MihomoMode::Rule);
+
     let rule_lines: Vec<String> = doc["rules"]
         .as_vec()
         .map(|v| v.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
@@ -1403,6 +1441,7 @@ async fn build_engine(doc: &Yaml, base_dir: &Path) -> Result<Engine, String> {
     let sniffer = Box::new(build_sniffer_config(doc));
 
     Ok(Engine {
+        mode,
         rules,
         providers,
         geodata_mode,
@@ -1521,6 +1560,36 @@ impl Engine {
             }
         }
 
+        if self.mode == MihomoMode::Direct {
+            return RouteResult {
+                target: ctx.target.to_string(),
+                kind: ctx.target.kind().to_string(),
+                outcome: Outcome::Default,
+                outbound: Some("DIRECT".to_string()),
+                rule: None,
+                balancer: None,
+                resolved_ips: eval.resolved_ips_all,
+                dns_source: eval.dns_source,
+                skipped: Vec::new(),
+                error: None,
+            };
+        }
+
+        if self.mode == MihomoMode::Global {
+            return RouteResult {
+                target: ctx.target.to_string(),
+                kind: ctx.target.kind().to_string(),
+                outcome: Outcome::Matched,
+                outbound: Some("GLOBAL".to_string()),
+                rule: None,
+                balancer: None,
+                resolved_ips: eval.resolved_ips_all,
+                dns_source: eval.dns_source,
+                skipped: Vec::new(),
+                error: None,
+            };
+        }
+
         let mut skipped = Vec::new();
         let mut matched: Option<(String, MatchedRule)> = None;
         for rule in &self.rules {
@@ -1564,6 +1633,21 @@ impl Engine {
             dns_source: eval.dns_source,
             skipped,
             error: None,
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: MihomoMode) {
+        self.mode = mode;
+    }
+
+    pub fn mode(&self) -> MihomoMode {
+        self.mode
+    }
+
+    pub fn add_warning(&self, warning: String) {
+        let mut w = self.warnings.lock().unwrap();
+        if !w.contains(&warning) {
+            w.push(warning);
         }
     }
 
@@ -3057,5 +3141,90 @@ rules:
             "должно быть предупреждение о пропущенной RULE-SET,bad@ipcidr строке: {:?}",
             engine.warnings()
         );
+    }
+
+    #[tokio::test]
+    async fn r29_mihomo_mode_direct_bypasses_rules_and_routes_to_direct() {
+        let dir = std::env::temp_dir().join(format!("r29-test-direct-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+mode: direct
+rules:
+  - "DOMAIN,example.com,PROXY"
+  - "MATCH,FALLBACK"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+        assert_eq!(engine.mode(), MihomoMode::Direct);
+        let resolver = empty_resolver();
+        let res = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(res.outbound.as_deref(), Some("DIRECT"));
+        assert_eq!(res.outcome, Outcome::Default);
+        assert!(res.rule.is_none());
+    }
+
+    #[tokio::test]
+    async fn r29_mihomo_mode_global_bypasses_rules_and_routes_to_global() {
+        let dir = std::env::temp_dir().join(format!("r29-test-global-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+mode: global
+rules:
+  - "DOMAIN,example.com,PROXY"
+  - "MATCH,FALLBACK"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+        assert_eq!(engine.mode(), MihomoMode::Global);
+        let resolver = empty_resolver();
+        let res = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(res.outbound.as_deref(), Some("GLOBAL"));
+        assert_eq!(res.outcome, Outcome::Matched);
+        assert!(res.rule.is_none());
+    }
+
+    #[tokio::test]
+    async fn r29_mihomo_mode_rule_matches_rules() {
+        let dir = std::env::temp_dir().join(format!("r29-test-rule-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+mode: rule
+rules:
+  - "DOMAIN,example.com,PROXY"
+  - "MATCH,DIRECT"
+"#;
+        let engine = from_yaml_str(yaml, &dir).await.unwrap();
+        assert_eq!(engine.mode(), MihomoMode::Rule);
+        let resolver = empty_resolver();
+        let res = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(res.outbound.as_deref(), Some("PROXY"));
+        assert_eq!(res.outcome, Outcome::Matched);
+        assert!(res.rule.is_some());
+    }
+
+    #[tokio::test]
+    async fn r29_engine_set_mode_switches_behavior_dynamically() {
+        let dir = std::env::temp_dir().join(format!("r29-test-dynamic-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let yaml = r#"
+mode: rule
+rules:
+  - "DOMAIN,example.com,PROXY"
+  - "MATCH,DIRECT"
+"#;
+        let mut engine = from_yaml_str(yaml, &dir).await.unwrap();
+        let resolver = empty_resolver();
+
+        // 1. Initially in rule mode -> PROXY
+        let res1 = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(res1.outbound.as_deref(), Some("PROXY"));
+
+        // 2. Switched to direct mode -> DIRECT
+        engine.set_mode(MihomoMode::Direct);
+        let res2 = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(res2.outbound.as_deref(), Some("DIRECT"));
+
+        // 3. Switched to global mode -> GLOBAL
+        engine.set_mode(MihomoMode::Global);
+        let res3 = engine.evaluate(&ctx_domain("example.com"), &resolver).await;
+        assert_eq!(res3.outbound.as_deref(), Some("GLOBAL"));
     }
 }

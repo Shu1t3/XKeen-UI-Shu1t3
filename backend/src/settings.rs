@@ -44,18 +44,32 @@ pub fn load_settings() -> AppSettings {
         }
         Err(e) => {
             log("ERROR", format!("Ошибка чтения {}: {}", APP_CONFIG, e));
-            return AppSettings::default();
+            let mut s = AppSettings::default();
+            s.auth.enabled = true;
+            return s;
         }
     };
 
-    match serde_json::from_str::<AppSettings>(&content) {
+    parse_settings(&content, path)
+}
+
+pub fn parse_settings(content: &str, path: &str) -> AppSettings {
+    match serde_json::from_str::<AppSettings>(content) {
         Ok(mut s) => {
             s.normalize_proxies();
             s
         }
         Err(e) => {
             log("ERROR", format!("Ошибка парсинга {}: {}", path, e));
-            AppSettings::default()
+            let mut s = AppSettings::default();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
+                && let Some(auth_val) = val.get("auth")
+                && let Ok(auth) = serde_json::from_value::<AuthSettings>(auth_val.clone())
+            {
+                s.auth = auth;
+            }
+            s.auth.enabled = true;
+            s
         }
     }
 }
@@ -320,5 +334,52 @@ mod tests {
             .await;
 
         _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn parse_settings_valid_config_normalizes_proxies() {
+        let json = r#"{
+            "updater": {
+                "github_proxy": ["proxy1.example.com", "https://proxy2.example.com"]
+            },
+            "auth": {
+                "enabled": true,
+                "fleet_token": "token-xyz"
+            }
+        }"#;
+        let settings = parse_settings(json, "test.json");
+        assert_eq!(settings.updater.github_proxy, vec!["https://proxy1.example.com", "https://proxy2.example.com"]);
+        assert!(settings.auth.enabled);
+        assert_eq!(settings.auth.fleet_token.as_deref(), Some("token-xyz"));
+    }
+
+    #[test]
+    fn parse_settings_corrupt_config_fails_closed_and_salvages_auth() {
+        // Here updater.github_proxy is a number instead of an array, causing AppSettings deserialization to fail,
+        // but auth is valid JSON and contains a password hash.
+        let json = r#"{
+            "updater": {
+                "github_proxy": 12345
+            },
+            "auth": {
+                "enabled": false,
+                "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$fakehash",
+                "session_ids": ["s1:123456789"]
+            }
+        }"#;
+        let settings = parse_settings(json, "corrupt.json");
+        // Fail-closed: auth.enabled is forced to true
+        assert!(settings.auth.enabled);
+        // Salvaged credentials
+        assert_eq!(settings.auth.password_hash.as_deref(), Some("$argon2id$v=19$m=19456,t=2,p=1$fakehash"));
+        assert_eq!(settings.auth.session_ids, vec!["s1:123456789"]);
+    }
+
+    #[test]
+    fn parse_settings_completely_invalid_fails_closed() {
+        let invalid = "not valid json at all {{{";
+        let settings = parse_settings(invalid, "broken.json");
+        assert!(settings.auth.enabled);
+        assert!(settings.auth.password_hash.is_none());
     }
 }

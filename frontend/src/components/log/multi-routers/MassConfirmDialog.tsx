@@ -7,7 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { LOCAL_ROUTER_ID, type RouterAuthStatus, type RouterOnlineStatus } from '../../../lib/multi-routers/model'
+import { LOCAL_ROUTER_ID, routerId, type RouterAuthStatus, type RouterOnlineStatus } from '../../../lib/multi-routers/model'
 import { useRoutersStore } from '../../../lib/multi-routers/store'
 import { cn } from '../../../lib/utils'
 
@@ -22,7 +22,7 @@ function OnlineDot({ online, auth }: { online: RouterOnlineStatus; auth: RouterA
         !authEnabled && online === false && 'bg-red-500',
         !authEnabled && online === null && 'bg-muted-foreground/40'
       )}
-      title={authEnabled ? 'Авторизация включена' : undefined}
+      title={authEnabled ? 'Требуется авторизация (укажите токен)' : undefined}
       aria-hidden
     />
   )
@@ -76,10 +76,12 @@ export function MassConfirmDialog({
 export function RouterOnlineDot({ id }: { id: string }) {
   const online = useRoutersStore((s) => s.online[id])
   const auth = useRoutersStore((s) => s.auth[id])
+  const token = useRoutersStore((s) => s.routers.find((r) => routerId(r) === id)?.token)
+  const authMissing = auth === true && !token?.trim()
   return (
     <OnlineDot
       online={id === LOCAL_ROUTER_ID ? (online ?? true) : (online ?? null)}
-      auth={id === LOCAL_ROUTER_ID ? false : (auth ?? null)}
+      auth={id === LOCAL_ROUTER_ID ? false : authMissing}
     />
   )
 }

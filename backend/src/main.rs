@@ -63,6 +63,14 @@ struct Cli {
     )]
     port: String,
 
+    #[arg(
+        short = 'H',
+        long = "host",
+        default_value = if cfg!(feature = "local-dev") { "127.0.0.1" } else { "0.0.0.0" },
+        help = "Адрес привязки веб-сервера (management bind)"
+    )]
+    host: String,
+
     #[arg(short = 'd', long = "debug", help = "Режим отладки")]
     debug: bool,
 
@@ -548,11 +556,7 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state)
         .layer(middleware::from_fn(local_dev::router_operations));
-    let host = if cfg!(feature = "local-dev") {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0"
-    };
+    let host = &cli.host;
     let addr: SocketAddr = format!("{host}:{}", cli.port)
         .parse()
         .unwrap_or_else(|e| report_process_error(&format!("Error listening on {host}:{}: {}", cli.port, e)));

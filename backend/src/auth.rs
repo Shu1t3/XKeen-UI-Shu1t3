@@ -117,6 +117,34 @@ fn get_session_cookie(headers: &HeaderMap) -> Option<&str> {
         .find_map(|pair| pair.trim().strip_prefix("session_id="))
 }
 
+pub fn get_session_token(headers: &HeaderMap) -> Option<&str> {
+    if let Some(auth_val) = headers.get(header::AUTHORIZATION)
+        && let Ok(s) = auth_val.to_str()
+        && let Some(token) = s.strip_prefix("Bearer ")
+    {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    if let Some(token_val) = headers.get("X-Auth-Token")
+        && let Ok(s) = token_val.to_str()
+    {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    get_session_cookie(headers)
+}
+
+fn is_fleet_token_valid(auth: &crate::types::AuthSettings, token: &str) -> bool {
+    if let Some(ref fleet_token) = auth.fleet_token {
+        return !fleet_token.is_empty() && fleet_token == token;
+    }
+    false
+}
+
 fn is_session_valid(session_ids: &[String], cookie: &str) -> bool {
     let ts = now_ts();
     session_ids.iter().any(|id| {
@@ -129,6 +157,10 @@ fn is_session_valid(session_ids: &[String], cookie: &str) -> bool {
             }
         false
     })
+}
+
+fn is_token_authorized(auth: &crate::types::AuthSettings, token: &str) -> bool {
+    is_session_valid(&auth.session_ids, token) || is_fleet_token_valid(auth, token)
 }
 
 fn set_cookie_header(headers_in: &HeaderMap, value: String, max_age: u64) -> HeaderMap {
@@ -165,7 +197,7 @@ fn clear_cookie_header() -> HeaderMap {
 pub async fn get_login_info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let s = state.settings.read().unwrap();
     let authenticated =
-        get_session_cookie(&headers).is_some_and(|cookie| is_session_valid(&s.auth.session_ids, cookie));
+        get_session_token(&headers).is_some_and(|token| is_token_authorized(&s.auth, token));
     Json(serde_json::json!({
         "enabled": s.auth.enabled,
         "has_password": s.auth.password_hash.is_some(),
@@ -219,11 +251,11 @@ pub async fn post_setup(
     match commit_res {
         Ok(()) => {
             (
-                set_cookie_header(&headers, session_id, 0),
-                Json(ApiResponse::<()> {
+                set_cookie_header(&headers, session_id.clone(), 0),
+                Json(ApiResponse::<serde_json::Value> {
                     success: true,
                     error: None,
-                    data: None,
+                    data: Some(serde_json::json!({ "token": session_id })),
                 }),
             )
                 .into_response()
@@ -336,18 +368,18 @@ pub async fn post_login(
     }
 
     (
-        set_cookie_header(&headers, session_id, max_age),
-        Json(ApiResponse::<()> {
+        set_cookie_header(&headers, session_id.clone(), max_age),
+        Json(ApiResponse::<serde_json::Value> {
             success: true,
             error: None,
-            data: None,
+            data: Some(serde_json::json!({ "token": session_id })),
         }),
     )
         .into_response()
 }
 
 pub async fn post_logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Some(cookie) = get_session_cookie(&headers) {
+    if let Some(cookie) = get_session_token(&headers) {
         let cookie = cookie.to_string();
         if let Err(e) = update_auth(&state, |auth| {
             auth.session_ids.retain(|id| id.split_once(':').map_or(id.as_str(), |(uid, _)| uid) != cookie)
@@ -418,15 +450,15 @@ impl WsSession {
     pub fn from_state(state: &AppState, headers: &HeaderMap) -> Self {
         let changes = state.auth_changes.subscribe();
         let auth = &state.settings.read().unwrap().auth;
-        let cookie = get_session_cookie(headers)
-            .filter(|cookie| auth.enabled || is_session_valid(&auth.session_ids, cookie))
+        let cookie = get_session_token(headers)
+            .filter(|token| auth.enabled || is_token_authorized(auth, token))
             .map(str::to_string);
         Self { state: state.clone(), cookie, changes }
     }
 
     fn authorized_with(&self, auth: &crate::types::AuthSettings) -> bool {
         match &self.cookie {
-            Some(cookie) => is_session_valid(&auth.session_ids, cookie),
+            Some(cookie) => is_token_authorized(auth, cookie),
             None => !auth.enabled,
         }
     }
@@ -1295,5 +1327,57 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert!(!resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[test]
+    fn get_session_token_precedence_and_parsing() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(get_session_token(&headers), None);
+
+        headers.insert(header::COOKIE, HeaderValue::from_static("other=1; session_id=sess123; foo=bar"));
+        assert_eq!(get_session_token(&headers), Some("sess123"));
+
+        headers.insert("X-Auth-Token", HeaderValue::from_static("token_header_val"));
+        assert_eq!(get_session_token(&headers), Some("token_header_val"));
+
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer bearer_token_val"));
+        assert_eq!(get_session_token(&headers), Some("bearer_token_val"));
+    }
+
+    #[tokio::test]
+    async fn fleet_token_authorizes_session_and_login_info() {
+        let state = fixture_state();
+        {
+            let mut s = state.settings.write().unwrap();
+            s.auth.enabled = true;
+            s.auth.fleet_token = Some("secret-fleet-123".into());
+        }
+
+        // 1. Without credentials -> unauthorized
+        let headers_unauth = HeaderMap::new();
+        let ws_unauth = WsSession::from_state(&state, &headers_unauth);
+        assert!(!ws_unauth.authorized());
+
+        // 2. With Bearer token matching fleet_token -> authorized
+        let mut headers_bearer = HeaderMap::new();
+        headers_bearer.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer secret-fleet-123"));
+        let ws_bearer = WsSession::from_state(&state, &headers_bearer);
+        assert!(ws_bearer.authorized());
+
+        // 3. With X-Auth-Token matching fleet_token -> authorized
+        let mut headers_xauth = HeaderMap::new();
+        headers_xauth.insert("X-Auth-Token", HeaderValue::from_static("secret-fleet-123"));
+        let ws_xauth = WsSession::from_state(&state, &headers_xauth);
+        assert!(ws_xauth.authorized());
+
+        // 4. With wrong token -> unauthorized
+        let mut headers_wrong = HeaderMap::new();
+        headers_wrong.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer wrong-token"));
+        let ws_wrong = WsSession::from_state(&state, &headers_wrong);
+        assert!(!ws_wrong.authorized());
+
+        // 5. get_login_info surfaces authenticated: true when fleet_token is valid
+        let login_resp = get_login_info(State(state.clone()), headers_bearer).await.into_response();
+        assert_eq!(login_resp.status(), StatusCode::OK);
     }
 }

@@ -521,12 +521,12 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     const currentCfg = configsRef.current.find((c) => c.file === cfg.file) ?? cfg
     const saveRevision = currentCfg.revision ?? 0
 
-    const results = await runMassTask(targets, async (_id, baseUrl) => {
+    const results = await runMassTask(targets, async (_id, baseUrl, target) => {
       const result = await apiCall<{ success: boolean; error?: string }>(
         'PUT',
         'configs',
         { file: cfg.file, content },
-        { baseUrl }
+        { baseUrl, token: target?.token }
       )
       if (!result.success) throw new Error(result.error || 'ошибка сохранения')
     })
@@ -638,11 +638,11 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       : 'hardRestart'
   }
 
-  async function applyToHost(baseUrl: string | null, cfg: Config, content: string) {
+  async function applyToHost(baseUrl: string | null, cfg: Config, content: string, token?: string | null) {
     let core = currentCore
     if (baseUrl) {
       try {
-        const ctrl = await apiCall<{ success?: boolean; currentCore?: string }>('GET', 'control', undefined, { baseUrl })
+        const ctrl = await apiCall<{ success?: boolean; currentCore?: string }>('GET', 'control', undefined, { baseUrl, token })
         if (ctrl?.currentCore) core = ctrl.currentCore
       } catch {
         /* keep local core */
@@ -653,7 +653,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       'PUT',
       buildApplyUrl(cfg.file, core),
       { file: cfg.file, content },
-      { baseUrl }
+      { baseUrl, token }
     )
     if (!saveResult.success) {
       throw new Error(
@@ -663,7 +663,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       )
     }
     const action = restartActionFor(cfg, content)
-    const r = await apiCall<{ success: boolean; error?: string }>('POST', 'control', { action, core }, { baseUrl })
+    const r = await apiCall<{ success: boolean; error?: string }>('POST', 'control', { action, core }, { baseUrl, token })
     if (!r?.success) throw new Error(r?.error || 'ошибка перезапуска')
   }
 
@@ -672,8 +672,8 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     const saveRevision = currentCfg.revision ?? 0
 
     dispatch({ type: 'SET_SERVICE_STATUS', status: 'pending', pendingText: 'Применение...' })
-    const results = await runMassTask(targets, async (_id, baseUrl) => {
-      await applyToHost(baseUrl, cfg, content)
+    const results = await runMassTask(targets, async (_id, baseUrl, target) => {
+      await applyToHost(baseUrl, cfg, content, target?.token)
     })
 
     const localTarget = targets.find((t) => t.id === LOCAL_ROUTER_ID)
@@ -754,8 +754,8 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   }
 
   async function executeQuickBackup(targets: readonly RouterTarget[]) {
-    const results = await runMassTask(targets, async (_id, baseUrl) => {
-      const result = await apiCall<{ success: boolean; error?: string }>('PUT', 'backup', undefined, { baseUrl })
+    const results = await runMassTask(targets, async (_id, baseUrl, target) => {
+      const result = await apiCall<{ success: boolean; error?: string }>('PUT', 'backup', undefined, { baseUrl, token: target?.token })
       if (!result.success) throw new Error(result.error || 'ошибка бэкапа')
     })
     const summary = summarizeFanOut(results)

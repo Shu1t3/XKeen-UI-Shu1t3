@@ -17,10 +17,9 @@ import { fetchClashProxies, useAppActions } from '../../lib/store'
 import { cn } from '../../lib/utils'
 import { ReadOnlyYamlView } from '../configuration/editor/ReadOnlyYamlView'
 
-const providerContentCache = new Map<string, string>()
-const DIALOG_CLOSE_ANIMATION_MS = 220
+import { invalidateProviderContentCache, providerContentCache, type ProvidersModalKind } from '../../lib/providersCache'
 
-type ProvidersModalKind = 'rules' | 'proxies'
+const DIALOG_CLOSE_ANIMATION_MS = 220
 
 interface Props {
   open: boolean
@@ -330,7 +329,7 @@ export function ProvidersModal({ open, kind, clashApiPort, clashApiSecret, clash
         await fetchClashProxies(clashApiPort, clashApiSecret, true, clashApiUnix ?? null)
       }
       await loadProviders(true)
-      providerContentCache.delete(`${kind}:${name}`)
+      invalidateProviderContentCache(kind, name)
       showToast(`Провайдер ${name} обновлён`)
     } catch (e) {
       showToast(`Не удалось обновить ${name}: ${e instanceof Error ? e.message : 'неизвестная ошибка'}`, 'error')
@@ -342,21 +341,40 @@ export function ProvidersModal({ open, kind, clashApiPort, clashApiSecret, clash
   async function updateAllProviders() {
     if (!httpProviderNames.length) return
     setUpdatingAll(true)
+    let updatedCount = 0
+    let failedCount = 0
     try {
-      await Promise.all(
-        httpProviderNames.map((name) =>
-          clashFetch(clashApiPort, `providers/${kind}/${encodeURIComponent(name)}`, {
+      const results = await Promise.allSettled(
+        httpProviderNames.map(async (name) => {
+          await clashFetch(clashApiPort, `providers/${kind}/${encodeURIComponent(name)}`, {
             method: 'PUT',
             secret: clashApiSecret,
             unix: clashApiUnix ?? null,
           })
-        )
+          invalidateProviderContentCache(kind, name)
+          return name
+        })
       )
-      if (kind === 'proxies') {
+
+      for (const res of results) {
+        if (res.status === 'fulfilled') {
+          updatedCount++
+        } else {
+          failedCount++
+        }
+      }
+
+      if (kind === 'proxies' && updatedCount > 0) {
         await fetchClashProxies(clashApiPort, clashApiSecret, true, clashApiUnix ?? null)
       }
       await loadProviders(true)
-      showToast(kind === 'proxies' ? 'Провайдеры прокси обновлены' : 'Провайдеры правил обновлены')
+      if (failedCount === 0) {
+        showToast(kind === 'proxies' ? 'Провайдеры прокси обновлены' : 'Провайдеры правил обновлены')
+      } else if (updatedCount > 0) {
+        showToast(`Обновлено ${updatedCount} из ${httpProviderNames.length} провайдеров (${failedCount} с ошибкой)`, 'error')
+      } else {
+        showToast('Не удалось обновить провайдеры', 'error')
+      }
     } catch (e) {
       showToast(`Ошибка обновления: ${e instanceof Error ? e.message : 'неизвестная ошибка'}`, 'error')
     } finally {

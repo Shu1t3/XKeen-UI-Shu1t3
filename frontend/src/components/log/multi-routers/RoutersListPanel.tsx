@@ -64,7 +64,7 @@ export function RoutersListPanel() {
     ...routers.map((r) => ({
       id: routerId(r),
       title: routerLabel(r),
-      subtitle: `${r.host}:${r.port}`,
+      subtitle: `${r.protocol === 'https' ? 'https' : 'http'}://${r.host}:${r.port}${r.token ? ' • токен' : ''}`,
     })),
   ]
 
@@ -83,7 +83,7 @@ export function RoutersListPanel() {
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
           {rows.map((row) => {
             const checked = applyTargets.includes(row.id)
-            const selectable = isRouterSelectable(row.id, online, auth)
+            const selectable = isRouterSelectable(row.id, online, auth, routers)
             return (
               <div
                 key={row.id}

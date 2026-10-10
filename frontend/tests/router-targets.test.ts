@@ -95,3 +95,53 @@ test('mixed selection executes only the explicit surviving local target', async 
   expect(await runMassTask(targets, writeConfig)).toMatchObject([{ id: 'local', ok: true }, { id, ok: false }])
   expect(requests).toEqual(['/api/configs'])
 })
+
+test('R03: HTTPS protocol produces secure base URL and is reflected in store', () => {
+  const httpsRemote = { host: 'keenetic.local', port: 1000, name: 'SecureRouter', protocol: 'https' as const, token: 'sec-tok-123' }
+  const httpsId = routerId(httpsRemote)
+  useRoutersStore.getState().setRouters([httpsRemote])
+  expect(getBaseUrlForId(httpsId)).toBe('https://keenetic.local:1000')
+})
+
+test('R03: apiCall forwards Authorization header when token is supplied', async () => {
+  let capturedHeaders: HeadersInit | undefined
+  globalThis.fetch = (async (_input, init) => {
+    capturedHeaders = init?.headers
+    return Response.json({ success: true })
+  }) as typeof fetch
+
+  await apiCall('GET', 'version', undefined, { baseUrl: 'https://keenetic.local:1000', token: 'my-fleet-token' })
+  expect((capturedHeaders as Record<string, string>)?.['Authorization']).toBe('Bearer my-fleet-token')
+})
+
+test('R03: isRouterSelectable and filterAuthBlockedTargets allow remote with token', async () => {
+  const authedRemote = { host: '192.0.2.10', port: 1000, name: 'AuthedRouter', token: 'token-abc' }
+  const unauthedRemote = { host: '192.0.2.11', port: 1000, name: 'UnauthedRouter' }
+  const authedId = routerId(authedRemote)
+  const unauthedId = routerId(unauthedRemote)
+
+  const routers = [authedRemote, unauthedRemote]
+  const online = { [authedId]: true, [unauthedId]: true }
+  const auth = { [authedId]: true, [unauthedId]: true }
+
+  // authedRemote has token -> selectable; unauthedRemote has no token -> not selectable
+  const { isRouterSelectable: checkSelectable } = await import('../src/lib/multi-routers/model')
+  expect(checkSelectable(authedId, online, auth, routers)).toBe(true)
+  expect(checkSelectable(unauthedId, online, auth, routers)).toBe(false)
+
+  // Test filterAuthBlockedTargets:
+  globalThis.fetch = (async (_input, init) => {
+    const authHeader = (init?.headers as Record<string, string> | undefined)?.['Authorization']
+    // If token is provided, probe succeeds with authenticated: true
+    const isAuthenticated = authHeader === 'Bearer token-abc'
+    return Response.json({ enabled: true, authenticated: isAuthenticated })
+  }) as typeof fetch
+
+  const targets = [
+    { id: authedId, baseUrl: 'http://192.0.2.10:1000', token: 'token-abc', label: 'Authed' },
+    { id: unauthedId, baseUrl: 'http://192.0.2.11:1000', token: null, label: 'Unauthed' },
+  ]
+  const { allowed, blocked } = await filterAuthBlockedTargets(targets)
+  expect(allowed.map((t) => t.id)).toEqual([authedId])
+  expect(blocked.map((t) => t.id)).toEqual([unauthedId])
+})

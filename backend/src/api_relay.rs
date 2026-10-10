@@ -441,13 +441,15 @@ mod tests {
     fn fixture_state() -> AppState {
         use std::sync::{Arc, RwLock};
         let (log_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut settings = crate::types::AppSettings::default();
+        settings.auth.enabled = false;
         AppState {
             core: Arc::new(RwLock::new(crate::types::CoreInfo {
                 name: "mihomo".into(),
                 conf_dir: String::new(),
                 is_json: false,
             })),
-            settings: Arc::new(RwLock::new(crate::types::AppSettings::default())),
+            settings: Arc::new(RwLock::new(settings)),
             init_file: Arc::new(RwLock::new(None)),
             http_client: reqwest::Client::new(),
             update_checker: Default::default(),
