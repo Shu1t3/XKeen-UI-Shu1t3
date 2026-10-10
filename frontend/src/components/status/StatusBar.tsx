@@ -46,7 +46,7 @@ async function applyAutoDns(setupFilter: boolean) {
   const yamlConfig = configsResult.success ? configsResult.configs?.find((c) => c.file.endsWith('/config.yaml')) : undefined
   if (!yamlConfig) return
   const configContent = ensureDnsEnabled(yamlConfig.content, DEFAULT_DNS_CONFIG)
-  await apiCall('POST', 'dns', { config_content: configContent, setup_filter: setupFilter })
+  await apiCall('POST', 'dns', { config_file: yamlConfig.file, config_content: configContent, setup_filter: setupFilter })
 }
 
 async function persistDnsEnabled(enabled: boolean) {
@@ -209,13 +209,13 @@ export function StatusBar({
   async function disableDnsAndStop() {
     setPending('Остановка...')
     try {
-      await persistDnsEnabled(false)
       const result = await apiCall<{ success: boolean; error?: string }>('DELETE', 'dns', {})
       if (result.success) {
         showToast('Управление DNS отключено')
       } else {
         showToast(`Ошибка DNS: ${result.error}`, 'error')
       }
+      await persistDnsEnabled(false)
     } catch {
       showToast('Ошибка отключения DNS', 'error')
     }

@@ -442,10 +442,11 @@ pub fn restore_backup_sync_with_paths_and_hook(
         let entry_path = entry.path().map_err(io_error)?;
         let relative =
             normalize_entry_path(entry_path.as_ref()).map_err(|e| format!("невалидный путь в архиве: {e}"))?;
-        let category = detect_content_key_with_paths(&relative, paths)
+        let (category, _) = parse_archive_entry_category_and_name(&relative, paths)
             .ok_or_else(|| format!("недопустимый путь в архиве: {relative}"))?;
         let target = archive_relative_to_target_with_paths(&relative, paths)
             .ok_or_else(|| format!("недопустимый путь в архиве: {relative}"))?;
+        validate_target_boundary(&target, category, paths)?;
 
         let mut data = Vec::new();
         entry.read_to_end(&mut data).map_err(io_error)?;
@@ -577,6 +578,18 @@ pub fn restore_backup_sync_with_paths_and_hook(
             f.sync_all()?;
 
             let backup_path = if entry.target.is_file() {
+                if let Ok(meta) = fs::symlink_metadata(&entry.target)
+                    && meta.file_type().is_symlink()
+                {
+                    let resolved = fs::canonicalize(&entry.target)?;
+                    let resolved_parent = fs::canonicalize(entry.target.parent().unwrap())?;
+                    if !resolved.starts_with(&resolved_parent) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("symlink points outside directory: {}", entry.target.display()),
+                        ));
+                    }
+                }
                 let backup_path = stage_dir.join("rollback").join(file_name);
                 fs::copy(&entry.target, &backup_path)?;
                 File::open(&backup_path)?.sync_all()?;
@@ -594,6 +607,18 @@ pub fn restore_backup_sync_with_paths_and_hook(
             let backup_path = stage_dir
                 .join("rollback")
                 .join(format!("rm_{}", file_name.to_string_lossy()));
+            if let Ok(meta) = fs::symlink_metadata(remove_target)
+                && meta.file_type().is_symlink()
+            {
+                let resolved = fs::canonicalize(remove_target)?;
+                let resolved_parent = fs::canonicalize(parent)?;
+                if !resolved.starts_with(&resolved_parent) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("symlink points outside directory: {}", remove_target.display()),
+                    ));
+                }
+            }
             fs::copy(remove_target, &backup_path)?;
             File::open(&backup_path)?.sync_all()?;
             staged_removes.push((remove_target.clone(), backup_path));
@@ -793,11 +818,31 @@ fn collect_files_in_dir(dir: &Path, exts: &[&str]) -> io::Result<Vec<PathBuf>> {
         Err(e) => return Err(e),
     };
 
+    let canonical_dir = fs::canonicalize(dir).ok();
+
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() && matches_extension(&path, exts) {
-            files.push(path);
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            if let Ok(resolved) = fs::canonicalize(&path) {
+                if let Some(ref cdir) = canonical_dir
+                    && !resolved.starts_with(cdir)
+                {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else if !file_type.is_file() {
+            continue;
+        }
+
+        if matches_extension(&path, exts) {
+            let fname = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+            if !fname.starts_with('.') {
+                files.push(path);
+            }
         }
     }
     files.sort();
@@ -813,7 +858,7 @@ fn matches_extension(path: &Path, exts: &[&str]) -> bool {
 fn to_archive_relative(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
-        .trim_start_matches('/')
+        .trim_matches('/')
         .to_string()
 }
 
@@ -873,9 +918,11 @@ fn validate_backup_entries_with_paths(path: &Path, paths: &BackupPaths) -> Resul
         let entry_path = entry.path().map_err(io_error)?;
         let relative =
             normalize_entry_path(entry_path.as_ref()).map_err(|e| format!("невалидный путь в архиве: {e}"))?;
-        if archive_relative_to_target_with_paths(&relative, paths).is_none() {
-            return Err(format!("недопустимый путь в архиве: {relative}"));
-        }
+        let (category, _) = parse_archive_entry_category_and_name(&relative, paths)
+            .ok_or_else(|| format!("недопустимый путь в архиве: {relative}"))?;
+        let target = archive_relative_to_target_with_paths(&relative, paths)
+            .ok_or_else(|| format!("недопустимый путь в архиве: {relative}"))?;
+        validate_target_boundary(&target, category, paths)?;
         if !seen.insert(relative) {
             return Err("архив содержит дубликаты файлов".into());
         }
@@ -889,12 +936,76 @@ fn validate_backup_entries_with_paths(path: &Path, paths: &BackupPaths) -> Resul
     Ok(())
 }
 
+fn validate_target_boundary(target: &Path, category: &'static str, paths: &BackupPaths) -> Result<(), String> {
+    let expected_dir = match category {
+        "xkeen-ui" => paths
+            .app_config
+            .parent()
+            .ok_or_else(|| "некорректный путь к app_config".to_string())?,
+        "xkeen" => paths.xkeen_dir.as_path(),
+        "xray" => paths.xray_dir.as_path(),
+        "mihomo" => paths.mihomo_dir.as_path(),
+        _ => return Err(format!("неизвестная категория: {category}")),
+    };
+
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| format!("целевой путь не имеет родительского каталога: {}", target.display()))?;
+    if target_parent != expected_dir {
+        return Err(format!(
+            "целевой путь {} находится вне ожидаемого каталога {}",
+            target.display(),
+            expected_dir.display()
+        ));
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(target)
+        && meta.file_type().is_symlink()
+    {
+        let canonical_target = fs::canonicalize(target).map_err(|e| {
+            format!(
+                "символическая ссылка {} повреждена или не может быть разрешена: {e}",
+                target.display()
+            )
+        })?;
+        let canonical_dir = fs::canonicalize(expected_dir).map_err(|e| {
+            format!(
+                "не удалось разрешить канонический путь каталога {}: {e}",
+                expected_dir.display()
+            )
+        })?;
+        let is_legacy_config = category == "xkeen-ui"
+            && fs::canonicalize(crate::types::APP_CONFIG_LEGACY)
+                .map(|c| c == canonical_target)
+                .unwrap_or(false);
+        if !canonical_target.starts_with(&canonical_dir) && !is_legacy_config {
+            return Err(format!(
+                "символическая ссылка {} указывает за пределы разрешённого каталога: {}",
+                target.display(),
+                canonical_target.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_entry_path(path: &Path) -> Result<String, &'static str> {
+    let raw = path.to_string_lossy();
+    if raw.contains('\\') || raw.contains('\0') {
+        return Err("обнаружен запрещённый компонент пути");
+    }
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
+            Component::Normal(value) => {
+                let s = value.to_string_lossy();
+                if s.is_empty() || s == "." || s == ".." {
+                    return Err("обнаружен запрещённый компонент пути");
+                }
+                parts.push(s.to_string());
+            }
             _ => return Err("обнаружен запрещённый компонент пути"),
         }
     }
@@ -904,9 +1015,77 @@ fn normalize_entry_path(path: &Path) -> Result<String, &'static str> {
     Ok(parts.join("/"))
 }
 
+fn parse_archive_entry_category_and_name<'a>(
+    relative: &'a str,
+    paths: &BackupPaths,
+) -> Option<(&'static str, &'a str)> {
+    let app_rel = to_archive_relative(&paths.app_config);
+    if relative == app_rel
+        || relative == "opt/etc/xkeen/xkeen-ui.json"
+        || relative == "opt/share/www/XKeen-UI/config.json"
+    {
+        let filename = Path::new(relative).file_name().and_then(|v| v.to_str())?;
+        return Some(("xkeen-ui", filename));
+    }
+
+    if let Some(filename) = match_dir_entry(relative, &paths.xkeen_dir, "opt/etc/xkeen", &["lst", "json"])
+        && filename != "xkeen-ui.json"
+        && filename != "config.json"
+    {
+        return Some(("xkeen", filename));
+    }
+
+    if let Some(filename) = match_dir_entry(relative, &paths.xray_dir, "opt/etc/xray/configs", &["json"]) {
+        return Some(("xray", filename));
+    }
+
+    if let Some(filename) = match_dir_entry(relative, &paths.mihomo_dir, "opt/etc/mihomo", &["yaml", "yml"]) {
+        return Some(("mihomo", filename));
+    }
+
+    None
+}
+
+fn match_dir_entry<'a>(
+    relative: &'a str,
+    dir: &Path,
+    alt_prefix: &str,
+    exts: &[&str],
+) -> Option<&'a str> {
+    let rel_path = Path::new(relative);
+    let prefix = to_archive_relative(dir);
+
+    let check_prefix = |p: &str| -> Option<&'a str> {
+        let prefix_clean = p.replace('\\', "/");
+        let prefix_clean = prefix_clean.trim_matches('/');
+        if prefix_clean.is_empty() {
+            return None;
+        }
+        let prefix_path = Path::new(prefix_clean);
+        let remainder = rel_path.strip_prefix(prefix_path).ok()?;
+        let mut comps = remainder.components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(fname_os)), None) => {
+                let fname = fname_os.to_str()?;
+                if !fname.is_empty()
+                    && !fname.starts_with('.')
+                    && !fname.contains('/')
+                    && !fname.contains('\\')
+                    && matches_file_name(fname, exts)
+                {
+                    return Some(fname);
+                }
+                None
+            }
+            _ => None,
+        }
+    };
+
+    check_prefix(&prefix).or_else(|| check_prefix(alt_prefix))
+}
+
 fn archive_relative_to_target_with_paths(relative: &str, paths: &BackupPaths) -> Option<PathBuf> {
-    let category = detect_content_key_with_paths(relative, paths)?;
-    let filename = Path::new(relative).file_name()?.to_str()?;
+    let (category, filename) = parse_archive_entry_category_and_name(relative, paths)?;
     match category {
         "xkeen-ui" => Some(paths.app_config.clone()),
         "xkeen" => Some(paths.xkeen_dir.join(filename)),
@@ -917,45 +1096,7 @@ fn archive_relative_to_target_with_paths(relative: &str, paths: &BackupPaths) ->
 }
 
 fn detect_content_key_with_paths(relative: &str, paths: &BackupPaths) -> Option<&'static str> {
-    let app_rel = to_archive_relative(&paths.app_config);
-    if relative == app_rel
-        || relative == "opt/etc/xkeen/xkeen-ui.json"
-        || relative == "opt/share/www/XKeen-UI/config.json"
-    {
-        return Some("xkeen-ui");
-    }
-
-    let check_dir = |dir: &Path, alt_prefix: &str, exts: &[&str]| -> bool {
-        let prefix = to_archive_relative(dir);
-        let check_one = |p: &str| -> Option<bool> {
-            let rest = relative.strip_prefix(p)?;
-            if let Some(name) = rest.strip_prefix('/')
-                && !name.contains('/')
-                && matches_file_name(name, exts)
-            {
-                return Some(true);
-            }
-            None
-        };
-        check_one(&prefix).or_else(|| check_one(alt_prefix)).unwrap_or(false)
-    };
-
-    if check_dir(&paths.xkeen_dir, "opt/etc/xkeen", &["lst", "json"]) {
-        let name = Path::new(relative).file_name().and_then(|v| v.to_str()).unwrap_or("");
-        if name != "xkeen-ui.json" && name != "config.json" {
-            return Some("xkeen");
-        }
-    }
-    if check_dir(&paths.xray_dir, "opt/etc/xray/configs", &["json"])
-        || check_dir(&paths.xray_dir, "opt/etc/xray", &["json"])
-    {
-        return Some("xray");
-    }
-    if check_dir(&paths.mihomo_dir, "opt/etc/mihomo", &["yaml", "yml"]) {
-        return Some("mihomo");
-    }
-
-    None
+    parse_archive_entry_category_and_name(relative, paths).map(|(cat, _)| cat)
 }
 
 fn matches_file_name(name: &str, exts: &[&str]) -> bool {
@@ -1013,12 +1154,16 @@ fn content_label(content: &str) -> &'static str {
     }
 }
 
-fn content_file_name_with_paths(_key: &str, relative: &str, _paths: &BackupPaths) -> String {
-    Path::new(relative)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or(relative)
-        .to_string()
+fn content_file_name_with_paths(_key: &str, relative: &str, paths: &BackupPaths) -> String {
+    parse_archive_entry_category_and_name(relative, paths)
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| {
+            Path::new(relative)
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or(relative)
+                .to_string()
+        })
 }
 
 fn restore_log_message(backup_path: &Path, requested_contents: &Option<HashSet<&'static str>>) -> String {
@@ -1367,6 +1512,7 @@ mod tests {
             log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(Mutex::new(())),
+            enrollment_lock: Arc::new(Mutex::new(())),
             debug: false,
             rci_token: Arc::new(RwLock::new(Some("old_token".into()))),
         };
@@ -1425,5 +1571,153 @@ mod tests {
         assert_eq!(state.settings.read().unwrap().auth.session_ids, vec!["new_session_id"]);
         assert_eq!(*state.rci_token.read().unwrap(), Some("restored_rci_token_123".into()));
         assert_eq!(*auth_rx.borrow_and_update(), 1);
+    }
+
+    #[test]
+    fn r22_tar_allowlist_rejects_paths_without_directory_boundary() {
+        let fixture = TestFixture::new();
+
+        // Direct path normalization boundary tests
+        assert!(normalize_entry_path(Path::new("opt/etc/xkeen/../outside.json")).is_err());
+        assert!(normalize_entry_path(Path::new("/opt/etc/xkeen/outside.json")).is_err());
+        assert!(normalize_entry_path(Path::new("opt/etc/xkeen\\outside.json")).is_err());
+        assert!(normalize_entry_path(Path::new("opt/etc/xkeen\0outside.json")).is_err());
+
+        let malicious_paths = [
+            "opt/etc/xkeen-extra.json",
+            "opt/etc/mihomo-extra.yaml",
+            "opt/etc/xray/configs-extra.json",
+            "opt/etc/xray/extra.json",
+            "opt/etc/xkeen/sub/extra.json",
+            "opt/etc/xkeen/.hidden.json",
+            "opt/etc/xkeen/test.txt",
+        ];
+
+        for &bad_rel in &malicious_paths {
+            let tar_name = format!("malicious_{}_{}", uuid::Uuid::new_v4(), BACKUP_SUFFIX);
+            let tar_path = fixture.paths.backup_dir.join(&tar_name);
+            let file = File::create(&tar_path).unwrap();
+            let mut builder = Builder::new(file);
+
+            let data = b"{\"payload\": true}";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, bad_rel, &data[..]).unwrap();
+            builder.finish().unwrap();
+
+            let validate_res = validate_backup_entries_with_paths(&tar_path, &fixture.paths);
+            assert!(
+                validate_res.is_err(),
+                "validate_backup_entries_with_paths unexpectedly accepted path '{bad_rel}'"
+            );
+
+            let restore_res = restore_backup_sync_with_paths_and_hook(
+                &fixture.paths,
+                &tar_name,
+                None,
+                |_| Ok(()),
+            );
+            assert!(
+                restore_res.is_err(),
+                "restore_backup_sync unexpectedly accepted path '{bad_rel}'"
+            );
+        }
+    }
+
+    #[test]
+    fn r22_restore_rejects_symlink_target_pointing_outside_directory() {
+        let fixture = TestFixture::new();
+
+        // Create an outside secret file
+        let outside_dir = std::env::temp_dir().join(format!("xkeen-outside-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("secret.conf");
+        fs::write(&outside_file, b"TOP_SECRET_DO_NOT_OVERWRITE").unwrap();
+
+        // Create a symlink in xray_dir pointing outside to secret.conf
+        let symlink_path = fixture.paths.xray_dir.join("01_main.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &symlink_path).unwrap();
+
+        // Prepare a valid backup targeting 01_main.json
+        let tar_name = format!("valid_{}_{}", uuid::Uuid::new_v4(), BACKUP_SUFFIX);
+        let tar_path = fixture.paths.backup_dir.join(&tar_name);
+        let file = File::create(&tar_path).unwrap();
+        let mut builder = Builder::new(file);
+
+        let data = b"{\"xray_config\": 1}";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let rel = to_archive_relative(&fixture.paths.xray_dir.join("01_main.json"));
+        builder.append_data(&mut header, rel, &data[..]).unwrap();
+        builder.finish().unwrap();
+
+        #[cfg(unix)]
+        {
+            let res = restore_backup_sync_with_paths_and_hook(
+                &fixture.paths,
+                &tar_name,
+                Some(vec!["xray".into()]),
+                |_| Ok(()),
+            );
+
+            assert!(res.is_err(), "restore should reject target that is a symlink pointing outside");
+            let err = res.unwrap_err();
+            assert!(
+                err.contains("символическая ссылка") && err.contains("указывает за пределы"),
+                "unexpected error message: {err}"
+            );
+
+            // Outside file was completely untouched!
+            assert_eq!(
+                fs::read_to_string(&outside_file).unwrap(),
+                "TOP_SECRET_DO_NOT_OVERWRITE"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&outside_dir);
+    }
+
+    #[test]
+    fn r22_snapshot_contract_ignores_external_symlinks_in_managed_directory() {
+        let fixture = TestFixture::new();
+
+        // Create normal backup with 01_main.json
+        fs::write(fixture.paths.xray_dir.join("01_main.json"), b"{\"v\": 1}").unwrap();
+        let backup = create_backup_sync_with_paths(&fixture.paths, 0).unwrap();
+
+        // Place an external secret file and create a symlink in xray_dir
+        let outside_dir = std::env::temp_dir().join(format!("xkeen-outside-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("secret_to_delete.json");
+        fs::write(&outside_file, b"KEEP_ME_SAFE").unwrap();
+
+        let symlink_path = fixture.paths.xray_dir.join("99_external.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &symlink_path).unwrap();
+
+        // Restore category xray
+        #[cfg(unix)]
+        {
+            let res = restore_backup_sync_with_paths_and_hook(
+                &fixture.paths,
+                &backup.name,
+                Some(vec!["xray".into()]),
+                |_| Ok(()),
+            );
+            assert!(res.is_ok(), "restore should succeed: {:?}", res.err());
+
+            // The external file was NOT deleted or overwritten!
+            assert_eq!(
+                fs::read_to_string(&outside_file).unwrap(),
+                "KEEP_ME_SAFE"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&outside_dir);
     }
 }

@@ -9,7 +9,9 @@ pub const APP_CONFIG: &str = opt_path!("/etc/xkeen/xkeen-ui.json");
 pub const APP_CONFIG_LEGACY: &str = opt_path!("/share/www/XKeen-UI/config.json");
 pub const DEFAULT_ACCESS_LOG: &str = opt_path!("/var/log/xray/access.log");
 pub const DEFAULT_ERROR_LOG: &str = opt_path!("/var/log/xray/error.log");
+pub const DNS_SNAPSHOT_FILE: &str = opt_path!("/etc/xkeen/dns-snapshot.json");
 pub const MIHOMO_CONF_DIR: &str = opt_path!("/etc/mihomo");
+pub const MIHOMO_CONFIG_FILE: &str = opt_path!("/etc/mihomo/config.yaml");
 pub const S24XRAY: &str = opt_path!("/etc/init.d/S24xray");
 pub const S99XKEEN: &str = opt_path!("/etc/init.d/S99xkeen");
 pub const S99XKEEN_UI: &str = opt_path!("/etc/init.d/S99xkeen-ui");
@@ -113,6 +115,7 @@ pub struct AppState {
     pub log_watcher: Arc<std::sync::Mutex<LogWatcherState>>,
     pub auth_changes: tokio::sync::watch::Sender<u64>,
     pub app_config_lock: Arc<Mutex<()>>,
+    pub enrollment_lock: Arc<Mutex<()>>,
     pub debug: bool,
     pub rci_token: Arc<RwLock<Option<String>>>,
 }
@@ -244,6 +247,12 @@ pub struct PluginsSettings {
     pub routers: Vec<RemoteRouter>,
 }
 
+#[derive(Clone, Serialize, Deserialize, Default, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct DnsSettings {
+    pub corporate_fallback: Vec<String>,
+}
+
 #[derive(Clone, Serialize, Default)]
 pub struct AppSettings {
     pub gui: GuiSettings,
@@ -253,6 +262,8 @@ pub struct AppSettings {
     pub append_config_paths: AppendConfigPaths,
     pub auth: AuthSettings,
     pub plugins: PluginsSettings,
+    #[serde(default)]
+    pub dns: DnsSettings,
 }
 
 impl<'de> Deserialize<'de> for AppSettings {
@@ -276,6 +287,8 @@ impl<'de> Deserialize<'de> for AppSettings {
             auth: AuthSettings,
             #[serde(default)]
             plugins: PluginsSettings,
+            #[serde(default)]
+            dns: DnsSettings,
             #[serde(rename = "timezoneOffset")]
             legacy_tz: Option<i32>,
         }
@@ -291,6 +304,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             append_config_paths: raw.append_config_paths,
             auth: raw.auth,
             plugins: raw.plugins,
+            dns: raw.dns,
         })
     }
 }

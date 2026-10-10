@@ -34,7 +34,7 @@ use yaml_rust2::yaml::Hash as YamlHash;
 
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Behavior {
     Domain,
     IpCidr,
@@ -48,6 +48,29 @@ impl Behavior {
             Behavior::IpCidr => "ipcidr",
             Behavior::Classical => "classical",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ProviderFormat {
+    Yaml,
+    Text,
+    Mrs,
+}
+
+impl ProviderFormat {
+    pub(crate) fn from_str(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("mrs") || s.eq_ignore_ascii_case("mrsrule") {
+            ProviderFormat::Mrs
+        } else if s.eq_ignore_ascii_case("text") {
+            ProviderFormat::Text
+        } else {
+            ProviderFormat::Yaml
+        }
+    }
+
+    pub(crate) fn is_mrs(self) -> bool {
+        matches!(self, ProviderFormat::Mrs)
     }
 }
 
@@ -446,23 +469,25 @@ pub(crate) enum ParsedProvider {
     Classical(ClassicalProvider),
 }
 
-fn parse_provider_content(content: &str, behavior: Behavior) -> Result<ParsedProvider, String> {
-    let trimmed = content.trim_start();
-    let looks_like_yaml_key = trimmed.starts_with("payload:") || trimmed.starts_with("rules:");
-    if looks_like_yaml_key
-        && let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(content)
-        && let Some(doc) = docs.first()
-    {
-        let arr = if !doc["payload"].is_badvalue() {
-            doc["payload"].as_vec()
-        } else {
-            doc["rules"].as_vec()
-        };
-        if let Some(arr) = arr {
-            // `v.as_str()` заимствует из `doc`/`docs` — они живут только до конца этого блока,
-            // поэтому строки разбираются в структуры (которые копируют нужные байты в свои арены)
-            // прямо здесь же, не выходя за пределы области видимости `docs`.
-            return build_from_lines(arr.iter().filter_map(|v| v.as_str()), behavior);
+fn parse_provider_content(content: &str, behavior: Behavior, format: ProviderFormat) -> Result<ParsedProvider, String> {
+    if !matches!(format, ProviderFormat::Text | ProviderFormat::Mrs) {
+        let trimmed = content.trim_start();
+        let looks_like_yaml_key = trimmed.starts_with("payload:") || trimmed.starts_with("rules:");
+        if looks_like_yaml_key
+            && let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(content)
+            && let Some(doc) = docs.first()
+        {
+            let arr = if !doc["payload"].is_badvalue() {
+                doc["payload"].as_vec()
+            } else {
+                doc["rules"].as_vec()
+            };
+            if let Some(arr) = arr {
+                // `v.as_str()` заимствует из `doc`/`docs` — они живут только до конца этого блока,
+                // поэтому строки разбираются в структуры (которые копируют нужные байты в свои арены)
+                // прямо здесь же, не выходя за пределы области видимости `docs`.
+                return build_from_lines(arr.iter().filter_map(|v| v.as_str()), behavior);
+            }
         }
     }
     let lines = content
@@ -551,7 +576,7 @@ enum Vehicle {
 
 pub(crate) struct ProviderDef {
     pub(crate) behavior: Behavior,
-    format_mrs: bool,
+    pub(crate) format: ProviderFormat,
     vehicle: Vehicle,
 }
 
@@ -580,8 +605,8 @@ pub(crate) fn parse_provider_defs(rule_providers: &Yaml, base_dir: &Path) -> Has
         }) else {
             continue;
         };
-        let format = get("format").unwrap_or_default();
-        let format_mrs = format.eq_ignore_ascii_case("mrs");
+        let format_raw = get("format").unwrap_or_default();
+        let format = ProviderFormat::from_str(&format_raw);
 
         let vtype = get("type").unwrap_or_default();
         let vehicle = match vtype.as_str() {
@@ -628,7 +653,7 @@ pub(crate) fn parse_provider_defs(rule_providers: &Yaml, base_dir: &Path) -> Has
             name.to_string(),
             ProviderDef {
                 behavior,
-                format_mrs,
+                format,
                 vehicle,
             },
         );
@@ -636,39 +661,56 @@ pub(crate) fn parse_provider_defs(rule_providers: &Yaml, base_dir: &Path) -> Has
     out
 }
 
-/// Кэш разобранных провайдеров по (путь, mtime) — общий `IdleCache` (см. `idle_cache.rs`), тот же,
-/// что и `geodb.rs` использует для `.dat`/`.mmdb`. Смена mtime сама даёт промах (новый ключ), фоновый
-/// реапер вытесняет записи без обращений 5 минут.
-type ProviderCacheKey = (PathBuf, SystemTime);
+/// Кэш разобранных провайдеров по (путь, mtime, behavior, format) — общий `IdleCache` (см. `idle_cache.rs`),
+/// тот же, что и `geodb.rs` использует для `.dat`/`.mmdb`. Смена mtime сама даёт промах (новый ключ),
+/// разные behavior/format для одного файла не конфликтуют, фоновый реапер вытесняет записи без
+/// обращений 5 минут. При смене конфигурации кэш очищается через `clear_provider_cache`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProviderCacheKey {
+    pub(crate) path: PathBuf,
+    pub(crate) mtime: SystemTime,
+    pub(crate) behavior: Behavior,
+    pub(crate) format: ProviderFormat,
+}
+
 static PROVIDER_CACHE: LazyLock<IdleCache<ProviderCacheKey, ParsedProvider>> =
     LazyLock::new(|| IdleCache::new(CACHE_TTL));
 
-/// Загружает и разбирает провайдер, используя кэш по (путь, mtime). Инлайн-провайдеры (без файла)
+pub(crate) fn clear_provider_cache() {
+    PROVIDER_CACHE.clear();
+}
+
+/// Загружает и разбирает провайдер, используя кэш по (путь, mtime, behavior, format). Инлайн-провайдеры (без файла)
 /// в общий кэш не кладутся — они и так строятся один раз на загрузку движка. Конвертация `.mrs`/
 /// чтение файла происходит ДО обращения к кэшу — `IdleCache::insert` не держит блокировку на время
 /// IO. Параллельный промах на один и тот же ключ может привести к повторной загрузке — это
 /// допустимо (см. `idle_cache.rs`), не пытаемся её схлопывать через single-flight.
-async fn load_from_path(path: &str, behavior: Behavior, mrs_behavior: bool) -> Result<Arc<ParsedProvider>, String> {
+pub(crate) async fn load_from_path(path: &str, behavior: Behavior, format: ProviderFormat) -> Result<Arc<ParsedProvider>, String> {
     let path_buf = PathBuf::from(path);
     let mtime = tokio::fs::metadata(&path_buf)
         .await
         .map_err(|e| format!("файл не найден: {e}"))?
         .modified()
         .map_err(|e| format!("нет mtime: {e}"))?;
-    let key = (path_buf, mtime);
+    let key = ProviderCacheKey {
+        path: path_buf,
+        mtime,
+        behavior,
+        format,
+    };
 
     if let Some(cached) = PROVIDER_CACHE.get(&key) {
         return Ok(cached);
     }
 
-    let content = if mrs_behavior {
+    let content = if format.is_mrs() {
         ruleset_inspector::convert_mrs(path, behavior.as_mihomo_str()).await?
     } else {
-        tokio::fs::read_to_string(&key.0)
+        tokio::fs::read_to_string(&key.path)
             .await
             .map_err(|e| format!("ошибка чтения: {e}"))?
     };
-    let parsed = Arc::new(parse_provider_content(&content, behavior)?);
+    let parsed = Arc::new(parse_provider_content(&content, behavior, format)?);
     PROVIDER_CACHE.insert(key, parsed.clone());
     Ok(parsed)
 }
@@ -703,7 +745,7 @@ impl Providers {
                 }
                 Vehicle::Inline(payload) => {
                     let content = payload.join("\n");
-                    match parse_provider_content(&content, def.behavior) {
+                    match parse_provider_content(&content, def.behavior, def.format) {
                         Ok(p) => {
                             loaded.insert(name, Arc::new(p));
                         }
@@ -712,7 +754,7 @@ impl Providers {
                         }
                     }
                 }
-                Vehicle::Path(path) => match load_from_path(&path, def.behavior, def.format_mrs).await {
+                Vehicle::Path(path) => match load_from_path(&path, def.behavior, def.format).await {
                     Ok(p) => {
                         loaded.insert(name, p);
                     }
@@ -1109,5 +1151,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn r30_provider_cache_differentiates_behavior_on_same_file() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-r30-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let file_path = temp_dir.join("shared_rules.yaml");
+        let content = "payload:\n  - 10.0.0.0/8\n  - example.com\n";
+        tokio::fs::write(&file_path, content).await.unwrap();
+
+        let path_str = file_path.to_str().unwrap();
+
+        // Загрузка с behavior: domain
+        let domain_provider = load_from_path(path_str, Behavior::Domain, ProviderFormat::Yaml)
+            .await
+            .expect("load domain provider");
+        match domain_provider.as_ref() {
+            ParsedProvider::Domain(dp) => {
+                assert_eq!(dp.matches("example.com"), Some("example.com"));
+                assert_eq!(dp.matches("10.0.0.0/8"), None);
+            }
+            _ => panic!("ожидался ParsedProvider::Domain"),
+        }
+
+        // Загрузка того же файла с behavior: ipcidr — не должна брать кэш от Domain!
+        let ipcidr_provider = load_from_path(path_str, Behavior::IpCidr, ProviderFormat::Yaml)
+            .await
+            .expect("load ipcidr provider");
+        match ipcidr_provider.as_ref() {
+            ParsedProvider::IpCidr(ip) => {
+                assert_eq!(ip.matches("10.1.2.3".parse().unwrap()), Some("10.0.0.0/8"));
+            }
+            _ => panic!("ожидался ParsedProvider::IpCidr, но получен кэш другого типа"),
+        }
+
+        // Загрузка того же файла с behavior: classical
+        let classical_provider = load_from_path(path_str, Behavior::Classical, ProviderFormat::Yaml)
+            .await
+            .expect("load classical provider");
+        match classical_provider.as_ref() {
+            ParsedProvider::Classical(_) => {}
+            _ => panic!("ожидался ParsedProvider::Classical"),
+        }
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn r30_provider_cache_differentiates_format_on_same_file() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-r30-fmt-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let file_path = temp_dir.join("fmt_rules.txt");
+        let content = "payload:\n  - example.com\n";
+        tokio::fs::write(&file_path, content).await.unwrap();
+
+        let path_str = file_path.to_str().unwrap();
+
+        // format: yaml разбирает YAML mapping `payload:` и берёт элементы
+        let yaml_provider = load_from_path(path_str, Behavior::Domain, ProviderFormat::Yaml)
+            .await
+            .expect("load yaml provider");
+        match yaml_provider.as_ref() {
+            ParsedProvider::Domain(dp) => {
+                assert_eq!(dp.matches("example.com"), Some("example.com"));
+            }
+            _ => panic!("ожидался ParsedProvider::Domain"),
+        }
+
+        // format: text не парсит YAML, а читает строки буквально
+        let text_provider = load_from_path(path_str, Behavior::Domain, ProviderFormat::Text)
+            .await
+            .expect("load text provider");
+        match text_provider.as_ref() {
+            ParsedProvider::Domain(dp) => {
+                // В текстовом формате строка "- example.com" не нормализуется как "example.com"
+                assert_eq!(dp.matches("example.com"), None);
+            }
+            _ => panic!("ожидался ParsedProvider::Domain"),
+        }
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn r30_providers_load_with_multiple_defs_sharing_path() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-r30-defs-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let file_path = temp_dir.join("rules.yaml");
+        let content = "payload:\n  - 10.0.0.0/8\n  - example.com\n";
+        tokio::fs::write(&file_path, content).await.unwrap();
+
+        let yaml_str = format!(
+            "p_dom:\n  type: file\n  behavior: domain\n  path: {}\np_ip:\n  type: file\n  behavior: ipcidr\n  path: {}\n",
+            file_path.display(),
+            file_path.display()
+        );
+        let docs = yaml_rust2::YamlLoader::load_from_str(&yaml_str).unwrap();
+        let defs = parse_provider_defs(&docs[0], &temp_dir);
+
+        let providers = Providers::load(defs).await;
+        assert!(matches!(providers.get("p_dom"), Some(ParsedProvider::Domain(_))));
+        assert!(matches!(providers.get("p_ip"), Some(ParsedProvider::IpCidr(_))));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn r30_clear_provider_cache_evicts_cached_entries() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-r30-clear-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let file_path = temp_dir.join("rules.yaml");
+        tokio::fs::write(&file_path, "payload:\n  - domain1.com\n").await.unwrap();
+
+        let path_str = file_path.to_str().unwrap();
+        let p1 = load_from_path(path_str, Behavior::Domain, ProviderFormat::Yaml)
+            .await
+            .unwrap();
+
+        // Очищаем кэш
+        clear_provider_cache();
+
+        // Перезагрузка возвращает новый Arc
+        let p2 = load_from_path(path_str, Behavior::Domain, ProviderFormat::Yaml)
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&p1, &p2), "после clear_provider_cache должен быть создан новый экземпляр");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

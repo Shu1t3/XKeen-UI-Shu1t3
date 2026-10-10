@@ -129,7 +129,7 @@ pub async fn get_configs(
     Json(serde_json::json!({ "success": true, "configs": core_configs }))
 }
 
-fn get_allowed_prefixes(state: &AppState, is_lst: bool) -> Vec<String> {
+pub(crate) fn get_allowed_prefixes(state: &AppState, is_lst: bool) -> Vec<String> {
     if is_lst {
         return vec![XKEEN_CONF_DIR.to_string()];
     }
@@ -150,7 +150,7 @@ fn get_allowed_prefixes(state: &AppState, is_lst: bool) -> Vec<String> {
     paths
 }
 
-fn is_path_allowed(file: &str, prefixes: &[String]) -> bool {
+pub(crate) fn is_path_allowed(file: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|prefix| {
         let prefix_path = Path::new(prefix.as_str());
         let file_path = Path::new(file);
@@ -172,6 +172,10 @@ fn check_access(file: &str, state: &AppState) -> Result<bool, &'static str> {
         return Err("Path not allowed");
     }
     Ok(file.ends_with(".lst"))
+}
+
+fn is_mihomo_config_file(path: &str) -> bool {
+    path.starts_with(MIHOMO_CONF_DIR) || path == MIHOMO_CONFIG_FILE
 }
 
 pub async fn put_config(
@@ -233,6 +237,9 @@ async fn put_config_inner(state: AppState, params: HashMap<String, String>, req:
             data: None,
         });
     }
+    if is_mihomo_config_file(&req.file) {
+        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+    }
     Json(ApiResponse::<()> {
         success: true,
         error: None,
@@ -281,6 +288,9 @@ async fn post_config_inner(state: AppState, req: ConfigReq) -> Json<ApiResponse<
             data: None,
         });
     }
+    if is_mihomo_config_file(&req.file) {
+        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+    }
     Json(ApiResponse::<()> {
         success: true,
         error: None,
@@ -313,6 +323,9 @@ async fn delete_config_inner(state: AppState, req: DeleteReq) -> Json<ApiRespons
             error: Some("Delete error".into()),
             data: None,
         });
+    }
+    if is_mihomo_config_file(&req.file) {
+        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
     }
     Json(ApiResponse::<()> {
         success: true,
@@ -360,6 +373,9 @@ async fn patch_config_inner(state: AppState, req: RenameReq) -> Json<ApiResponse
             error: Some("Rename error".into()),
             data: None,
         });
+    }
+    if is_mihomo_config_file(&req.file) || is_mihomo_config_file(&req.new_file) {
+        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
     }
     Json(ApiResponse::<()> {
         success: true,

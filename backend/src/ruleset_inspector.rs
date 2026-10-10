@@ -40,7 +40,14 @@ pub(crate) async fn load_mihomo_yaml() -> Result<Arc<Vec<Yaml>>, String> {
     let docs = YamlLoader::load_from_str(&content).map_err(|e| format!("Ошибка парсинга YAML: {e}"))?;
     let arc = Arc::new(docs);
     *MIHOMO_YAML_CACHE.write().unwrap() = Some((mtime, arc.clone()));
+    crate::route_test::providers::clear_provider_cache();
     Ok(arc)
+}
+
+/// Принудительно инвалидирует кэш YAML конфига и кэш провайдеров.
+pub(crate) fn invalidate_mihomo_yaml_cache() {
+    *MIHOMO_YAML_CACHE.write().unwrap() = None;
+    crate::route_test::providers::clear_provider_cache();
 }
 
 #[derive(Deserialize)]
@@ -261,4 +268,39 @@ fn error_response(msg: String) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalidate_mihomo_yaml_cache_clears_provider_cache() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-inv-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let file_path = temp_dir.join("rules.yaml");
+        tokio::fs::write(&file_path, "payload:\n  - domain.com\n").await.unwrap();
+
+        let path_str = file_path.to_str().unwrap();
+        let p1 = crate::route_test::providers::load_from_path(
+            path_str,
+            crate::route_test::providers::Behavior::Domain,
+            crate::route_test::providers::ProviderFormat::Yaml,
+        )
+        .await
+        .unwrap();
+
+        invalidate_mihomo_yaml_cache();
+
+        let p2 = crate::route_test::providers::load_from_path(
+            path_str,
+            crate::route_test::providers::Behavior::Domain,
+            crate::route_test::providers::ProviderFormat::Yaml,
+        )
+        .await
+        .unwrap();
+
+        assert!(!Arc::ptr_eq(&p1, &p2), "invalidate_mihomo_yaml_cache должен был очистить provider cache");
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
 }

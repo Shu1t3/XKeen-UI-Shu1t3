@@ -450,6 +450,7 @@ async fn main() {
         log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
         auth_changes: tokio::sync::watch::channel(0).0,
         app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
+        enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
         debug: cli.debug,
         rci_token: Arc::new(RwLock::new(rci_token)),
     };

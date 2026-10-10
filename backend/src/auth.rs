@@ -12,7 +12,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-use crate::types::{APP_CONFIG, ApiResponse, AppState};
+use crate::types::{APP_CONFIG, ApiResponse, AppState, XKEEN_CONF_DIR};
+
+#[cfg(test)]
+tokio::task_local! {
+    pub static TEST_AUTH_CONFIG_OVERRIDE: (std::path::PathBuf, std::path::PathBuf);
+}
+
+fn current_config_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    #[cfg(test)]
+    {
+        if let Ok(paths) = TEST_AUTH_CONFIG_OVERRIDE.try_with(|p| p.clone()) {
+            return paths;
+        }
+    }
+    (
+        std::path::PathBuf::from(APP_CONFIG),
+        std::path::PathBuf::from(XKEEN_CONF_DIR),
+    )
+}
 
 const SESSION_COOKIE: &str = "session_id";
 const MAX_ATTEMPTS: u32 = 5;
@@ -170,6 +188,20 @@ pub async fn post_setup(
             .into_response();
     }
 
+    let _enrollment_guard = state.enrollment_lock.lock().await;
+
+    if state.settings.read().unwrap().auth.password_hash.is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<()> {
+                success: false,
+                error: Some("Password already set".into()),
+                data: None,
+            }),
+        )
+            .into_response();
+    }
+
     let permit = match PASSWORD_WORKERS.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return password_worker_busy(),
@@ -182,21 +214,43 @@ pub async fn post_setup(
     let ttl = 86400;
     let session_val = format!("{}:{}", session_id, now_ts() + ttl);
 
-    update_auth(&state, |auth| {
-        auth.password_hash = Some(hash);
-        auth.session_ids.push(session_val);
-    })
-    .await;
+    let commit_res = commit_setup(&state, hash, session_val).await;
 
-    (
-        set_cookie_header(&headers, session_id, 0),
-        Json(ApiResponse::<()> {
-            success: true,
-            error: None,
-            data: None,
-        }),
-    )
-        .into_response()
+    match commit_res {
+        Ok(()) => {
+            (
+                set_cookie_header(&headers, session_id, 0),
+                Json(ApiResponse::<()> {
+                    success: true,
+                    error: None,
+                    data: None,
+                }),
+            )
+                .into_response()
+        }
+        Err(AuthSetupError::AlreadySet) => {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse::<()> {
+                    success: false,
+                    error: Some("Password already set".into()),
+                    data: None,
+                }),
+            )
+                .into_response()
+        }
+        Err(AuthSetupError::Io(e)) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()> {
+                    success: false,
+                    error: Some(format!("Ошибка сохранения: {}", e)),
+                    data: None,
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn post_login(
@@ -264,10 +318,22 @@ pub async fn post_login(
     let session_id = Uuid::new_v4().to_string();
     let session_val = format!("{}:{}", session_id, now_ts() + backend_ttl);
 
-    update_auth(&state, |auth| {
+    let update_res = update_auth(&state, |auth| {
         auth.session_ids.push(session_val);
     })
     .await;
+
+    if let Err(e) = update_res {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()> {
+                success: false,
+                error: Some(format!("Ошибка сохранения сессии: {}", e)),
+                data: None,
+            }),
+        )
+            .into_response();
+    }
 
     (
         set_cookie_header(&headers, session_id, max_age),
@@ -283,10 +349,22 @@ pub async fn post_login(
 pub async fn post_logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(cookie) = get_session_cookie(&headers) {
         let cookie = cookie.to_string();
-        update_auth(&state, |auth| {
+        if let Err(e) = update_auth(&state, |auth| {
             auth.session_ids.retain(|id| id.split_once(':').map_or(id.as_str(), |(uid, _)| uid) != cookie)
         })
-        .await;
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                clear_cookie_header(),
+                Json(ApiResponse::<()> {
+                    success: false,
+                    error: Some(format!("Ошибка сохранения: {}", e)),
+                    data: None,
+                }),
+            )
+                .into_response();
+        }
     }
     (
         clear_cookie_header(),
@@ -296,14 +374,27 @@ pub async fn post_logout(State(state): State<AppState>, headers: HeaderMap) -> i
             data: None,
         }),
     )
+        .into_response()
 }
 
 pub async fn post_auth_reset(State(state): State<AppState>) -> impl IntoResponse {
-    update_auth(&state, |auth| {
+    if let Err(e) = update_auth(&state, |auth| {
         auth.password_hash = None;
         auth.session_ids.clear();
     })
-    .await;
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            clear_cookie_header(),
+            Json(ApiResponse::<()> {
+                success: false,
+                error: Some(format!("Ошибка сброса авторизации: {}", e)),
+                data: None,
+            }),
+        )
+            .into_response();
+    }
     (
         clear_cookie_header(),
         Json(ApiResponse::<()> {
@@ -312,6 +403,7 @@ pub async fn post_auth_reset(State(state): State<AppState>) -> impl IntoResponse
             data: None,
         }),
     )
+        .into_response()
 }
 
 /// Upgrade captures the admitted identity; disabling auth cannot resurrect a revoked session.
@@ -403,38 +495,158 @@ fn verify_password(password: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn update_auth(state: &AppState, modify: impl FnOnce(&mut crate::types::AuthSettings)) {
-    {
-        let mut s = state.settings.write().unwrap();
-        modify(&mut s.auth);
-
-        let ts = now_ts();
-        s.auth.session_ids.retain(|id| {
-            if let Some((_, exp)) = id.split_once(':') {
-                exp.parse::<u64>().unwrap_or(0) > ts
-            } else {
-                true
-            }
-        });
-    }
-    state.auth_changes.send_modify(|version| *version = version.wrapping_add(1));
-    save_auth_to_config(state).await;
+#[derive(Debug)]
+pub enum AuthSetupError {
+    AlreadySet,
+    Io(std::io::Error),
 }
 
-async fn save_auth_to_config(state: &AppState) {
+impl std::fmt::Display for AuthSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadySet => write!(f, "Password already set"),
+            Self::Io(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for AuthSetupError {}
+
+#[derive(Debug)]
+pub enum AuthModifyError<E> {
+    Custom(E),
+    Io(std::io::Error),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AuthModifyError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Custom(e) => write!(f, "{}", e),
+            Self::Io(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for AuthModifyError<E> {}
+
+pub async fn update_auth_modify_at<E>(
+    state: &AppState,
+    config_path: &std::path::Path,
+    conf_dir: &std::path::Path,
+    modify: impl FnOnce(&mut crate::types::AuthSettings) -> Result<(), E>,
+) -> Result<(), AuthModifyError<E>> {
     let _guard = state.app_config_lock.lock().await;
-    let auth = state.settings.read().unwrap().auth.clone();
-    let mut file_json: serde_json::Value = tokio::fs::read_to_string(APP_CONFIG)
+
+    let mut new_auth = state.settings.read().unwrap().auth.clone();
+    modify(&mut new_auth).map_err(AuthModifyError::Custom)?;
+
+    let ts = now_ts();
+    new_auth.session_ids.retain(|id| {
+        if let Some((_, exp)) = id.split_once(':') {
+            exp.parse::<u64>().unwrap_or(0) > ts
+        } else {
+            true
+        }
+    });
+
+    let mut file_json: serde_json::Value = tokio::fs::read_to_string(config_path)
         .await
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or(serde_json::json!({}));
-    file_json["auth"] = serde_json::to_value(auth).unwrap();
-    let serialized = serde_json::to_string_pretty(&file_json).unwrap();
-    let tmp = format!("{}.tmp", APP_CONFIG);
-    if tokio::fs::write(&tmp, &serialized).await.is_ok() {
-        let _ = tokio::fs::rename(&tmp, APP_CONFIG).await;
+        .unwrap_or_else(|| {
+            let current = state.settings.read().unwrap();
+            serde_json::to_value(&*current).unwrap_or(serde_json::json!({}))
+        });
+
+    if !file_json.is_object() {
+        let current = state.settings.read().unwrap();
+        file_json = serde_json::to_value(&*current).unwrap_or(serde_json::json!({}));
     }
+
+    file_json["auth"] = serde_json::to_value(&new_auth)
+        .map_err(|e| AuthModifyError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+
+    tokio::fs::create_dir_all(conf_dir)
+        .await
+        .map_err(AuthModifyError::Io)?;
+
+    let serialized = serde_json::to_string_pretty(&file_json)
+        .map_err(|e| AuthModifyError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+
+    let tmp = format!("{}.tmp", config_path.display());
+    tokio::fs::write(&tmp, &serialized)
+        .await
+        .map_err(AuthModifyError::Io)?;
+    if let Err(e) = tokio::fs::rename(&tmp, config_path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AuthModifyError::Io(e));
+    }
+
+    // Disk commit confirmed: publish to in-memory state and notify subscribers
+    {
+        let mut s = state.settings.write().unwrap();
+        s.auth = new_auth;
+    }
+    state.auth_changes.send_modify(|version| *version = version.wrapping_add(1));
+
+    Ok(())
+}
+
+async fn update_auth(
+    state: &AppState,
+    modify: impl FnOnce(&mut crate::types::AuthSettings),
+) -> Result<(), std::io::Error> {
+    let (config_path, conf_dir) = current_config_paths();
+    update_auth_at(state, &config_path, &conf_dir, modify).await
+}
+
+pub async fn update_auth_at(
+    state: &AppState,
+    config_path: &std::path::Path,
+    conf_dir: &std::path::Path,
+    modify: impl FnOnce(&mut crate::types::AuthSettings),
+) -> Result<(), std::io::Error> {
+    match update_auth_modify_at(state, config_path, conf_dir, |auth| {
+        modify(auth);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(AuthModifyError::Io(e)) => Err(e),
+        Err(AuthModifyError::Custom(infallible)) => match infallible {},
+    }
+}
+
+async fn commit_setup(
+    state: &AppState,
+    hash: String,
+    session_val: String,
+) -> Result<(), AuthSetupError> {
+    let (config_path, conf_dir) = current_config_paths();
+    commit_setup_at(state, &config_path, &conf_dir, hash, session_val).await
+}
+
+pub async fn commit_setup_at(
+    state: &AppState,
+    config_path: &std::path::Path,
+    conf_dir: &std::path::Path,
+    hash: String,
+    session_val: String,
+) -> Result<(), AuthSetupError> {
+    update_auth_modify_at(state, config_path, conf_dir, |auth| {
+        if auth.password_hash.is_some() {
+            return Err(AuthSetupError::AlreadySet);
+        }
+        auth.password_hash = Some(hash);
+        auth.session_ids.push(session_val);
+        Ok(())
+    })
+    .await
+    .map_err(|e| match e {
+        AuthModifyError::Custom(err) => err,
+        AuthModifyError::Io(io_err) => AuthSetupError::Io(io_err),
+    })
 }
 
 #[cfg(test)]
@@ -536,8 +748,12 @@ mod tests {
         assert_eq!(workers.available_permits(), 1);
     }
 
+    static AUTH_HANDLER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     #[tokio::test]
     async fn login_ignores_forged_forwarded_addresses() {
+        let _test_lock = AUTH_HANDLER_TEST_LOCK.lock().await;
+        BRUTE_CACHE.lock().unwrap().remove(&"127.0.0.1".parse().unwrap());
         let (log_tx, _) = tokio::sync::broadcast::channel(16);
         let mut settings = AppSettings::default();
         // Invalid hashes reject passwords without saving sessions or touching router files.
@@ -557,6 +773,7 @@ mod tests {
             log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
+            enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
             debug: false,
             rci_token: Arc::new(RwLock::new(None)),
         };
@@ -651,5 +868,432 @@ mod tests {
         drop(permit);
         server.abort();
         let _ = server.await;
+    }
+
+    fn fixture_state() -> AppState {
+        let (log_tx, _) = tokio::sync::broadcast::channel(16);
+        AppState {
+            core: Arc::new(RwLock::new(crate::types::CoreInfo {
+                name: "xray".into(),
+                conf_dir: String::new(),
+                is_json: true,
+            })),
+            settings: Arc::new(RwLock::new(AppSettings::default())),
+            init_file: Arc::new(RwLock::new(None)),
+            http_client: reqwest::Client::new(),
+            update_checker: UpdateChecker::default(),
+            geo_cache: Arc::new(RwLock::new(Default::default())),
+            log_tx: Arc::new(log_tx),
+            log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
+            auth_changes: tokio::sync::watch::channel(0).0,
+            app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
+            enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
+            debug: false,
+            rci_token: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_persists_before_publishing_and_fails_safely_on_io_error() {
+        let _test_lock = AUTH_HANDLER_TEST_LOCK.lock().await;
+        let state = fixture_state();
+        let mut auth_rx = state.auth_changes.subscribe();
+
+        // 1. Failure branch: unwritable path
+        let fail_dir = std::env::temp_dir().join(format!("xkeen-auth-setup-fail-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&fail_dir).await.unwrap();
+        let blocker = fail_dir.join("blocker");
+        tokio::fs::write(&blocker, b"blocker").await.unwrap();
+        let bad_config = blocker.join("xkeen-ui.json");
+        let bad_conf_dir = blocker.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((bad_config, bad_conf_dir), async {
+                let req = PasswordReq {
+                    password: "my-secure-password".into(),
+                    remember: false,
+                };
+                let resp = post_setup(State(state.clone()), HeaderMap::new(), Json(req))
+                    .await
+                    .into_response();
+                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(!resp.headers().contains_key(header::SET_COOKIE));
+                assert!(state.settings.read().unwrap().auth.password_hash.is_none());
+                assert!(state.settings.read().unwrap().auth.session_ids.is_empty());
+                assert_eq!(*auth_rx.borrow_and_update(), 0);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&fail_dir).await;
+
+        // 2. Success branch: writable path
+        let ok_dir = std::env::temp_dir().join(format!("xkeen-auth-setup-ok-{}", uuid::Uuid::new_v4()));
+        let ok_config = ok_dir.join("xkeen-ui.json");
+        let ok_conf_dir = ok_dir.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((ok_config.clone(), ok_conf_dir), async {
+                let req = PasswordReq {
+                    password: "my-secure-password".into(),
+                    remember: false,
+                };
+                let resp = post_setup(State(state.clone()), HeaderMap::new(), Json(req))
+                    .await
+                    .into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert!(resp.headers().contains_key(header::SET_COOKIE));
+                assert!(state.settings.read().unwrap().auth.password_hash.is_some());
+                assert_eq!(state.settings.read().unwrap().auth.session_ids.len(), 1);
+                assert_eq!(*auth_rx.borrow_and_update(), 1);
+
+                // Disk must contain the committed auth
+                let disk_str = tokio::fs::read_to_string(&ok_config).await.unwrap();
+                let disk_json: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+                assert_eq!(
+                    disk_json["auth"]["password_hash"],
+                    serde_json::to_value(state.settings.read().unwrap().auth.password_hash.clone()).unwrap()
+                );
+                assert_eq!(disk_json["auth"]["session_ids"].as_array().unwrap().len(), 1);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&ok_dir).await;
+    }
+
+    #[tokio::test]
+    async fn login_persists_session_and_fails_safely_on_io_error() {
+        let _test_lock = AUTH_HANDLER_TEST_LOCK.lock().await;
+        let addr: SocketAddr = "192.0.2.200:12345".parse().unwrap();
+        BRUTE_CACHE.lock().unwrap().remove(&addr.ip());
+        let state = fixture_state();
+        let hash = hash_password("login-password");
+        state.settings.write().unwrap().auth.password_hash = Some(hash);
+        let mut auth_rx = state.auth_changes.subscribe();
+
+        // 1. Failure branch: unwritable path
+        let fail_dir = std::env::temp_dir().join(format!("xkeen-auth-login-fail-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&fail_dir).await.unwrap();
+        let blocker = fail_dir.join("blocker");
+        tokio::fs::write(&blocker, b"blocker").await.unwrap();
+        let bad_config = blocker.join("xkeen-ui.json");
+        let bad_conf_dir = blocker.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((bad_config, bad_conf_dir), async {
+                let req = PasswordReq {
+                    password: "login-password".into(),
+                    remember: false,
+                };
+                let resp = post_login(State(state.clone()), ConnectInfo(addr), HeaderMap::new(), Json(req)).await;
+                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(!resp.headers().contains_key(header::SET_COOKIE));
+                assert!(state.settings.read().unwrap().auth.session_ids.is_empty());
+                assert_eq!(*auth_rx.borrow_and_update(), 0);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&fail_dir).await;
+
+        // 2. Success branch: writable path
+        let ok_dir = std::env::temp_dir().join(format!("xkeen-auth-login-ok-{}", uuid::Uuid::new_v4()));
+        let ok_config = ok_dir.join("xkeen-ui.json");
+        let ok_conf_dir = ok_dir.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((ok_config.clone(), ok_conf_dir), async {
+                let req = PasswordReq {
+                    password: "login-password".into(),
+                    remember: false,
+                };
+                let resp = post_login(State(state.clone()), ConnectInfo(addr), HeaderMap::new(), Json(req)).await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert!(resp.headers().contains_key(header::SET_COOKIE));
+                assert_eq!(state.settings.read().unwrap().auth.session_ids.len(), 1);
+                assert_eq!(*auth_rx.borrow_and_update(), 1);
+
+                let disk_str = tokio::fs::read_to_string(&ok_config).await.unwrap();
+                let disk_json: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+                assert_eq!(disk_json["auth"]["session_ids"].as_array().unwrap().len(), 1);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&ok_dir).await;
+    }
+
+    #[tokio::test]
+    async fn reset_persists_and_preserves_hash_on_io_error() {
+        let state = fixture_state();
+        let hash = "existing-hash".to_string();
+        state.settings.write().unwrap().auth.password_hash = Some(hash.clone());
+        state.settings.write().unwrap().auth.session_ids = vec!["sess-1".into(), "sess-2".into()];
+        let mut auth_rx = state.auth_changes.subscribe();
+
+        // 1. Failure branch: unwritable path
+        let fail_dir = std::env::temp_dir().join(format!("xkeen-auth-reset-fail-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&fail_dir).await.unwrap();
+        let blocker = fail_dir.join("blocker");
+        tokio::fs::write(&blocker, b"blocker").await.unwrap();
+        let bad_config = blocker.join("xkeen-ui.json");
+        let bad_conf_dir = blocker.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((bad_config, bad_conf_dir), async {
+                let resp = post_auth_reset(State(state.clone())).await.into_response();
+                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(state.settings.read().unwrap().auth.password_hash, Some(hash.clone()));
+                assert_eq!(state.settings.read().unwrap().auth.session_ids.len(), 2);
+                assert_eq!(*auth_rx.borrow_and_update(), 0);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&fail_dir).await;
+
+        // 2. Success branch: writable path
+        let ok_dir = std::env::temp_dir().join(format!("xkeen-auth-reset-ok-{}", uuid::Uuid::new_v4()));
+        let ok_config = ok_dir.join("xkeen-ui.json");
+        let ok_conf_dir = ok_dir.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((ok_config.clone(), ok_conf_dir), async {
+                let resp = post_auth_reset(State(state.clone())).await.into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert!(state.settings.read().unwrap().auth.password_hash.is_none());
+                assert!(state.settings.read().unwrap().auth.session_ids.is_empty());
+                assert_eq!(*auth_rx.borrow_and_update(), 1);
+
+                let disk_str = tokio::fs::read_to_string(&ok_config).await.unwrap();
+                let disk_json: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+                assert!(disk_json["auth"]["password_hash"].is_null());
+                assert!(disk_json["auth"]["session_ids"].as_array().unwrap().is_empty());
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&ok_dir).await;
+    }
+
+    #[tokio::test]
+    async fn logout_persists_and_preserves_session_on_io_error() {
+        let state = fixture_state();
+        let active_sess = format!("active-uid:{}", now_ts() + 3600);
+        let other_sess = format!("other-uid:{}", now_ts() + 3600);
+        state.settings.write().unwrap().auth.session_ids = vec![active_sess.clone(), other_sess.clone()];
+        let mut auth_rx = state.auth_changes.subscribe();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_static("session_id=active-uid"));
+
+        // 1. Failure branch: unwritable path
+        let fail_dir = std::env::temp_dir().join(format!("xkeen-auth-logout-fail-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&fail_dir).await.unwrap();
+        let blocker = fail_dir.join("blocker");
+        tokio::fs::write(&blocker, b"blocker").await.unwrap();
+        let bad_config = blocker.join("xkeen-ui.json");
+        let bad_conf_dir = blocker.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((bad_config, bad_conf_dir), async {
+                let resp = post_logout(State(state.clone()), headers.clone()).await.into_response();
+                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(state.settings.read().unwrap().auth.session_ids.len(), 2);
+                assert_eq!(*auth_rx.borrow_and_update(), 0);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&fail_dir).await;
+
+        // 2. Success branch: writable path
+        let ok_dir = std::env::temp_dir().join(format!("xkeen-auth-logout-ok-{}", uuid::Uuid::new_v4()));
+        let ok_config = ok_dir.join("xkeen-ui.json");
+        let ok_conf_dir = ok_dir.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((ok_config.clone(), ok_conf_dir), async {
+                let resp = post_logout(State(state.clone()), headers.clone()).await.into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(state.settings.read().unwrap().auth.session_ids, vec![other_sess.clone()]);
+                assert_eq!(*auth_rx.borrow_and_update(), 1);
+
+                let disk_str = tokio::fs::read_to_string(&ok_config).await.unwrap();
+                let disk_json: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+                assert_eq!(
+                    disk_json["auth"]["session_ids"].as_array().unwrap(),
+                    &[serde_json::Value::String(other_sess.clone())]
+                );
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&ok_dir).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_setup_requests_elect_single_winner_and_prevent_duplicate_sessions() {
+        let _test_lock = AUTH_HANDLER_TEST_LOCK.lock().await;
+        let state = fixture_state();
+        let mut auth_rx = state.auth_changes.subscribe();
+
+        let dir = std::env::temp_dir().join(format!("xkeen-auth-setup-race-{}", uuid::Uuid::new_v4()));
+        let config_path = dir.join("xkeen-ui.json");
+        let conf_dir = dir.clone();
+
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((config_path.clone(), conf_dir), async {
+                let req1 = PasswordReq {
+                    password: "password-one".into(),
+                    remember: false,
+                };
+                let req2 = PasswordReq {
+                    password: "password-two".into(),
+                    remember: false,
+                };
+
+                let state1 = state.clone();
+                let state2 = state.clone();
+
+                // Fire two setup requests concurrently
+                let (resp1, resp2) = tokio::join!(
+                    post_setup(State(state1), HeaderMap::new(), Json(req1)),
+                    post_setup(State(state2), HeaderMap::new(), Json(req2))
+                );
+
+                let r1 = resp1.into_response();
+                let r2 = resp2.into_response();
+
+                // Exactly one request must succeed with 200 OK and cookie, the other must fail with 403 FORBIDDEN and no cookie
+                let (winner_resp, loser_resp) = if r1.status() == StatusCode::OK {
+                    (r1, r2)
+                } else {
+                    (r2, r1)
+                };
+
+                assert_eq!(winner_resp.status(), StatusCode::OK);
+                assert!(winner_resp.headers().contains_key(header::SET_COOKIE));
+
+                assert_eq!(loser_resp.status(), StatusCode::FORBIDDEN);
+                assert!(!loser_resp.headers().contains_key(header::SET_COOKIE));
+
+                // Settings must have password_hash set and exactly ONE session ID
+                let auth = state.settings.read().unwrap().auth.clone();
+                assert!(auth.password_hash.is_some());
+                assert_eq!(auth.session_ids.len(), 1);
+
+                // Check winner cookie matches the single session ID
+                let cookie_header = winner_resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+                let session_id = cookie_header
+                    .split(';')
+                    .find_map(|s| s.trim().strip_prefix("session_id="))
+                    .unwrap();
+                assert!(auth.session_ids[0].starts_with(session_id));
+
+                // Exactly 1 update notification emitted
+                assert_eq!(*auth_rx.borrow_and_update(), 1);
+
+                // Disk configuration must match in-memory state and have exactly 1 session ID
+                let disk_str = tokio::fs::read_to_string(&config_path).await.unwrap();
+                let disk_json: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+                assert_eq!(disk_json["auth"]["session_ids"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    disk_json["auth"]["password_hash"],
+                    serde_json::to_value(auth.password_hash.clone()).unwrap()
+                );
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn setup_commit_level_race_rejection() {
+        let state = fixture_state();
+        let dir = std::env::temp_dir().join(format!("xkeen-auth-commit-race-{}", uuid::Uuid::new_v4()));
+        let config_path = dir.join("xkeen-ui.json");
+        let conf_dir = dir.clone();
+
+        let hash1 = hash_password("first-pass");
+        let hash2 = hash_password("second-pass");
+        let sess1 = format!("{}:{}", Uuid::new_v4(), now_ts() + 86400);
+        let sess2 = format!("{}:{}", Uuid::new_v4(), now_ts() + 86400);
+
+        // First commit succeeds
+        let res1 = commit_setup_at(&state, &config_path, &conf_dir, hash1.clone(), sess1.clone()).await;
+        assert!(res1.is_ok());
+        assert_eq!(state.settings.read().unwrap().auth.password_hash, Some(hash1.clone()));
+        assert_eq!(state.settings.read().unwrap().auth.session_ids, vec![sess1.clone()]);
+
+        // Second commit MUST fail with AlreadySet and NOT modify password or append session
+        let res2 = commit_setup_at(&state, &config_path, &conf_dir, hash2.clone(), sess2.clone()).await;
+        match res2 {
+            Err(AuthSetupError::AlreadySet) => {}
+            other => panic!("Expected AlreadySet, got {:?}", other),
+        }
+
+        // Verify state is untouched by second commit
+        assert_eq!(state.settings.read().unwrap().auth.password_hash, Some(hash1.clone()));
+        assert_eq!(state.settings.read().unwrap().auth.session_ids, vec![sess1.clone()]);
+
+        // Disk is untouched by second commit
+        let disk_str = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let disk_json: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+        assert_eq!(disk_json["auth"]["password_hash"].as_str().unwrap(), hash1);
+        assert_eq!(disk_json["auth"]["session_ids"].as_array().unwrap().len(), 1);
+
+        _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn setup_serialized_and_recovers_after_transient_failure() {
+        let _test_lock = AUTH_HANDLER_TEST_LOCK.lock().await;
+        let state = fixture_state();
+
+        let fail_dir = std::env::temp_dir().join(format!("xkeen-auth-setup-recover-fail-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&fail_dir).await.unwrap();
+        let blocker = fail_dir.join("blocker");
+        tokio::fs::write(&blocker, b"blocker").await.unwrap();
+        let bad_config = blocker.join("xkeen-ui.json");
+        let bad_conf_dir = blocker.clone();
+
+        let ok_dir = std::env::temp_dir().join(format!("xkeen-auth-setup-recover-ok-{}", uuid::Uuid::new_v4()));
+        let ok_config = ok_dir.join("xkeen-ui.json");
+        let ok_conf_dir = ok_dir.clone();
+
+        // 1. First setup fails due to I/O error
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((bad_config, bad_conf_dir), async {
+                let req = PasswordReq {
+                    password: "attempt-one".into(),
+                    remember: false,
+                };
+                let resp = post_setup(State(state.clone()), HeaderMap::new(), Json(req))
+                    .await
+                    .into_response();
+                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(state.settings.read().unwrap().auth.password_hash.is_none());
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&fail_dir).await;
+
+        // 2. Second setup can now proceed under enrollment lock and succeeds
+        TEST_AUTH_CONFIG_OVERRIDE
+            .scope((ok_config.clone(), ok_conf_dir), async {
+                let req = PasswordReq {
+                    password: "attempt-two".into(),
+                    remember: false,
+                };
+                let resp = post_setup(State(state.clone()), HeaderMap::new(), Json(req))
+                    .await
+                    .into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert!(resp.headers().contains_key(header::SET_COOKIE));
+                assert!(state.settings.read().unwrap().auth.password_hash.is_some());
+                assert_eq!(state.settings.read().unwrap().auth.session_ids.len(), 1);
+            })
+            .await;
+        _ = tokio::fs::remove_dir_all(&ok_dir).await;
+    }
+
+    #[tokio::test]
+    async fn setup_fast_rejection_when_password_already_set() {
+        let state = fixture_state();
+        state.settings.write().unwrap().auth.password_hash = Some(hash_password("existing"));
+
+        let req = PasswordReq {
+            password: "new-password".into(),
+            remember: false,
+        };
+        let resp = post_setup(State(state.clone()), HeaderMap::new(), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!resp.headers().contains_key(header::SET_COOKIE));
     }
 }

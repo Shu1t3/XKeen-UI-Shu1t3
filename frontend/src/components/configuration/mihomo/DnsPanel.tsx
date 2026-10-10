@@ -329,6 +329,12 @@ export const DnsPanel = memo(function DnsPanel() {
     setDisableOpen(false)
     setIsToggling(true)
     try {
+      const result = await apiCall<{ success: boolean; error?: string }>('DELETE', 'dns', {})
+      if (!result.success) {
+        showToast(`Ошибка: ${result.error}`, 'error')
+        return
+      }
+
       if (yamlConfig) {
         const content = yamlConfig.savedContent || yamlConfig.content
         const updated = setDnsEnabled(content, false)
@@ -340,22 +346,21 @@ export const DnsPanel = memo(function DnsPanel() {
           showToast(`Ошибка сохранения: ${saveResult.error}`, 'error')
           return
         }
-        await clashFetch(clashApiPort ?? '', 'configs', {
-          method: 'PUT',
-          secret: clashApiSecret,
-          unix: clashApiUnix,
-          body: {},
-        })
+        try {
+          await clashFetch(clashApiPort ?? '', 'configs', {
+            method: 'PUT',
+            secret: clashApiSecret,
+            unix: clashApiUnix,
+            body: {},
+          })
+        } catch {
+          // ignore reload error during shutdown
+        }
         await refreshConfigs()
       }
 
-      const result = await apiCall<{ success: boolean; error?: string }>('DELETE', 'dns', {})
-      if (result.success) {
-        showToast('Управление DNS отключено')
-        await fetchStatus()
-      } else {
-        showToast(`Ошибка: ${result.error}`, 'error')
-      }
+      showToast('Управление DNS отключено')
+      await fetchStatus()
     } catch {
       showToast('Ошибка отключения DNS', 'error')
     } finally {
@@ -374,6 +379,7 @@ export const DnsPanel = memo(function DnsPanel() {
       const content = yamlConfig.savedContent || yamlConfig.content
       const configContent = ensureDnsEnabled(content, config)
       const result = await apiCall<{ success: boolean; error?: string }>('POST', 'dns', {
+        config_file: yamlConfig.file,
         config_content: configContent,
         setup_filter: setupFilter,
       })

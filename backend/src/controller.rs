@@ -613,6 +613,7 @@ mod tests {
             log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(Mutex::new(())),
+            enrollment_lock: Arc::new(Mutex::new(())),
             debug: false,
             rci_token: Arc::new(RwLock::new(None)),
         };
@@ -723,6 +724,7 @@ mod tests {
             log_watcher: Arc::new(std::sync::Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
             app_config_lock: Arc::new(Mutex::new(())),
+            enrollment_lock: Arc::new(Mutex::new(())),
             debug: false,
             rci_token: Arc::new(RwLock::new(None)),
         }

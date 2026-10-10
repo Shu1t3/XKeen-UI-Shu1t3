@@ -21,6 +21,12 @@ import {
   withProxyName,
 } from '../../lib/mihomoReplace'
 import { useAppContext, useModalContext } from '../../lib/store'
+import {
+  formatMihomoProviderYaml,
+  validateMihomoProxy,
+  validateMihomoProvider,
+  validateXrayOutbound,
+} from '@/lib/configYaml'
 import { InputGroup, InputGroupAddon, InputGroupInput } from '../ui/input-group'
 import { SelectGroup } from '@/components/ui/select'
 
@@ -198,19 +204,6 @@ function randomHwid(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(6)), (n) => n.toString(16).padStart(2, '0').toUpperCase()).join('')
 }
 
-function toYaml(obj: Record<string, any>, indent = 0): string {
-  const padding = ' '.repeat(indent)
-  return Object.entries(obj).reduce((result, [key, value]) => {
-    if (value == null || value === '') return result
-    if (Array.isArray(value))
-      return value.length
-        ? result + `${padding}${key}:\n` + value.map((item) => `${padding}  - ${item}`).join('\n') + '\n'
-        : result
-    if (typeof value === 'object') return result + `${padding}${key}:\n${toYaml(value, indent + 2)}`
-    return result + `${padding}${key}: ${value}\n`
-  }, '')
-}
-
 function highlightYaml(code: string): string {
   return code
     .replace(/&/g, '&amp;')
@@ -220,7 +213,7 @@ function highlightYaml(code: string): string {
     .map((line) => {
       if (/^\s*#/.test(line)) return `<span style="color:#565f89">${line}</span>`
 
-      const kvMatch = line.match(/^(\s*)(-\s)?([a-zA-Z_][\w.-]*)(\s*:)(.*)?$/)
+      const kvMatch = line.match(/^(\s*)(-\s)?([a-zA-Z0-9_][\w.-]*|"[^"]*"|'[^']*')(\s*:)(.*)?$/)
       if (kvMatch) {
         const [, indent, dash = '', key, colon, rest = ''] = kvMatch
         const marker = dash ? `<span style="color:#89ddff">${dash}</span>` : ''
@@ -323,10 +316,10 @@ function generateSubYaml(form: SubscriptionForm): string {
   }
 
   const overrideExpr: string[] = []
-  if (form.fingerprint) overrideExpr.push(`'.["client-fingerprint"] = "${form.fingerprint}"'`)
+  if (form.fingerprint) overrideExpr.push(`.["client-fingerprint"] = "${form.fingerprint}"`)
   if (form.x25519 !== 'inherit')
     overrideExpr.push(
-      `'(select(.type == "vless" and .["reality-opts"] != null) | .["reality-opts"]["support-x25519mlkem768"]) = ${form.x25519 === 'enable'}'`
+      `(select(.type == "vless" and .["reality-opts"] != null) | .["reality-opts"]["support-x25519mlkem768"]) = ${form.x25519 === 'enable'}`
     )
   if (overrideExpr.length) sub.override['override-expr'] = overrideExpr
 
@@ -341,8 +334,8 @@ function generateSubYaml(form: SubscriptionForm): string {
 
   if (form.headerEnable) {
     sub.header = {
-      'User-Agent': `["${form.userAgent}"]`,
-      'x-hwid': `["${form.hwid}"]`,
+      'User-Agent': [form.userAgent],
+      'x-hwid': [form.hwid],
     }
   }
 
@@ -352,7 +345,9 @@ function generateSubYaml(form: SubscriptionForm): string {
     if (form.excludeType) sub['exclude-type'] = form.excludeType
   }
 
-  return toYaml({ [form.name.trim()]: sub }, 2).trimEnd() + '\n'
+  const content = formatMihomoProviderYaml(form.name.trim(), sub)
+  validateMihomoProvider(content, form.name.trim())
+  return content
 }
 
 function createDefaultForm(url: string, existingConfig: string): SubscriptionForm {
@@ -572,14 +567,24 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
   function confirmReplace() {
     if (isMihomoProxyFlow) {
       if (!result || !replaceTarget || (renameRefs && !newProxyName)) return
-      onReplace('proxy', previewContent, replaceTarget, renameRefs)
-      close()
+      try {
+        validateMihomoProxy(previewContent)
+        onReplace('proxy', previewContent, replaceTarget, renameRefs)
+        close()
+      } catch (e: any) {
+        showToast(e.message || 'Ошибка валидации прокси', 'error')
+      }
       return
     }
     if (isMihomoProviderFlow) {
       if (!subForm || !replaceTarget || providerReplaceDisabled) return
-      onReplace('provider', finalProviderContent, replaceTarget, renameRefs)
-      close()
+      try {
+        validateMihomoProvider(finalProviderContent)
+        onReplace('provider', finalProviderContent, replaceTarget, renameRefs)
+        close()
+      } catch (e: any) {
+        showToast(e.message || 'Ошибка валидации провайдера', 'error')
+      }
     }
   }
 
@@ -593,9 +598,14 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
 
   function addSubToConfig(position: 'start' | 'end') {
     if (!subForm) return
-    const content = generateSubYaml(subForm)
-    onAddToConfig(content, 'proxy-provider', position)
-    close()
+    try {
+      const content = generateSubYaml(subForm)
+      validateMihomoProvider(content, subForm.name.trim())
+      onAddToConfig(content, 'proxy-provider', position)
+      close()
+    } catch (e: any) {
+      showToast(e.message || 'Ошибка валидации провайдера', 'error')
+    }
   }
 
   async function copySub() {
@@ -622,8 +632,19 @@ export function ImportModal({ onGenerate, onAddToConfig, onReplace }: Props) {
 
   function addToConfig(position: 'start' | 'end') {
     if (!result) return
-    onAddToConfig(result.content, result.type, position)
-    close()
+    try {
+      if (result.type === 'proxy') {
+        validateMihomoProxy(result.content)
+      } else if (result.type === 'proxy-provider') {
+        validateMihomoProvider(result.content)
+      } else if (result.type === 'outbound') {
+        validateXrayOutbound(result.content)
+      }
+      onAddToConfig(result.content, result.type, position)
+      close()
+    } catch (e: any) {
+      showToast(e.message || 'Ошибка валидации конфигурации', 'error')
+    }
   }
 
   const showSubForm = subForm && result

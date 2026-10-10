@@ -93,6 +93,12 @@ where
         }
     }
 
+    /// Очищает все записи в кэше (например, при смене конфигурации).
+    pub fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.map.clear();
+    }
+
     fn spawn_reaper(&self) {
         let state = self.state.clone();
         let ttl = self.ttl;
@@ -206,5 +212,17 @@ mod tests {
         let cache: IdleCache<&'static str, u32> = IdleCache::new(Duration::from_secs(5));
         cache.insert("a", Arc::new(42));
         assert_eq!(cache.get(&"a").map(|v| *v), Some(42));
+    }
+
+    #[test]
+    fn clear_empties_the_cache() {
+        let cache: IdleCache<&'static str, u32> = IdleCache::new(Duration::from_secs(5));
+        cache.insert("a", Arc::new(1));
+        cache.insert("b", Arc::new(2));
+        assert_eq!(cache.get(&"a").map(|v| *v), Some(1));
+        assert_eq!(cache.get(&"b").map(|v| *v), Some(2));
+        cache.clear();
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), None);
     }
 }

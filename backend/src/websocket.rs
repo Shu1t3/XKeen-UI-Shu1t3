@@ -255,7 +255,10 @@ mod tests {
             geo_cache: Arc::new(std::sync::RwLock::new(Default::default())),
             log_tx: Arc::new(log_tx), log_watcher: Arc::new(Mutex::new(Default::default())),
             auth_changes: tokio::sync::watch::channel(0).0,
-            app_config_lock: Arc::new(tokio::sync::Mutex::new(())), debug: false, rci_token: Arc::new(std::sync::RwLock::new(None)),
+            app_config_lock: Arc::new(tokio::sync::Mutex::new(())),
+            enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
+            debug: false,
+            rci_token: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -357,19 +360,28 @@ mod tests {
             request.headers_mut().insert("cookie", "session_id=other".parse().unwrap());
             let (mut other, _) = connect_async(request).await.unwrap();
             other.next().await.unwrap().unwrap();
-            // Block persistence only, so the real endpoint revokes without touching router files.
-            let persist_guard = state.app_config_lock.lock().await;
+            // Use isolated temp config so the real endpoint persists and revokes without touching router files.
+            let temp_dir = std::env::temp_dir().join(format!("xkeen-ws-test-{}", uuid::Uuid::new_v4()));
+            tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+            let config_path = temp_dir.join("xkeen-ui.json");
+            let conf_dir = temp_dir.clone();
             let revoke = if mode != "expiration" {
                 let mut changed = state.auth_changes.subscribe();
                 let task_state = state.clone();
+                let task_config = config_path.clone();
+                let task_dir = conf_dir.clone();
                 let task = tokio::spawn(async move {
-                    if mode == "logout" {
-                        let mut headers = axum::http::HeaderMap::new();
-                        headers.insert("cookie", "session_id=victim".parse().unwrap());
-                        let _ = crate::auth::post_logout(State(task_state), headers).await;
-                    } else {
-                        let _ = crate::auth::post_auth_reset(State(task_state)).await;
-                    }
+                    crate::auth::TEST_AUTH_CONFIG_OVERRIDE
+                        .scope((task_config, task_dir), async move {
+                            if mode == "logout" {
+                                let mut headers = axum::http::HeaderMap::new();
+                                headers.insert("cookie", "session_id=victim".parse().unwrap());
+                                let _ = crate::auth::post_logout(State(task_state), headers).await;
+                            } else {
+                                let _ = crate::auth::post_auth_reset(State(task_state)).await;
+                            }
+                        })
+                        .await;
                 });
                 tokio::time::timeout(std::time::Duration::from_secs(2), changed.changed()).await.unwrap().unwrap();
                 Some(task)
@@ -383,10 +395,9 @@ mod tests {
                 other.send(WireMessage::Text(r#"{"type":"reload"}"#.into())).await.unwrap();
                 assert!(matches!(tokio::time::timeout(std::time::Duration::from_secs(2), other.next()).await.unwrap(), Some(Ok(WireMessage::Text(_)))));
             }
-            // Abort the pending endpoint while persistence is still locked.
-            if let Some(task) = revoke { task.abort(); let _ = task.await; }
+            if let Some(task) = revoke { let _ = task.await; }
             server.abort(); let _ = server.await;
-            drop(persist_guard);
+            _ = tokio::fs::remove_dir_all(&temp_dir).await;
             drop(victim); drop(other);
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {

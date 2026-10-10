@@ -1,3 +1,13 @@
+import YAML from 'yaml'
+import {
+  cleanObject,
+  formatMihomoProxyYaml,
+  formatMihomoProviderYaml,
+  validateMihomoProxy,
+  validateMihomoProvider,
+  validateXrayOutbound,
+} from './configYaml'
+
 const safeBase64 = (str) =>
   atob(
     str
@@ -7,14 +17,11 @@ const safeBase64 = (str) =>
   )
 
 const toYaml = (obj, indent = 0) => {
+  const cleaned = cleanObject(obj)
+  if (cleaned === undefined) return ''
+  const yamlStr = YAML.stringify(cleaned, { indent: 2 }).trimEnd()
   const padding = ' '.repeat(indent)
-  return Object.entries(obj).reduce((result, [key, value]) => {
-    if (value == null || value === '') return result
-    if (Array.isArray(value))
-      return value.length ? result + `${padding}${key}:\n` + value.map((item) => `${padding}  - ${item}`).join('\n') + '\n' : result
-    if (typeof value === 'object') return result + `${padding}${key}:\n${toYaml(value, indent + 2)}`
-    return result + `${padding}${key}: ${key === 'name' ? `'${String(value).replace(/'/g, "''")}'` : value}\n`
-  }, '')
+  return yamlStr.split('\n').map((l) => padding + l).join('\n') + '\n'
 }
 
 const randomHwid = () =>
@@ -354,7 +361,7 @@ function convertToMihomoYaml(proxyConfig) {
         : undefined,
     }
   }
-  return `  - ${toYaml(common).trim().replace(/\n/g, '\n    ')}`
+  return formatMihomoProxyYaml(common).trimEnd()
 }
 
 const parseHysteria2Xray = (uri) => {
@@ -396,29 +403,27 @@ function generateConfigForCore(uri, core = 'xray', existingConfig = '') {
 
   if (uri.startsWith('http') && core === 'mihomo') {
     const name = generateName('subscription')
+    const providerConfig = {
+      type: 'http',
+      url: uri,
+      interval: 43200,
+      'health-check': {
+        enable: true,
+        url: 'https://www.gstatic.com/generate_204',
+        interval: 300,
+        'expected-status': 204,
+      },
+      header: {
+        'User-Agent': ['ClashMeta/1.19.24; mihomo/1.19.24'],
+        'x-hwid': [randomHwid()],
+      },
+      override: { udp: true },
+    }
+    const content = formatMihomoProviderYaml(name, providerConfig)
+    validateMihomoProvider(content, name)
     return {
       type: 'proxy-provider',
-      content: toYaml(
-        {
-          [name]: {
-            type: 'http',
-            url: uri,
-            interval: 43200,
-            'health-check': {
-              enable: true,
-              url: 'https://www.gstatic.com/generate_204',
-              interval: 300,
-              'expected-status': 204,
-            },
-            header: {
-              'User-Agent': '["ClashMeta/1.19.24; mihomo/1.19.24"]',
-              'x-hwid': `["${randomHwid()}"]`,
-            },
-            override: { udp: true },
-          },
-        },
-        2
-      ),
+      content,
     }
   }
 
@@ -426,15 +431,29 @@ function generateConfigForCore(uri, core = 'xray', existingConfig = '') {
   if (core !== 'mihomo' && (uri.startsWith('hysteria2') || uri.startsWith('hy2'))) {
     const config = parseHysteria2Xray(uri)
     if (config.tag === 'PROXY' || existingConfig.includes(config.tag)) config.tag = generateName('hysteria')
-    return { type: 'outbound', content: JSON.stringify(config, null, 2) }
+    const content = JSON.stringify(config, null, 2)
+    validateXrayOutbound(content, config.tag)
+    return { type: 'outbound', content }
   }
 
   const config = parseProxyUri(uri)
   if (config.tag === 'PROXY' || existingConfig.includes(config.tag)) config.tag = generateName(config.protocol)
 
-  return core === 'mihomo'
-    ? { type: 'proxy', content: convertToMihomoYaml(config) + '\n' }
-    : { type: 'outbound', content: JSON.stringify(config, null, 2) }
+  if (core === 'mihomo') {
+    const content = convertToMihomoYaml(config) + '\n'
+    validateMihomoProxy(content, config.tag)
+    return { type: 'proxy', content }
+  } else {
+    const content = JSON.stringify(config, null, 2)
+    validateXrayOutbound(content, config.tag)
+    return { type: 'outbound', content }
+  }
 }
 
-window.generateConfigForCore = generateConfigForCore
+if (typeof window !== 'undefined') {
+  window.generateConfigForCore = generateConfigForCore
+} else if (typeof globalThis !== 'undefined') {
+  globalThis.generateConfigForCore = generateConfigForCore
+}
+
+export { generateConfigForCore, convertToMihomoYaml, toYaml }

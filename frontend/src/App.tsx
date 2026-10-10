@@ -24,6 +24,7 @@ import {
 } from './lib/types'
 import { parseClashApiCredentials } from './lib/utils'
 import { parse as parseJsonc } from 'jsonc-parser'
+import { validateMihomoProxy, validateMihomoProvider, validateXrayOutbound } from './lib/configYaml'
 
 const CommentsWarningModal = lazyLoad(() => import('./components/modals/CommentsWarning'), 'CommentsWarningModal')
 const CoreManageModal = lazyLoad(() => import('./components/modals/CoreManagement'), 'CoreManageModal')
@@ -375,6 +376,22 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
     (generated: string, type: string, position: 'start' | 'end') => {
       const appState = getAppState()
       const core = appState.currentCore
+
+      try {
+        if (core === 'mihomo') {
+          if (type === 'proxy') {
+            validateMihomoProxy(generated)
+          } else if (type === 'proxy-provider') {
+            validateMihomoProvider(generated)
+          }
+        } else {
+          validateXrayOutbound(generated)
+        }
+      } catch (e: any) {
+        showToast(e.message || 'Ошибка валидации конфигурации', 'error')
+        return
+      }
+
       let targetIndex = configActionsRef.current.getActiveIndex()
 
       if (core === 'mihomo') {
@@ -483,6 +500,17 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
 
   const onReplace = useCallback(
     (kind: 'proxy' | 'provider', content: string, oldName: string, renameRefs: boolean) => {
+      try {
+        if (kind === 'proxy') {
+          validateMihomoProxy(content)
+        } else {
+          validateMihomoProvider(content)
+        }
+      } catch (e: any) {
+        showToast(e.message || 'Ошибка валидации конфигурации', 'error')
+        return
+      }
+
       const appState = getAppState()
       const targetIndex = appState.configs.findIndex((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')
 
