@@ -1,4 +1,4 @@
-import { apiCall, fanOutRouters, type FanOutResult } from '../api'
+import { apiCall, fanOutRouters, type FanOutResult, mapConcurrent, ROUTER_CONCURRENCY_LIMIT } from '../api'
 import { LOCAL_ROUTER_ID, type RemoteRouter, isRouterSelectable, routerId, routerLabel } from './model'
 import { getBaseUrlForId, getTokenForId, useRoutersStore } from './store'
 
@@ -89,11 +89,13 @@ export async function pingRouterOnline(id: string): Promise<boolean> {
   }
 }
 
-export async function refreshAllOnline(): Promise<void> {
+export async function refreshAllOnline(concurrency = ROUTER_CONCURRENCY_LIMIT): Promise<void> {
   const { routers, setOnline, setAuth } = useRoutersStore.getState()
   const ids = [LOCAL_ROUTER_ID, ...routers.map(routerId)]
-  await Promise.all(
-    ids.map(async (id) => {
+  await mapConcurrent(
+    ids,
+    concurrency,
+    async (id) => {
       const online = await pingRouterOnline(id)
       if (id === LOCAL_ROUTER_ID || online) {
         setOnline(id, online)
@@ -109,7 +111,7 @@ export async function refreshAllOnline(): Promise<void> {
       }
       setOnline(id, false)
       setAuth(id, authEnabled === true)
-    })
+    }
   )
   const state = useRoutersStore.getState()
   const next = state.applyTargets.filter((id) => isRouterSelectable(id, state.online, state.auth, state.routers))

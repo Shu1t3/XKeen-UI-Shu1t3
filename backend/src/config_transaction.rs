@@ -39,7 +39,15 @@ pub fn write_atomic(path: &Path, content: &[u8], create_only: bool) -> Result<()
 fn write_with_hook(
     path: &Path, content: &[u8], create_only: bool, mut hook: impl FnMut(&str) -> io::Result<()>,
 ) -> Result<(), String> {
+    let parent_path = path.parent().ok_or_else(|| "Missing parent directory".to_string())?;
+    let canonical_parent = fs::canonicalize(parent_path).map_err(|e| e.to_string())?;
     let target = target_path(path).map_err(|e| e.to_string())?;
+    if !target.starts_with(&canonical_parent) {
+        return Err("Канонический путь выходит за пределы целевого каталога".into());
+    }
+    if target.file_name().and_then(|n| n.to_str()) == Some("xkeen-ui.json") {
+        return Err("Запрещена запись в файл настроек".into());
+    }
     let parent = target.parent().unwrap();
     let existing = match fs::metadata(&target) {
         Ok(metadata) => Some(metadata),
@@ -205,5 +213,21 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"new");
         assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o640);
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_parent_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = fixture();
+        let outside = fixture();
+        let target_file = outside.join("secret.json");
+        fs::write(&target_file, b"unmodified").unwrap();
+        let link = dir.join("link.json");
+        symlink(&target_file, &link).unwrap();
+        let res = write_atomic(&link, b"evil", false);
+        assert!(res.is_err(), "Должен отклонить symlink вне каталога");
+        assert_eq!(fs::read(&target_file).unwrap(), b"unmodified");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

@@ -628,20 +628,26 @@ pub(crate) fn parse_provider_defs(rule_providers: &Yaml, base_dir: &Path) -> Has
                 }
             }
             "file" => match get("path") {
-                Some(p) => Vehicle::Path(ruleset_inspector::resolve_provider_path_in(
+                Some(p) => match ruleset_inspector::resolve_provider_path_in(
                     &p,
                     &base_dir.to_string_lossy(),
-                )),
+                ) {
+                    Ok(path_str) => Vehicle::Path(path_str),
+                    Err(_) => Vehicle::Unusable,
+                },
                 None => Vehicle::Unusable,
             },
             "http" => {
                 let url = get("url");
                 let path = get("path");
                 match (path, url) {
-                    (Some(p), _) => Vehicle::Path(ruleset_inspector::resolve_provider_path_in(
+                    (Some(p), _) => match ruleset_inspector::resolve_provider_path_in(
                         &p,
                         &base_dir.to_string_lossy(),
-                    )),
+                    ) {
+                        Ok(path_str) => Vehicle::Path(path_str),
+                        Err(_) => Vehicle::Unusable,
+                    },
                     (None, Some(u)) => Vehicle::Path(format!("{}/rules/{:x}", base_dir.display(), md5::compute(&u))),
                     (None, None) => Vehicle::Unusable,
                 }

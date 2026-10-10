@@ -32,6 +32,7 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
     for path_str in paths {
         let path = Path::new(path_str);
         if path.is_dir() {
+            let canonical_dir = tokio::fs::canonicalize(path).await.ok();
             match tokio::fs::read_dir(path).await {
                 Err(e) => {
                     log("ERROR", format!("Не удалось открыть директорию {}: {}", path_str, e));
@@ -45,6 +46,24 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
                             entry_path.extension().is_some_and(|e| e == "json")
                         };
                         if matches {
+                            if let Ok(meta) = tokio::fs::symlink_metadata(&entry_path).await
+                                && meta.file_type().is_symlink()
+                            {
+                                if let Ok(resolved) = tokio::fs::canonicalize(&entry_path).await {
+                                    if let Some(ref cdir) = canonical_dir
+                                        && !resolved.starts_with(cdir)
+                                    {
+                                        log("WARN", format!("Пропуск symlink вне разрешенного каталога: {}", entry_path.display()));
+                                        continue;
+                                    }
+                                    if resolved.file_name().and_then(|n| n.to_str()) == Some("xkeen-ui.json") {
+                                        log("WARN", format!("Пропуск symlink на xkeen-ui.json: {}", entry_path.display()));
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
                             match tokio::fs::read_to_string(&entry_path).await {
                                 Ok(content) => results.push(ConfigItem {
                                     file: entry_path.to_string_lossy().into(),
@@ -62,6 +81,14 @@ async fn collect_configs(paths: &[String], is_mihomo: bool) -> Vec<ConfigItem> {
                 }
             }
         } else if path.exists() {
+            if let Ok(meta) = tokio::fs::symlink_metadata(path).await
+                && meta.file_type().is_symlink()
+                && let Ok(resolved) = tokio::fs::canonicalize(path).await
+                && resolved.file_name().and_then(|n| n.to_str()) == Some("xkeen-ui.json")
+            {
+                log("WARN", format!("Пропуск symlink на xkeen-ui.json: {}", path_str));
+                continue;
+            }
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => results.push(ConfigItem {
                     file: path_str.clone(),
@@ -110,15 +137,33 @@ pub async fn get_configs(
     let mut lst_configs = Vec::new();
 
     if let Ok(mut entries) = tokio::fs::read_dir(XKEEN_CONF_DIR).await {
+        let canonical_xkeen = tokio::fs::canonicalize(XKEEN_CONF_DIR).await.ok();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if (path.extension().is_some_and(|e| e == "lst") || name == "xkeen.json")
-                && let Ok(content) = tokio::fs::read_to_string(&path).await {
-                lst_configs.push(ConfigItem {
-                    file: path.to_string_lossy().into(),
-                    content,
-                });
+            if path.extension().is_some_and(|e| e == "lst") || name == "xkeen.json" {
+                if let Ok(meta) = tokio::fs::symlink_metadata(&path).await
+                    && meta.file_type().is_symlink()
+                {
+                    if let Ok(resolved) = tokio::fs::canonicalize(&path).await {
+                        if let Some(ref cdir) = canonical_xkeen
+                            && !resolved.starts_with(cdir)
+                        {
+                            continue;
+                        }
+                        if resolved.file_name().and_then(|n| n.to_str()) == Some("xkeen-ui.json") {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    lst_configs.push(ConfigItem {
+                        file: path.to_string_lossy().into(),
+                        content,
+                    });
+                }
             }
         }
     }
@@ -151,13 +196,54 @@ pub(crate) fn get_allowed_prefixes(state: &AppState, is_lst: bool) -> Vec<String
 }
 
 pub(crate) fn is_path_allowed(file: &str, prefixes: &[String]) -> bool {
-    prefixes.iter().any(|prefix| {
+    if file.contains("..") {
+        return false;
+    }
+    let file_path = Path::new(file);
+    let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if fname == "xkeen-ui.json" {
+        return false;
+    }
+
+    let lexical_match = prefixes.iter().any(|prefix| {
         let prefix_path = Path::new(prefix.as_str());
-        let file_path = Path::new(file);
         if prefix_path.is_dir() {
             file_path.starts_with(prefix_path)
         } else {
             file == prefix
+        }
+    });
+    if !lexical_match {
+        return false;
+    }
+
+    let canonical_file = if let Ok(canon) = std::fs::canonicalize(file_path) {
+        canon
+    } else if let Some(parent) = file_path.parent() {
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            if let Some(name) = file_path.file_name() {
+                canon_parent.join(name)
+            } else {
+                return false;
+            }
+        } else {
+            return true;
+        }
+    } else {
+        return false;
+    };
+
+    if canonical_file.file_name().and_then(|n| n.to_str()) == Some("xkeen-ui.json") {
+        return false;
+    }
+
+    prefixes.iter().any(|prefix| {
+        let prefix_path = Path::new(prefix.as_str());
+        let canon_prefix = std::fs::canonicalize(prefix_path).unwrap_or_else(|_| prefix_path.to_path_buf());
+        if prefix_path.is_dir() || canon_prefix.is_dir() {
+            canonical_file.starts_with(&canon_prefix)
+        } else {
+            canonical_file == canon_prefix
         }
     })
 }
@@ -166,7 +252,12 @@ fn check_access(file: &str, state: &AppState) -> Result<bool, &'static str> {
     if file.contains("..") {
         return Err("Invalid path");
     }
-    let is_xkeen = file.ends_with(".lst") || (file.ends_with(".json") && file.starts_with(XKEEN_CONF_DIR));
+    let file_path = Path::new(file);
+    let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if fname == "xkeen-ui.json" {
+        return Err("Access to settings file is forbidden");
+    }
+    let is_xkeen = file.ends_with(".lst") || (fname == "xkeen.json" && file.starts_with(XKEEN_CONF_DIR));
     let prefixes = get_allowed_prefixes(state, is_xkeen);
     if !is_path_allowed(file, &prefixes) {
         return Err("Path not allowed");
@@ -600,5 +691,69 @@ mod tests {
         .await
         .unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r37_collect_configs_skips_symlinks_pointing_outside_or_to_settings() {
+        use std::os::unix::fs::symlink;
+        let config_dir = fixture();
+        let outside_dir = fixture();
+
+        let valid_config = config_dir.join("valid.json");
+        fs::write(&valid_config, r#"{"valid": true}"#).unwrap();
+
+        let outside_secret = outside_dir.join("secret.json");
+        fs::write(&outside_secret, r#"{"secret": "leak"}"#).unwrap();
+
+        let symlink_escape = config_dir.join("escape.json");
+        symlink(&outside_secret, &symlink_escape).unwrap();
+
+        let settings_file = outside_dir.join("xkeen-ui.json");
+        fs::write(&settings_file, r#"{"password": "hash"}"#).unwrap();
+
+        let symlink_settings = config_dir.join("settings_link.json");
+        symlink(&settings_file, &symlink_settings).unwrap();
+
+        let paths = vec![config_dir.to_str().unwrap().to_string()];
+        let collected = collect_configs(&paths, false).await;
+
+        assert_eq!(collected.len(), 1, "Должен собраться только валидный файл внутри каталога");
+        assert_eq!(collected[0].file, valid_config.to_str().unwrap());
+
+        fs::remove_dir_all(config_dir).unwrap();
+        fs::remove_dir_all(outside_dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn r37_is_path_allowed_rejects_symlink_traversal_and_settings_file() {
+        use std::os::unix::fs::symlink;
+        let allowed_dir = fixture();
+        let outside_dir = fixture();
+
+        let normal_config = allowed_dir.join("config.json");
+        fs::write(&normal_config, "{}").unwrap();
+
+        let prefixes = vec![allowed_dir.to_str().unwrap().to_string()];
+        assert!(is_path_allowed(normal_config.to_str().unwrap(), &prefixes));
+
+        // Symlink pointing outside
+        let outside_file = outside_dir.join("secret.json");
+        fs::write(&outside_file, "{}").unwrap();
+        let symlink_escape = allowed_dir.join("link_escape.json");
+        symlink(&outside_file, &symlink_escape).unwrap();
+        assert!(!is_path_allowed(symlink_escape.to_str().unwrap(), &prefixes), "Symlink наружу должен быть отклонен");
+
+        // Target pointing to xkeen-ui.json
+        let settings_file = outside_dir.join("xkeen-ui.json");
+        fs::write(&settings_file, "{}").unwrap();
+        let symlink_settings = allowed_dir.join("link_settings.json");
+        symlink(&settings_file, &symlink_settings).unwrap();
+        assert!(!is_path_allowed(symlink_settings.to_str().unwrap(), &prefixes), "Symlink на xkeen-ui.json должен быть отклонен");
+
+        // Direct xkeen-ui.json
+        assert!(!is_path_allowed(allowed_dir.join("xkeen-ui.json").to_str().unwrap(), &prefixes));
+
+        fs::remove_dir_all(allowed_dir).unwrap();
+        fs::remove_dir_all(outside_dir).unwrap();
     }
 }

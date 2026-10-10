@@ -265,24 +265,28 @@ fn is_private_ipv4(ip: &str) -> bool {
     }
 }
 
-pub fn get_all_segment_ips() -> Result<Vec<LanSegment>, String> {
+pub async fn get_all_segment_ips() -> Result<Vec<LanSegment>, String> {
     #[cfg(test)]
     if let Ok(override_segs) = TEST_SEGMENTS_OVERRIDE.try_with(|s| s.clone()) {
         return Ok(override_segs);
     }
 
-    let output = std::process::Command::new("ip")
-        .args(["-4", "a"])
-        .output()
-        .map_err(|e| format!("Ошибка выполнения ip: {e}"))?;
+    let mut cmd = tokio::process::Command::new("ip");
+    cmd.args(["-4", "a"]).kill_on_drop(true);
+    let output = match tokio::time::timeout(Duration::from_secs(5), cmd.output()).await {
+        Ok(res) => res.map_err(|e| format!("Ошибка выполнения ip: {e}"))?,
+        Err(_) => return Err("Превышен таймаут выполнения команды ip (5 с)".into()),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let segments = parse_ip_addr_segments(&stdout);
     if segments.is_empty() {
-        let br0_out = std::process::Command::new("ip")
-            .args(["-4", "a", "s", "br0"])
-            .output()
-            .map_err(|e| format!("Ошибка выполнения ip: {e}"))?;
+        let mut br0_cmd = tokio::process::Command::new("ip");
+        br0_cmd.args(["-4", "a", "s", "br0"]).kill_on_drop(true);
+        let br0_out = match tokio::time::timeout(Duration::from_secs(5), br0_cmd.output()).await {
+            Ok(res) => res.map_err(|e| format!("Ошибка выполнения ip: {e}"))?,
+            Err(_) => return Err("Превышен таймаут выполнения команды ip br0 (5 с)".into()),
+        };
         let br0_stdout = String::from_utf8_lossy(&br0_out.stdout);
         let br0_segs = parse_ip_addr_segments(&br0_stdout);
         if !br0_segs.is_empty() {
@@ -744,7 +748,7 @@ pub async fn post_dns(State(state): State<AppState>, Json(req): Json<DnsEnableRe
     }
 
     // 3. Obtain LAN segments
-    let segments = match get_all_segment_ips() {
+    let segments = match get_all_segment_ips().await {
         Ok(segs) => segs,
         Err(e) => {
             log("ERROR", e.clone());

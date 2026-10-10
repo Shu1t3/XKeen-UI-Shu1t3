@@ -118,26 +118,51 @@ export async function clashFetch<T = unknown>(
 
 export type FanOutResult = { id: string; ok: boolean; error?: string }
 
+/**
+ * Run mapping function over items with limited concurrency.
+ * @param items Array of items to process
+ * @param concurrency Maximum concurrent executions (default 6)
+ * @param fn Worker function returning Promise
+ */
+export async function mapConcurrent<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const limit = Math.max(1, concurrency)
+  const results = new Array<R>(items.length)
+  let currentIndex = 0
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (currentIndex < items.length) {
+      const idx = currentIndex++
+      results[idx] = await fn(items[idx], idx)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
+
+export const ROUTER_CONCURRENCY_LIMIT = 6
+
 export async function fanOutRouters(
   targetIds: string[],
   task: (id: string, baseUrl: string | null) => Promise<void>,
-  getBaseUrl: (id: string) => string | null
+  getBaseUrl: (id: string) => string | null,
+  concurrency = ROUTER_CONCURRENCY_LIMIT
 ): Promise<FanOutResult[]> {
   if (targetIds.length === 0) throw new Error('Выберите хотя бы один роутер')
-  const results = await Promise.allSettled(
-    targetIds.map(async (id) => {
+  return mapConcurrent(targetIds, concurrency, async (id) => {
+    try {
       const baseUrl = getBaseUrl(id)
       if (id !== LOCAL_ROUTER_ID && !baseUrl) throw new Error(`Не задан адрес роутера ${id}`)
       await task(id, baseUrl)
-      return id
-    })
-  )
-
-  return results.map((result, index) => {
-    const id = targetIds[index]
-    if (result.status === 'fulfilled') return { id, ok: true }
-    const error = result.reason instanceof Error ? result.reason.message : String(result.reason ?? 'Ошибка')
-    return { id, ok: false, error }
+      return { id, ok: true }
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err ?? 'Ошибка')
+      return { id, ok: false, error }
+    }
   })
 }
 

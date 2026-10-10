@@ -2,6 +2,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::SystemTime;
 use tokio::process::Command;
@@ -93,7 +94,10 @@ pub async fn get_ruleset_content(State(_state): State<AppState>, Query(params): 
     let path = provider["path"].as_str();
 
     let final_path = match path {
-        Some(p) => resolve_provider_path(p),
+        Some(p) => match resolve_provider_path(p) {
+            Ok(p) => p,
+            Err(e) => return error_response(e),
+        },
         None => match url {
             Some(u) => format!("{}/rules/{:x}", MIHOMO_CONF_DIR, md5::compute(u)),
             None => return error_response("В провайдере нет ни path, ни url".into()),
@@ -162,7 +166,10 @@ pub async fn get_proxy_provider_content(
     let path = provider["path"].as_str();
 
     let final_path = match path {
-        Some(p) => resolve_provider_path(p),
+        Some(p) => match resolve_provider_path(p) {
+            Ok(p) => p,
+            Err(e) => return error_response(e),
+        },
         None => match url {
             Some(u) => format!("{}/proxies/{:x}", MIHOMO_CONF_DIR, md5::compute(u)),
             None => return error_response("В провайдере нет ни path, ни url".into()),
@@ -197,16 +204,31 @@ pub(crate) async fn convert_mrs(mrs_path: &str, behavior: &str) -> Result<String
     }
 
     let behavior = behavior.to_ascii_lowercase();
+    match behavior.as_str() {
+        "domain" | "ipcidr" | "classical" => {}
+        _ => return Err(format!("Недопустимый behavior: '{behavior}'. Разрешены только: domain, ipcidr, classical")),
+    }
+
     let tmp_path = format!("/tmp/convert-ruleset_{}", random_suffix());
 
-    let output = Command::new(opt_path!("/sbin/mihomo"))
-        .args(["convert-ruleset", behavior.as_str(), "mrs", mrs_path, &tmp_path])
-        .output()
-        .await
-        .map_err(|e| format!("Ошибка запуска mihomo: {e}"))?;
+    struct TmpGuard(PathBuf);
+    impl Drop for TmpGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = TmpGuard(PathBuf::from(&tmp_path));
+
+    let mut cmd = Command::new(opt_path!("/sbin/mihomo"));
+    cmd.args(["convert-ruleset", behavior.as_str(), "mrs", mrs_path, &tmp_path])
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await {
+        Ok(res) => res.map_err(|e| format!("Ошибка запуска mihomo: {e}"))?,
+        Err(_) => return Err("Превышен таймаут выполнения mihomo convert-ruleset (15 с)".into()),
+    };
 
     if !output.status.success() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
             "mihomo convert-ruleset упал с кодом {}: {}",
@@ -216,10 +238,9 @@ pub(crate) async fn convert_mrs(mrs_path: &str, behavior: &str) -> Result<String
 
     let content = tokio::fs::read_to_string(&tmp_path)
         .await
-        .map_err(|e| format!("Ошибка чтения результата конвертации: {e}"));
+        .map_err(|e| format!("Ошибка чтения результата конвертации: {e}"))?;
 
-    let _ = tokio::fs::remove_file(&tmp_path).await;
-    content
+    Ok(content)
 }
 
 fn random_suffix() -> String {
@@ -231,19 +252,55 @@ fn random_suffix() -> String {
     format!("{:08x}", nanos ^ std::process::id().wrapping_shl(8))
 }
 
-fn resolve_provider_path(path: &str) -> String {
+fn resolve_provider_path(path: &str) -> Result<String, String> {
     resolve_provider_path_in(path, MIHOMO_CONF_DIR)
 }
 
 /// Резолвит относительный `path` провайдера к каталогу mihomo. Параметризовано по `base_dir`,
 /// чтобы `route_test::providers` могло переиспользовать ту же логику с временным каталогом
 /// в тестах (боевой код всегда зовёт через `resolve_provider_path`, привязанный к `MIHOMO_CONF_DIR`).
-pub(crate) fn resolve_provider_path_in(path: &str, base_dir: &str) -> String {
-    if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("{}/{}", base_dir, path.trim_start_matches("./"))
+pub(crate) fn resolve_provider_path_in(path: &str, base_dir: &str) -> Result<String, String> {
+    if path.contains("..") {
+        return Err("Обнаружена попытка выхода за пределы каталога (..)".into());
     }
+    let base = Path::new(base_dir);
+    let candidate = if path.starts_with('/') {
+        PathBuf::from(path)
+    } else {
+        base.join(path.trim_start_matches("./"))
+    };
+
+    let mut normalized = PathBuf::new();
+    for comp in candidate.components() {
+        match comp {
+            std::path::Component::Prefix(p) => normalized.push(p.as_os_str()),
+            std::path::Component::RootDir => normalized.push("/"),
+            std::path::Component::CurDir => {},
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("Обнаружена попытка выхода за пределы каталога".into());
+                }
+            }
+            std::path::Component::Normal(c) => normalized.push(c),
+        }
+    }
+
+    if !normalized.starts_with(base) {
+        return Err(format!("Путь '{}' выходит за пределы базового каталога {}", path, base_dir));
+    }
+
+    if let Ok(canon_base) = std::fs::canonicalize(base)
+        && let Ok(canon_target) = std::fs::canonicalize(&normalized)
+    {
+        if !canon_target.starts_with(&canon_base) {
+            return Err(format!("Канонический путь '{}' выходит за пределы базового каталога {}", path, base_dir));
+        }
+        if canon_target.file_name().and_then(|n| n.to_str()) == Some("xkeen-ui.json") {
+            return Err("Доступ к файлу настроек запрещен".into());
+        }
+    }
+
+    Ok(normalized.to_string_lossy().to_string())
 }
 
 fn ok_response(content: String) -> Response {
@@ -301,6 +358,62 @@ mod tests {
         .unwrap();
 
         assert!(!Arc::ptr_eq(&p1, &p2), "invalidate_mihomo_yaml_cache должен был очистить provider cache");
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn r37_resolve_provider_path_in_boundary_isolation() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-r37-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let base_dir_str = temp_dir.to_str().unwrap();
+
+        // 1. Valid relative paths
+        let valid_rel = resolve_provider_path_in("rules/direct.yaml", base_dir_str);
+        assert!(valid_rel.is_ok());
+        let valid_dot_slash = resolve_provider_path_in("./rules/direct.yaml", base_dir_str);
+        assert!(valid_dot_slash.is_ok());
+
+        // 2. Traversal rejection (..)
+        assert!(resolve_provider_path_in("../../etc/shadow", base_dir_str).is_err());
+        assert!(resolve_provider_path_in("rules/../../etc/passwd", base_dir_str).is_err());
+
+        // 3. Absolute path outside base_dir
+        assert!(resolve_provider_path_in("/etc/shadow", base_dir_str).is_err());
+
+        // 4. Symlink escaping base_dir
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside_dir = std::env::temp_dir().join(format!("xkeen-outside-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            let outside_file = outside_dir.join("secret.yaml");
+            std::fs::write(&outside_file, "payload: []").unwrap();
+
+            let link_file = temp_dir.join("symlink_escape.yaml");
+            symlink(&outside_file, &link_file).unwrap();
+
+            let res = resolve_provider_path_in("symlink_escape.yaml", base_dir_str);
+            assert!(res.is_err(), "Symlink вне базовой директории должен быть отклонен");
+
+            let _ = std::fs::remove_dir_all(&outside_dir);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn r38_convert_mrs_validates_behavior() {
+        let temp_dir = std::env::temp_dir().join(format!("xkeen-r38-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let mrs_file = temp_dir.join("test.mrs");
+        tokio::fs::write(&mrs_file, b"dummy").await.unwrap();
+        let mrs_path = mrs_file.to_str().unwrap();
+
+        // Invalid behaviors must be rejected immediately without running mihomo
+        assert!(convert_mrs(mrs_path, "invalid_behavior").await.is_err());
+        assert!(convert_mrs(mrs_path, "--help").await.is_err());
+        assert!(convert_mrs(mrs_path, "domain; rm -rf /").await.is_err());
+
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

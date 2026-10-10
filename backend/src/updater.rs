@@ -387,18 +387,20 @@ async fn save(dl: DownloadResult, out_path: PathBuf) -> std::io::Result<()> {
 
 async fn install_jq() -> Result<(), String> {
     log("INFO", "Установка jq через opkg...".into());
-    let update = Command::new("opkg")
-        .arg("update")
-        .status()
+    let mut update_cmd = Command::new("opkg");
+    update_cmd.arg("update").kill_on_drop(true);
+    let update = tokio::time::timeout(Duration::from_secs(30), update_cmd.status())
         .await
+        .map_err(|_| "Превышен таймаут opkg update (30 с)".to_string())?
         .map_err(|e| format!("opkg update: {}", e))?;
     if !update.success() {
         return Err("Ошибка обновления opkg кеша".into());
     }
-    let install = Command::new("opkg")
-        .args(["install", "jq"])
-        .status()
+    let mut install_cmd = Command::new("opkg");
+    install_cmd.args(["install", "jq"]).kill_on_drop(true);
+    let install = tokio::time::timeout(Duration::from_secs(30), install_cmd.status())
         .await
+        .map_err(|_| "Превышен таймаут opkg install jq (30 с)".to_string())?
         .map_err(|e| format!("opkg install jq: {}", e))?;
     if !install.success() {
         return Err("Ошибка установки jq".into());
