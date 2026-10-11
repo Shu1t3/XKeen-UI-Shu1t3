@@ -41,6 +41,8 @@ for SCRIPT in setup.sh scripts/switch-to-fork.sh; do
   EXPECTED=$(sha256sum "$CHECK_ROOT/binary"); EXPECTED=${EXPECTED%% *}
   jq -n --arg digest "sha256:$EXPECTED" '{tag_name:"v1.0.0",draft:false,assets:[{name:"xkeen-ui-arm64-v8a",state:"uploaded",digest:$digest}]}' > "$CHECK_ROOT/release"
   test "$(release_asset_digest "$CHECK_ROOT/release" v1.0.0 xkeen-ui-arm64-v8a)" = "$EXPECTED"
+  jq '.assets[0].digest |= ascii_upcase | .assets[0].digest |= sub("SHA256:"; "sha256:")' "$CHECK_ROOT/release" > "$CHECK_ROOT/uppercase"
+  test "$(release_asset_digest "$CHECK_ROOT/uppercase" v1.0.0 xkeen-ui-arm64-v8a)" = "$EXPECTED"
   verify_release_file "$CHECK_ROOT/binary" "$EXPECTED"
   printf changed >> "$CHECK_ROOT/binary"
   if verify_release_file "$CHECK_ROOT/binary" "$EXPECTED" >/dev/null 2>&1; then exit 1; fi

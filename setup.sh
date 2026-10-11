@@ -69,7 +69,13 @@ get_arch() {
 }
 
 select_release_tag() {
-  jq -er --arg channel "$RELEASE_CHANNEL" '[.[] | select(.draft != true) | select($channel == "latest" or ($channel == "beta" and .prerelease == true) or ($channel == "stable" and .prerelease != true))] | first | .tag_name | select(type == "string" and test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$"))'
+  local tag
+  tag=$(jq -er --arg channel "$RELEASE_CHANNEL" '[.[] | select(.draft != true) | select($channel == "latest" or ($channel == "beta" and .prerelease == true) or ($channel == "stable" and .prerelease != true))] | first | .tag_name | select(type == "string")') || return 1
+  if printf '%s' "$tag" | grep -qE '^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?$'; then
+    printf '%s\n' "$tag"
+  else
+    return 1
+  fi
 }
 
 # Metadata is trusted only when obtained directly from GitHub over HTTPS.
@@ -81,11 +87,17 @@ get_trusted_release() {
   [ "$status" = 200 ] || { printf 'GitHub API вернул неожиданный HTTP-статус: %s\n' "$status" >&2; return 1; }
 }
 release_asset_digest() {
-  jq -er --arg tag "$2" --arg name "$3" '
+  local digest
+  digest=$(jq -er --arg tag "$2" --arg name "$3" '
     select(.draft == false and .tag_name == $tag)
     | [.assets[] | select(.name == $name)] | select(length == 1) | .[0] | select(.state == "uploaded") | .digest
-    | select(type == "string" and test("^sha256:[0-9a-fA-F]{64}$"))
-    | .[7:] | ascii_downcase' "$1"
+    | select(type == "string")' "$1") || return 1
+  if printf '%s' "$digest" | grep -qE '^sha256:[0-9a-fA-F]{64}$'; then
+    digest="${digest#sha256:}"
+    printf '%s\n' "$digest" | tr 'A-Z' 'a-z'
+  else
+    return 1
+  fi
 }
 verify_release_file() {
   local actual
