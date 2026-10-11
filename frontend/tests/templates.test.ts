@@ -6,6 +6,7 @@ import {
   assertGeoFilesAvailable,
   assertTemplateImportCurrent,
   DEFAULT_TEMPLATE_OPTIONS,
+  missingGeoFiles,
   prepareTemplateImport,
   proxyOutboundTags,
   requiredGeoFiles,
@@ -227,4 +228,18 @@ test('preserving a Unix-only Mihomo API does not enable an additional TCP listen
 test('Outbounds refuses duplicate built-in tags instead of pretending to repair them', () => {
   const duplicate = config('/opt/etc/xray/configs/extra.json', '{"outbounds":[{"tag":"direct","protocol":"freedom"}]}')
   expect(() => prepare('xray-outbounds', servers, [servers, duplicate])).toThrow('повторяется')
+})
+
+test('missing geodata lists every requirement with its type and excludes installed files', () => {
+  const file = prepare('xray-routing-blocked', routes, [routes, servers])
+  expect(missingGeoFiles(file.content, { site_files: ['zkeen.dat'], ip_files: [] })).toEqual([{ file: 'zkeenip.dat', kind: 'ip' }])
+  expect(missingGeoFiles(file.content, { site_files: [], ip_files: [] })).toEqual([
+    { file: 'zkeen.dat', kind: 'domain' },
+    { file: 'zkeenip.dat', kind: 'ip' },
+  ])
+  expect(missingGeoFiles(file.content, { site_files: ['zkeenip.dat'], ip_files: ['zkeen.dat'] })).toHaveLength(2)
+  const exceptRu = prepare('xray-routing-except-ru', routes, [routes, servers])
+  expect(missingGeoFiles(exceptRu.content, { site_files: [], ip_files: ['zkeenip.dat'] })).toEqual([
+    { file: 'geosite_v2fly.dat', kind: 'domain' },
+  ])
 })

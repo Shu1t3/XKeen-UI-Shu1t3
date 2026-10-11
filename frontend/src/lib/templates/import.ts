@@ -257,8 +257,12 @@ export function requiredGeoFiles(content: string): { file: string; kind: 'domain
   return [...entries.values()]
 }
 
+export function missingGeoFiles(content: string, geo: { site_files: string[]; ip_files: string[] }) {
+  return requiredGeoFiles(content).filter(({ file, kind }) => !(kind === 'domain' ? geo.site_files : geo.ip_files).includes(file))
+}
+
 export function assertGeoFilesAvailable(content: string, geo: { site_files: string[]; ip_files: string[] }): void {
-  const missing = requiredGeoFiles(content).filter(({ file, kind }) => !(kind === 'domain' ? geo.site_files : geo.ip_files).includes(file))
+  const missing = missingGeoFiles(content, geo)
   if (missing.length)
     throw new Error(`Не найдены геофайлы нужного типа: ${missing.map(({ file }) => file).join(', ')}. Установите их перед импортом`)
 }

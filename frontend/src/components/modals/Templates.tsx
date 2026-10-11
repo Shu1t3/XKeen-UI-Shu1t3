@@ -13,6 +13,7 @@ import {
   assertGeoFilesAvailable,
   assertTemplateImportCurrent,
   DEFAULT_TEMPLATE_OPTIONS,
+  missingGeoFiles,
   prepareTemplateImport,
   proxyOutboundTags,
   templateTargets,
@@ -39,6 +40,8 @@ function TemplateForm({ onImport }: Props) {
   const [options, setOptions] = useState(DEFAULT_TEMPLATE_OPTIONS)
   const [preview, setPreview] = useState<TemplateImport | null>(null)
   const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState('Проверка...')
+  const [missing, setMissing] = useState<{ selection: string; files: string[] } | null>(null)
   const request = useRef(0)
   useEffect(
     () => () => {
@@ -63,23 +66,48 @@ function TemplateForm({ onImport }: Props) {
   const outboundTag = outboundTags.includes(options.outboundTag) ? options.outboundTag : (outboundTags[0] ?? '')
   const close = () => dispatch({ type: 'SHOW_MODAL', modal: 'showTemplateModal', show: false })
 
-  async function prepare() {
+  const selection = JSON.stringify([selectedId, file, options, outboundTag])
+  const missingFiles = missing?.selection === selection ? missing.files : []
+
+  async function prepare(installMissing = false) {
     const id = ++request.current
     setBusy(true)
+    setProgress('Проверка...')
+    setMissing(null)
     try {
       const current = getAppState()
       const result = prepareTemplateImport(selectedId, file, current.currentCore, current.configs, { ...options, outboundTag })
       if (isRouting) {
-        const geo = await apiCall<{ success: boolean; site_files?: string[]; ip_files?: string[]; error?: string }>(
-          'GET',
-          'geo',
-          undefined,
-          { timeoutMs: 10000 }
-        )
-        if (!geo.success || !Array.isArray(geo.site_files) || !Array.isArray(geo.ip_files)) {
-          throw new Error(geo.error || 'Не удалось проверить геофайлы. Повторите предпросмотр')
+        const readGeo = async () => {
+          const geo = await apiCall<{ success: boolean; site_files?: string[]; ip_files?: string[]; error?: string }>(
+            'GET',
+            'geo',
+            undefined,
+            { timeoutMs: 10000 }
+          )
+          if (!geo.success || !Array.isArray(geo.site_files) || !Array.isArray(geo.ip_files)) {
+            throw new Error(geo.error || 'Не удалось проверить геофайлы. Повторите предпросмотр')
+          }
+          return { site_files: geo.site_files, ip_files: geo.ip_files }
         }
-        assertGeoFilesAvailable(result.content, { site_files: geo.site_files, ip_files: geo.ip_files })
+        let geo = await readGeo()
+        if (id !== request.current) return
+        const required = missingGeoFiles(result.content, geo).map(({ file }) => file)
+        if (required.length) {
+          setMissing({ selection, files: required })
+          if (!installMissing) return
+          const latest = getAppState()
+          assertTemplateImportCurrent(result, latest.currentCore, latest.configs)
+          setProgress('Установка геофайлов...')
+          // This is an explicit action: preview alone never writes to the router.
+          const installed = await apiCall<{ success: boolean; error?: string }>('POST', 'geo/install', { files: required })
+          if (id !== request.current) return
+          if (!installed.success) throw new Error(installed.error || 'Не удалось установить геофайлы')
+          geo = await readGeo()
+          if (id !== request.current) return
+          showToast('Геофайлы установлены')
+        }
+        assertGeoFilesAvailable(result.content, geo)
       }
       if (id !== request.current) return
       const latest = getAppState()
@@ -214,6 +242,18 @@ function TemplateForm({ onImport }: Props) {
                     Перед предпросмотром проверяются теги Outbounds и наличие геофайлов на роутере. Категории внутри геофайлов проверит ядро
                     при применении.
                   </p>
+                  {missingFiles.length > 0 && (
+                    <div className="space-y-2 rounded-md border border-amber-500/40 p-3">
+                      <p className="text-sm">Не хватает геофайлов: {missingFiles.join(', ')}.</p>
+                      <p className="text-muted-foreground text-xs">
+                        Скачаем все недостающие файлы выбранного шаблона и проверим их перед установкой. Работающее ядро не перезапускается.
+                        Загрузка может занять несколько минут.
+                      </p>
+                      <Button variant="outline" disabled={busy} onClick={() => void prepare(true)} className="w-full whitespace-normal">
+                        Скачать недостающие файлы
+                      </Button>
+                    </div>
+                  )}
                   {(outboundError || outboundTags.length === 0) && (
                     <p className="text-sm text-amber-500">{outboundError || 'Сначала добавьте прокси-подключение в Outbounds.'}</p>
                   )}
@@ -285,7 +325,7 @@ function TemplateForm({ onImport }: Props) {
               disabled={!file || busy || (isRouting && (!outboundTag || !!outboundError))}
               className="w-full"
             >
-              {busy ? 'Проверка...' : 'Предпросмотр'}
+              {busy ? progress : 'Предпросмотр'}
             </Button>
           )}
         </DialogFooter>

@@ -14,6 +14,7 @@ mod core_switch;
 mod dns;
 mod frontend_embedder;
 mod geo;
+mod geo_install;
 mod local_dev;
 mod logger;
 mod release_source;
@@ -526,6 +527,7 @@ async fn main() {
         .route("/api/device-list", get(api_relay::get_device_list))
         .route("/api/update", post(updater::post_update))
         .route("/api/geo", get(geo::get_geo))
+        .route("/api/geo/install", post(geo_install::post_install))
         .route("/api/geo/site", get(geo::get_geosite))
         .route("/api/geo/ip", get(geo::get_geoip))
         .route(

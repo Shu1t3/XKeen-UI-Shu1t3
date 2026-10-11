@@ -81,20 +81,120 @@ pub async fn asset(repo: &str, tag: &str, name: &str) -> Result<TrustedAsset, St
     select(release, repo, tag, name)
 }
 
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<Release, String> {
+// Bound both the number of attempts and the entire metadata operation.
+const METADATA_ATTEMPTS: usize = 5;
+const METADATA_BUDGET: Duration = Duration::from_secs(180);
+
+struct FetchFailure {
+    message: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+fn network_failure(error: reqwest::Error) -> FetchFailure {
+    use std::error::Error;
+    // bytes() reports truncated HTTP bodies as decode errors, before JSON parsing.
+    let retryable = error.is_connect() || error.is_timeout() || error.is_body() || error.is_decode();
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    FetchFailure {
+        message: format!("Прямой GitHub API недоступен: {message}"),
+        retryable,
+        retry_after: None,
+    }
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get("retry-after")?.to_str().ok()?;
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    // GitHub normally sends seconds; HTTP also permits an absolute GMT date.
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default(),
+    )
+}
+
+async fn fetch_once(client: &reqwest::Client, url: &str) -> Result<Release, FetchFailure> {
     let response = client
         .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| format!("Прямой GitHub API недоступен: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("Прямой GitHub API: {}", response.status()));
+        .map_err(network_failure)?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = retry_after(response.headers());
+        return Err(FetchFailure {
+            message: format!("Прямой GitHub API: {status}"),
+            retryable: matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+                || (status.as_u16() == 403 && retry_after.is_some()),
+            retry_after,
+        });
     }
-    response
-        .json()
-        .await
-        .map_err(|e| format!("Некорректные доверенные метаданные: {e}"))
+    // Read the body separately so interrupted transfers can be retried, while
+    // invalid JSON and invalid integrity metadata remain terminal failures.
+    let bytes = response.bytes().await.map_err(network_failure)?;
+    serde_json::from_slice(&bytes).map_err(|error| FetchFailure {
+        message: format!("Некорректные доверенные метаданные: {error}"),
+        retryable: false,
+        retry_after: None,
+    })
+}
+
+async fn fetch(client: &reqwest::Client, url: &str) -> Result<Release, String> {
+    fetch_with_policy(client, url, Duration::from_secs(1), METADATA_BUDGET).await
+}
+
+async fn fetch_with_policy(
+    client: &reqwest::Client, url: &str, base_delay: Duration, budget: Duration,
+) -> Result<Release, String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut last_error = String::new();
+    for attempt in 1..=METADATA_ATTEMPTS {
+        let failure = match tokio::time::timeout_at(deadline, fetch_once(client, url)).await {
+            Ok(Ok(release)) => return Ok(release),
+            Ok(Err(failure)) => failure,
+            Err(_) => {
+                return Err(format!(
+                    "Истекло время проверки GitHub API ({} с), попытка {attempt}/{METADATA_ATTEMPTS}. {last_error}",
+                    budget.as_secs()
+                ));
+            }
+        };
+        last_error = failure.message;
+        if !failure.retryable || attempt == METADATA_ATTEMPTS {
+            return Err(format!("{last_error} (попытка {attempt}/{METADATA_ATTEMPTS})"));
+        }
+        let delay = base_delay
+            .saturating_mul(1 << (attempt - 1))
+            .max(failure.retry_after.unwrap_or_default());
+        // Never retry earlier than Retry-After, or extend the total budget.
+        if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+            return Err(format!(
+                "{last_error}. Следующая попытка не укладывается в лимит {} с",
+                budget.as_secs()
+            ));
+        }
+        crate::logger::log(
+            "WARN",
+            format!(
+                "{last_error}. Повтор {}/{METADATA_ATTEMPTS} через {:.1} с",
+                attempt + 1,
+                delay.as_secs_f64()
+            ),
+        );
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("metadata attempts are nonzero")
 }
 
 impl TrustedAsset {
@@ -265,11 +365,224 @@ mod tests {
             .unwrap();
         assert!(fetch(&client, &format!("{base}/redirect")).await.is_err());
         assert!(
-            fetch(&client, &format!("{base}/unavailable"))
+            fetch_with_policy(&client, &format!("{base}/unavailable"), Duration::ZERO, Duration::from_secs(5))
                 .await
                 .is_err()
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+    #[tokio::test]
+    async fn metadata_retries_transient_statuses_but_not_invalid_or_missing_metadata() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for (status, recover, expected_hits) in [
+            (StatusCode::SERVICE_UNAVAILABLE, true, 3),
+            (StatusCode::TOO_MANY_REQUESTS, true, 3),
+            (StatusCode::GATEWAY_TIMEOUT, false, METADATA_ATTEMPTS),
+            (StatusCode::NOT_FOUND, false, 1),
+            (StatusCode::FORBIDDEN, false, 1),
+            (StatusCode::FOUND, false, 1),
+            (StatusCode::OK, false, 1), // Invalid JSON is not a network failure.
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let h = hits.clone();
+            let app = Router::new().route(
+                "/",
+                get(move || {
+                    let h = h.clone();
+                    async move {
+                        let attempt = h.fetch_add(1, Ordering::SeqCst) + 1;
+                        if recover && attempt >= 3 {
+                            (StatusCode::OK, r#"{"tag_name":"v1","draft":false,"assets":[]}"#)
+                        } else {
+                            (status, "invalid JSON")
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let result = fetch_with_policy(&client, &url, Duration::ZERO, Duration::from_secs(5)).await;
+            assert_eq!(result.is_ok(), recover, "status {status}");
+            assert_eq!(hits.load(Ordering::SeqCst), expected_hits, "status {status}");
+            if let Err(message) = result {
+                assert!(message.contains(&format!("попытка {expected_hits}/{METADATA_ATTEMPTS}")));
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_retries_request_timeouts_and_reports_the_underlying_cause() {
+        use axum::{Router, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let h = h.clone();
+                async move {
+                    if h.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    r#"{"tag_name":"v1","draft":false,"assets":[]}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        assert!(
+            fetch_with_policy(&client, &url, Duration::ZERO, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // A closed local port gives a deterministic transport error and source chain.
+        server.abort();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let message = fetch_with_policy(&client, &closed_url, Duration::ZERO, Duration::from_secs(5))
+            .await
+            .err()
+            .unwrap();
+        assert!(message.contains("попытка 5/5"), "{message}");
+        assert!(
+            message.contains("Connection refused") || message.contains("connection refused"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_respects_retry_after_and_does_not_extend_the_total_budget() {
+        use axum::{
+            Router,
+            http::{StatusCode, header},
+            routing::get,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new()
+            .route(
+                "/limited",
+                get(move || {
+                    let h = h.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "60")])
+                    }
+                }),
+            )
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    "{}"
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let message = fetch_with_policy(
+            &client,
+            &format!("{base}/limited"),
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            message.contains("429") && message.contains("не укладывается"),
+            "{message}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let start = tokio::time::Instant::now();
+        let message = fetch_with_policy(
+            &client,
+            &format!("{base}/slow"),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(message.contains("Истекло время"), "{message}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        server.abort();
+    }
+
+    #[test]
+    fn retry_after_supports_seconds_and_http_dates() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "60".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(60)));
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc2822();
+        headers.insert("retry-after", future.parse().unwrap());
+        let delay = retry_after(&headers).unwrap();
+        assert!(delay > Duration::from_secs(58) && delay <= Duration::from_secs(60));
+        headers.insert("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::ZERO));
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        assert_eq!(retry_after(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn metadata_retries_interrupted_response_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 4096);
+                }
+                let body = r#"{"tag_name":"v1","draft":false,"assets":[]}"#;
+                let response = if attempt == 0 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result = fetch_with_policy(&client, &url, Duration::ZERO, Duration::from_secs(5)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        server.await.unwrap();
     }
 }

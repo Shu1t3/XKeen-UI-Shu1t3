@@ -159,7 +159,7 @@ pub(crate) fn parse_domain_and_match(mut buf: &[u8], dom_low: &str) -> bool {
     }
 }
 
-fn detect_geo_file_type(data: &[u8]) -> (bool, bool) {
+pub(crate) fn detect_geo_file_type(data: &[u8]) -> (bool, bool) {
     let mut buf = data;
     let Ok((1, WireType::LengthDelimited)) = decode_key(&mut buf) else {
         return (false, false);
@@ -197,13 +197,28 @@ fn detect_geo_file_type(data: &[u8]) -> (bool, bool) {
 }
 
 pub fn list_geo_files(cache_arc: Arc<RwLock<crate::types::GeoCache>>) -> Result<GeoFilesResponse, String> {
+    list_geo_files_in(Path::new(XRAY_ASSET_DIR), cache_arc)
+}
+
+fn list_geo_files_in(base: &Path, cache_arc: Arc<RwLock<crate::types::GeoCache>>) -> Result<GeoFilesResponse, String> {
     let mut site_files = Vec::new();
     let mut ip_files = Vec::new();
     let mut new_cache_entries = Vec::new();
 
-    for entry in std::fs::read_dir(XRAY_ASSET_DIR).map_err(|e| e.to_string())?.flatten() {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GeoFilesResponse { site_files, ip_files });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let canonical_base = std::fs::canonicalize(base).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
         let path = entry.path();
-        if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+        // XKeen uses aliases such as zkeenip.dat -> geoip_zkeenip.dat.
+        // Only regular files and symlinks resolving inside the asset directory qualify.
+        let Ok(resolved) = std::fs::canonicalize(&path) else { continue };
+        if !resolved.starts_with(&canonical_base) || !resolved.is_file() {
             continue;
         }
         if path.extension().is_none_or(|ext| ext != "dat") {
@@ -211,8 +226,7 @@ pub fn list_geo_files(cache_arc: Arc<RwLock<crate::types::GeoCache>>) -> Result<
         }
 
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let mtime = entry
-            .metadata()
+        let mtime = std::fs::metadata(&resolved)
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let cached = cache_arc.read().unwrap().get(&name).cloned();
@@ -410,5 +424,26 @@ async fn geo_query_handler(
             error: Some(format!("Ошибка: {}", e)),
             data: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod file_listing_tests {
+    use super::*;
+    #[test]
+    fn lists_internal_geodata_aliases_but_not_external_or_broken_links() {
+        let base = std::env::temp_dir().join(format!("xkeen-geo-list-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        let cache = Arc::new(RwLock::new(GeoCache::new()));
+        assert!(list_geo_files_in(&base.join("missing"), cache.clone()).unwrap().site_files.is_empty());
+        let ip = [10, 14, 10, 2, b'R', b'U', 18, 8, 10, 4, 1, 2, 3, 0, 16, 24];
+        std::fs::write(base.join("geoip_zkeenip.dat"), ip).unwrap();
+        std::os::unix::fs::symlink("geoip_zkeenip.dat", base.join("zkeenip.dat")).unwrap();
+        std::os::unix::fs::symlink("missing.dat", base.join("broken.dat")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", base.join("outside.dat")).unwrap();
+        let result = list_geo_files_in(&base, cache).unwrap();
+        assert_eq!(result.ip_files, vec!["geoip_zkeenip.dat", "zkeenip.dat"]);
+        assert!(result.site_files.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
