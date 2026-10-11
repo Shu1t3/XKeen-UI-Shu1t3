@@ -25,6 +25,7 @@ import {
 import { parseClashApiCredentials } from './lib/utils'
 import { parse as parseJsonc } from 'jsonc-parser'
 import { validateMihomoProxy, validateMihomoProvider, validateXrayOutbound } from './lib/configYaml'
+import { assertTemplateImportCurrent, type TemplateImport } from './lib/templates/import'
 
 const CommentsWarningModal = lazyLoad(() => import('./components/modals/CommentsWarning'), 'CommentsWarningModal')
 const CoreManageModal = lazyLoad(() => import('./components/modals/CoreManagement'), 'CoreManageModal')
@@ -55,7 +56,7 @@ interface ModalManagerProps {
   onGenerate: (uri: string, excludeName?: string) => { content: string; type: string } | null
   onAddToConfig: (content: string, type: string, position: 'start' | 'end') => void
   onReplace: (kind: 'proxy' | 'provider', content: string, oldName: string, renameRefs: boolean) => void
-  onImportTemplate: (url: string) => Promise<void>
+  onImportTemplate: (preview: TemplateImport) => void
   openModal: (modal: string) => void
 }
 
@@ -356,18 +357,25 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
   }, [])
 
   const importTemplate = useCallback(
-    async (url: string) => {
-      const activeIndex = configActionsRef.current.getActiveIndex()
-      const active = getAppState().configs[activeIndex]
-      if (active?.isDirty && !confirm('Несохраненные изменения будут потеряны. Продолжить?')) throw new Error('Отменено')
-      const res = await fetch(url)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const content = await res.text()
-      if (editorRef.current) {
-        editorRef.current.setValue(content)
-        dispatch({ type: 'UPDATE_CONFIG_DIRTY', index: activeIndex, isDirty: true, content, file: active?.file })
+    (preview: TemplateImport) => {
+      const appState = getAppState()
+      assertTemplateImportCurrent(preview, appState.currentCore, appState.configs)
+      const active = appState.configs[configActionsRef.current.getActiveIndex()]
+      if (active?.file === preview.file) {
+        if (!editorRef.current || editorRef.current.getValue() !== preview.before) {
+          throw new Error('Текст редактора изменился. Откройте предпросмотр заново')
+        }
+        editorRef.current.setValue(preview.content)
+        editorRef.current.validate(preview.file)
       }
-      showToast('Шаблон импортирован')
+      dispatch({
+        type: 'UPDATE_CONFIG_DIRTY',
+        index: appState.configs.findIndex((config) => config.file === preview.file),
+        isDirty: true,
+        content: preview.content,
+        file: preview.file,
+      })
+      showToast(`Шаблон вставлен в ${preview.file.split('/').pop()}. Сохраните или примените изменения`)
     },
     [dispatch, showToast]
   )
