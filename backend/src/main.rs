@@ -271,19 +271,20 @@ async fn main() {
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|json| json.get("xkeen")?.get("rci_token")?.as_str().map(String::from));
 
-        let mut router_req = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .user_agent("XKeen-UI")
+            .timeout(std::time::Duration::from_millis(500))
             .build()
-            .unwrap()
-            .get("http://127.0.0.1:79/rci/show/version");
+            .unwrap();
+        let mut router_req = client.get("http://127.0.0.1:79/rci/show/version");
         if let Some(ref token) = rci_token {
             router_req = router_req.header("X-Ndma-Tkn", token);
         }
 
-        let router_info = router_req
-            .send()
-            .ok()
-            .and_then(|resp| resp.json::<serde_json::Value>().ok());
+        let router_info = match router_req.send().await {
+            Ok(resp) => resp.json::<serde_json::Value>().await.ok(),
+            Err(_) => None,
+        };
 
         let device = router_info
             .as_ref()

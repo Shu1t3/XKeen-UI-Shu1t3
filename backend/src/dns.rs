@@ -842,31 +842,58 @@ fn port_53_inodes(table: &str, protocol: &str) -> Vec<u64> {
         .collect()
 }
 
+type Port53CacheEntry = (std::time::Instant, Option<String>);
+
+static PORT_53_CACHE: std::sync::LazyLock<std::sync::Mutex<Option<Port53CacheEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+pub(crate) fn invalidate_port_53_cache() {
+    if let Ok(mut guard) = PORT_53_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 fn port_53_listener() -> Option<String> {
+    if let Ok(guard) = PORT_53_CACHE.lock()
+        && let Some((instant, ref res)) = *guard
+        && instant.elapsed() < Duration::from_secs(3)
+    {
+        return res.clone();
+    }
+
     let mut sockets = HashSet::new();
     for protocol in ["tcp", "udp", "tcp6", "udp6"] {
         let table = std::fs::read_to_string(format!("/proc/net/{protocol}")).unwrap_or_default();
         sockets.extend(port_53_inodes(&table, protocol).into_iter().map(|inode| format!("socket:[{inode}]")));
     }
     if sockets.is_empty() {
+        if let Ok(mut guard) = PORT_53_CACHE.lock() {
+            *guard = Some((std::time::Instant::now(), None));
+        }
         return None;
     }
 
     let mut names = BTreeSet::new();
+    let mut comm_buf = [0u8; 64];
     for process in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else { continue };
+        let Ok(pid) = process.file_name().to_string_lossy().parse::<i32>() else { continue };
+        let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
         let is_listener = descriptors.flatten().any(|descriptor| {
             std::fs::read_link(descriptor.path()).is_ok_and(|link| sockets.contains(link.to_string_lossy().as_ref()))
         });
         if is_listener {
-            let name = std::fs::read_to_string(process.path().join("comm")).unwrap_or_default();
-            names.insert(name.trim().to_string());
+            let name = crate::controller::read_pid_comm(pid, &mut comm_buf).unwrap_or("unknown");
+            names.insert(name.to_string());
         }
     }
     if names.is_empty() {
         names.insert("unknown".to_string());
     }
-    Some(names.into_iter().collect::<Vec<_>>().join(", "))
+    let res = Some(names.into_iter().collect::<Vec<_>>().join(", "));
+    if let Ok(mut guard) = PORT_53_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), res.clone()));
+    }
+    res
 }
 
 pub async fn get_dns(State(state): State<AppState>, Query(params): Query<DnsStatusQuery>) -> impl IntoResponse {
@@ -880,15 +907,13 @@ pub async fn get_dns(State(state): State<AppState>, Query(params): Query<DnsStat
                     true
                 }
             };
-            if !is_no_delay_requested(&params.no_delay) {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            let no_delay = is_no_delay_requested(&params.no_delay);
+            if !no_delay {
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
             let mut port_listener = tokio::task::spawn_blocking(port_53_listener).await.ok().flatten();
-            for delay_ms in [1000, 2000] {
-                if port_listener.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            if !no_delay && port_listener.is_none() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 port_listener = tokio::task::spawn_blocking(port_53_listener).await.ok().flatten();
             }
             Json(DnsResponse {
@@ -1159,6 +1184,7 @@ pub async fn post_dns(State(state): State<AppState>, Json(req): Json<DnsEnableRe
         "Управление DNS включено".into()
     };
     log("INFO", message);
+    invalidate_port_53_cache();
     Json(DnsResponse {
         success: true,
         error: None,
@@ -1270,6 +1296,7 @@ pub async fn delete_dns(State(state): State<AppState>, Json(_req): Json<DnsDelet
     remove_dns_snapshot();
 
     log("INFO", restore_message);
+    invalidate_port_53_cache();
     Json(DnsResponse {
         success: true,
         error: None,

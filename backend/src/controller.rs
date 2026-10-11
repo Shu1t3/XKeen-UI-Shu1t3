@@ -57,7 +57,20 @@ impl ControlReq {
     }
 }
 
+type InitCacheEntry = (std::time::Instant, Option<String>);
+
+static INIT_CACHE: std::sync::LazyLock<std::sync::Mutex<Option<InitCacheEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
 pub fn find_init_file(log_enabled: bool) -> Option<String> {
+    if !log_enabled
+        && let Ok(guard) = INIT_CACHE.lock()
+        && let Some((instant, ref path)) = *guard
+        && instant.elapsed() < std::time::Duration::from_secs(15)
+    {
+        return path.clone();
+    }
+
     let (mut path, mut source) = (None, "fallback");
 
     if let Ok(content) = std::fs::read_to_string(opt_path!("/sbin/.xkeen/01_info/01_info_variable.sh")) {
@@ -86,6 +99,10 @@ pub fn find_init_file(log_enabled: bool) -> Option<String> {
     if log_enabled
         && let Some(p) = &final_path {
         println!("{} [INFO] Defined initd_file ({}): {}", crate::logger::ts(), source, p);
+    }
+
+    if let Ok(mut guard) = INIT_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), final_path.clone()));
     }
 
     final_path
@@ -218,25 +235,81 @@ fn get_core_info(name: &str) -> CoreInfo {
     }
 }
 
+pub(crate) fn read_pid_comm(pid: i32, buf: &mut [u8]) -> Option<&str> {
+    use std::io::Read;
+    let path = format!("/proc/{pid}/comm");
+    let mut file = std::fs::File::open(path).ok()?;
+    let n = file.read(buf).ok()?;
+    let s = std::str::from_utf8(&buf[..n]).ok()?;
+    Some(s.trim_end_matches(&['\r', '\n'][..]))
+}
+
 pub fn get_pids_for(names: &[&str]) -> std::collections::HashMap<String, Vec<i32>> {
+    static KNOWN_PIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Vec<i32>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
     let mut map: std::collections::HashMap<String, Vec<i32>> = names
         .iter()
         .map(|n| (n.to_string(), Vec::new()))
         .collect();
+
+    let mut needs_scan = false;
+    {
+        let mut comm_buf = [0u8; 64];
+        if let Ok(known) = KNOWN_PIDS.lock() {
+            for name in names {
+                if let Some(cached_list) = known.get(*name) {
+                    if !cached_list.is_empty() {
+                        let mut all_alive = true;
+                        for &pid in cached_list {
+                            if read_pid_comm(pid, &mut comm_buf) != Some(*name) {
+                                all_alive = false;
+                                break;
+                            }
+                        }
+                        if all_alive {
+                            map.insert(name.to_string(), cached_list.clone());
+                        } else {
+                            needs_scan = true;
+                        }
+                    } else {
+                        needs_scan = true;
+                    }
+                } else {
+                    needs_scan = true;
+                }
+            }
+        } else {
+            needs_scan = true;
+        }
+    }
+
+    if !needs_scan {
+        return map;
+    }
+
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return map;
     };
+
+    let mut comm_buf = [0u8; 64];
     for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
-            let comm = comm.trim_end_matches('\n');
-            if let Some(list) = map.get_mut(comm) {
-                list.push(pid);
-            }
+        if let Some(comm) = read_pid_comm(pid, &mut comm_buf)
+            && let Some(list) = map.get_mut(comm)
+        {
+            list.push(pid);
         }
     }
+
+    if let Ok(mut known) = KNOWN_PIDS.lock() {
+        for (k, v) in &map {
+            known.insert(k.clone(), v.clone());
+        }
+    }
+
     map
 }
 
@@ -313,7 +386,6 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
             "currentCore": state.core.read().unwrap().name, "running": false,
             "xkeenInstalled": false}));
     }
-    let _control_guard = CONTROL_LOCK.lock().await;
 
     // Single-pass check of both cores in /proc avoids repeated scanning on weak MIPS CPUs.
     let running_map = tokio::task::spawn_blocking(|| get_pids_for(&["xray", "mihomo"]))

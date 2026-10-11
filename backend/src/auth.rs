@@ -514,8 +514,14 @@ pub async fn auth_middleware(state: AppState, mut request: Request, next: Next) 
     next.run(request).await
 }
 
+fn embedded_argon2() -> Argon2<'static> {
+    // 16 MiB memory cost, 2 iterations, 1 lane keeps memory and CPU bounded on embedded MIPS/ARM routers.
+    let params = argon2::Params::new(16384, 2, 1, None).expect("valid argon2 parameters");
+    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+}
+
 fn hash_password(password: &str) -> String {
-    Argon2::default()
+    embedded_argon2()
         .hash_password(password.as_bytes())
         .unwrap()
         .to_string()
@@ -523,7 +529,7 @@ fn hash_password(password: &str) -> String {
 
 fn verify_password(password: &str, hash: &str) -> bool {
     PasswordHash::new(hash)
-        .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+        .map(|parsed| embedded_argon2().verify_password(password.as_bytes(), &parsed).is_ok())
         .unwrap_or(false)
 }
 
@@ -778,6 +784,13 @@ mod tests {
         assert!(!wrong);
         drop(permit);
         assert_eq!(workers.available_permits(), 1);
+    }
+
+    #[test]
+    fn verify_legacy_default_hash() {
+        let legacy = Argon2::default().hash_password(b"legacy-pass").unwrap().to_string();
+        assert!(verify_password("legacy-pass", &legacy));
+        assert!(!verify_password("bad-pass", &legacy));
     }
 
     static AUTH_HANDLER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));

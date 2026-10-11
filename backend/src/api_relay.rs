@@ -334,6 +334,40 @@ async fn build_http_response(upstream: reqwest::Response) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+struct AuthorizedPortCache {
+    port: u16,
+    expires_at: std::time::Instant,
+}
+
+static AUTHORIZED_PORT_CACHE: std::sync::Mutex<Option<AuthorizedPortCache>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn invalidate_clash_target_cache() {
+    if let Ok(mut lock) = AUTHORIZED_PORT_CACHE.lock() {
+        *lock = None;
+    }
+}
+
+fn is_port_authorized_cached(port: u16) -> bool {
+    if let Ok(lock) = AUTHORIZED_PORT_CACHE.lock()
+        && let Some(cached) = &*lock
+        && cached.port == port
+        && std::time::Instant::now() < cached.expires_at
+    {
+        return true;
+    }
+    false
+}
+
+fn cache_authorized_port(port: u16) {
+    if let Ok(mut lock) = AUTHORIZED_PORT_CACHE.lock() {
+        *lock = Some(AuthorizedPortCache {
+            port,
+            expires_at: std::time::Instant::now() + Duration::from_secs(5),
+        });
+    }
+}
+
 pub(crate) async fn resolve_clash_target(
     port_override: Option<String>, secret_override: Option<String>, unix_override: Option<String>,
 ) -> Result<ClashTarget, String> {
@@ -347,12 +381,15 @@ pub(crate) async fn resolve_clash_target(
 
     if let Some(port) = port_override {
         let port = parse_clash_port(&port)?;
-        let docs = crate::provider_inspector::load_mihomo_yaml().await?;
-        let configured = docs
-            .first()
-            .and_then(|doc| doc["external-controller"].as_str())
-            .ok_or_else(|| "В сохранённом config.yaml не задан external-controller".to_string())?;
-        authorize_clash_port(port, configured)?;
+        if !is_port_authorized_cached(port) {
+            let docs = crate::provider_inspector::load_mihomo_yaml().await?;
+            let configured = docs
+                .first()
+                .and_then(|doc| doc["external-controller"].as_str())
+                .ok_or_else(|| "В сохранённом config.yaml не задан external-controller".to_string())?;
+            authorize_clash_port(port, configured)?;
+            cache_authorized_port(port);
+        }
         return Ok(ClashTarget::Tcp {
             port,
             secret: secret_override,
@@ -401,9 +438,20 @@ pub(crate) fn relay_http_client(socket_path: Option<&str>) -> Result<reqwest::Cl
     // Keep TCP connection pooling without sharing API clients that follow redirects.
     static TCP_CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
         std::sync::LazyLock::new(|| build_relay_http_client(None));
+    static UNIX_CLIENTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
     match socket_path {
         None => TCP_CLIENT.clone(),
-        Some(path) => build_relay_http_client(Some(path)),
+        Some(path) => {
+            let mut cache = UNIX_CLIENTS.lock().map_err(|e| e.to_string())?;
+            if let Some(client) = cache.get(path) {
+                return Ok(client.clone());
+            }
+            let client = build_relay_http_client(Some(path))?;
+            cache.insert(path.to_string(), client.clone());
+            Ok(client)
+        }
     }
 }
 
@@ -769,5 +817,26 @@ mod tests {
         assert!(timeout(Duration::from_millis(100), decoy.accept()).await.is_err());
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn authorized_port_cache_and_invalidation() {
+        invalidate_clash_target_cache();
+        assert!(!is_port_authorized_cached(9090));
+        cache_authorized_port(9090);
+        assert!(is_port_authorized_cached(9090));
+        assert!(!is_port_authorized_cached(9091));
+        invalidate_clash_target_cache();
+        assert!(!is_port_authorized_cached(9090));
+    }
+
+    #[test]
+    fn unix_client_is_cached() {
+        let sock_path = "/tmp/test_mihomo_relay.sock";
+        let c1 = relay_http_client(Some(sock_path)).unwrap();
+        let c2 = relay_http_client(Some(sock_path)).unwrap();
+        // Cloned reqwest::Client instances share internal connection pool and engine
+        drop(c1);
+        drop(c2);
     }
 }

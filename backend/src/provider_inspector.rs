@@ -49,6 +49,7 @@ pub(crate) async fn load_mihomo_yaml() -> Result<Arc<Vec<Yaml>>, String> {
 pub(crate) fn invalidate_mihomo_yaml_cache() {
     *MIHOMO_YAML_CACHE.write().unwrap() = None;
     crate::route_test::providers::clear_provider_cache();
+    crate::api_relay::invalidate_clash_target_cache();
 }
 
 #[derive(Deserialize)]

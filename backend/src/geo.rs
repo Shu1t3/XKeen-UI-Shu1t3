@@ -121,6 +121,23 @@ pub(crate) fn parse_cidr_and_match(mut buf: &[u8], target_v4: Option<u32>, targe
     }
 }
 
+static REGEX_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Option<Regex>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::with_capacity(64)));
+
+fn match_cached_regex(pattern: &str, text: &str) -> bool {
+    let mut cache = REGEX_CACHE.lock().unwrap();
+    if let Some(opt_re) = cache.get(pattern) {
+        return opt_re.as_ref().is_some_and(|re| re.is_match(text));
+    }
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    let compiled = Regex::new(pattern).ok();
+    let matches = compiled.as_ref().is_some_and(|re| re.is_match(text));
+    cache.insert(pattern.to_string(), compiled);
+    matches
+}
+
 pub(crate) fn parse_domain_and_match(mut buf: &[u8], dom_low: &str) -> bool {
     let (mut domain_type, mut value) = (0i32, "");
     while buf.has_remaining() {
@@ -147,7 +164,7 @@ pub(crate) fn parse_domain_and_match(mut buf: &[u8], dom_low: &str) -> bool {
     }
     match domain_type {
         0 => dom_low.contains(value),
-        1 => Regex::new(value).is_ok_and(|re: regex_lite::Regex| re.is_match(dom_low)),
+        1 => match_cached_regex(value, dom_low),
         2 => {
             dom_low == value
                 || (dom_low.len() > value.len()
@@ -306,32 +323,44 @@ pub(crate) async fn resolve_domain(client: &reqwest::Client, domain: &str) -> Re
         data: String,
     }
 
-    const PROVIDERS: &[&str] = &["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"];
-
-    for provider in PROVIDERS {
-        for qtype in ["A", "AAAA"] {
-            let Ok(resp) = client
-                .get(*provider)
-                .header("accept", "application/dns-json")
-                .query(&[("name", domain), ("type", qtype)])
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await
-            else {
-                continue;
-            };
-            let Ok(parsed): Result<DohResponse, _> = resp.json().await else {
-                continue;
-            };
-            if let Some(answers) = parsed.answer {
-                for answer in answers {
-                    if let Ok(ip) = answer.data.parse::<IpAddr>() {
-                        return Ok(ip);
-                    }
+    async fn fetch_doh(client: &reqwest::Client, provider: &str, qtype: &str, domain: &str) -> Result<IpAddr, ()> {
+        let resp = client
+            .get(provider)
+            .header("accept", "application/dns-json")
+            .query(&[("name", domain), ("type", qtype)])
+            .timeout(Duration::from_millis(2500))
+            .send()
+            .await
+            .map_err(|_| ())?;
+        let parsed: DohResponse = resp.json().await.map_err(|_| ())?;
+        if let Some(answers) = parsed.answer {
+            for answer in answers {
+                if let Ok(ip) = answer.data.parse::<IpAddr>() {
+                    return Ok(ip);
                 }
             }
         }
+        Err(())
     }
+
+    // Query both providers concurrently for IPv4
+    let (cf_a, gg_a) = tokio::join!(
+        fetch_doh(client, "https://1.1.1.1/dns-query", "A", domain),
+        fetch_doh(client, "https://8.8.8.8/dns-query", "A", domain),
+    );
+    if let Ok(ip) = cf_a.or(gg_a) {
+        return Ok(ip);
+    }
+
+    // Fallback: Query both providers concurrently for IPv6
+    let (cf_aaaa, gg_aaaa) = tokio::join!(
+        fetch_doh(client, "https://1.1.1.1/dns-query", "AAAA", domain),
+        fetch_doh(client, "https://8.8.8.8/dns-query", "AAAA", domain),
+    );
+    if let Ok(ip) = cf_aaaa.or(gg_aaaa) {
+        return Ok(ip);
+    }
+
     Err(format!("Не удалось разрешить домен: {}", domain))
 }
 
@@ -445,5 +474,23 @@ mod file_listing_tests {
         assert_eq!(result.ip_files, vec!["geoip_zkeenip.dat", "zkeenip.dat"]);
         assert!(result.site_files.is_empty());
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cached_regex_matching_works_and_reuses_cache() {
+        assert!(match_cached_regex(r"^google\..*", "google.com"));
+        assert!(match_cached_regex(r"^google\..*", "google.org"));
+        assert!(!match_cached_regex(r"^google\..*", "yahoo.com"));
+
+        // Invalid regex should safely return false without panicking
+        assert!(!match_cached_regex(r"[unclosed-regex", "test"));
+
+        // Test protobuf encoding with domain_type = 1 (regex)
+        // Tag 1 (varint, type 1): 0x08, 0x01
+        // Tag 2 (len-delimited, ".*\\.org"): 0x12, 0x06, '.', '*', '\\', '.', 'o', 'r', 'g'
+        let mut proto = vec![0x08, 0x01, 0x12, 0x07];
+        proto.extend_from_slice(b".*\\.org");
+        assert!(parse_domain_and_match(&proto, "wikipedia.org"));
+        assert!(!parse_domain_and_match(&proto, "wikipedia.com"));
     }
 }

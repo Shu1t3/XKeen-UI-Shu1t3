@@ -73,16 +73,18 @@ pub fn process_log_line(line: String, tz: i32) -> String {
     // Escape it before adding our fixed markup, never after ANSI/level rendering.
     out = escape_html(&out);
 
-    out = ANSI_RE
-        .replace_all(&out, |caps: &regex_lite::Captures<'_>| match &caps[0] {
-            "\x1b[32m" | "\x1b[92m" => r#"<span style="color: #00cc00;">"#,
-            "\x1b[31m" | "\x1b[91m" => r#"<span style="color: #ef4444;">"#,
-            "\x1b[33m" | "\x1b[93m" => r#"<span style="color: #f59e0b;">"#,
-            "\x1b[96m" => r#"<span style="color: #8BCEF7;">"#,
-            "\x1b[0m" => "</span>",
-            _ => "",
-        })
-        .to_string();
+    if out.contains("\x1b[") {
+        out = ANSI_RE
+            .replace_all(&out, |caps: &regex_lite::Captures<'_>| match &caps[0] {
+                "\x1b[32m" | "\x1b[92m" => r#"<span style="color: #00cc00;">"#,
+                "\x1b[31m" | "\x1b[91m" => r#"<span style="color: #ef4444;">"#,
+                "\x1b[33m" | "\x1b[93m" => r#"<span style="color: #f59e0b;">"#,
+                "\x1b[96m" => r#"<span style="color: #8BCEF7;">"#,
+                "\x1b[0m" => "</span>",
+                _ => "",
+            })
+            .to_string();
+    }
 
     out = LVL_RE
         .replace_all(&out, |caps: &regex_lite::Captures<'_>| {
@@ -101,7 +103,10 @@ pub fn process_log_line(line: String, tz: i32) -> String {
 }
 
 fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
+    if !text.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+        return text.to_string();
+    }
+    let mut escaped = String::with_capacity(text.len() + 16);
     for ch in text.chars() {
         match ch {
             '&' => escaped.push_str("&amp;"),

@@ -72,6 +72,35 @@ pub async fn ws_handler(
     })
 }
 
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn line_matches_keywords(line: &str, keywords: &[String]) -> bool {
+    for kw in keywords {
+        if kw.is_empty() {
+            continue;
+        }
+        if contains_ignore_ascii_case(line, kw) {
+            return true;
+        }
+        // Match level aliases: "WARN" matches "warning", "[Warning]", etc.
+        if kw.eq_ignore_ascii_case("WARN") && contains_ignore_ascii_case(line, "warning") {
+            return true;
+        }
+    }
+    false
+}
+
 fn read_log_file(p: String, offset: u64, query: String, full: bool, tz: i32) -> (String, Vec<String>, u64) {
     let mut f = match File::open(&p) {
         Ok(f) => f,
@@ -108,21 +137,10 @@ fn read_log_file(p: String, offset: u64, query: String, full: bool, tz: i32) -> 
         let line_len = line.len() + 1;
         bytes_read += line_len as u64;
 
-        let matched = if query.is_empty() {
+        let matched = if keywords.is_empty() {
             true
         } else {
-            let normalized = line
-                .replace("[Debug]", "[DEBUG]")
-                .replace("level=debug", "level=DEBUG")
-                .replace("[Info]", "[INFO]")
-                .replace("level=info", "level=INFO")
-                .replace("[Warning]", "[WARN]")
-                .replace("level=warning", "level=WARN")
-                .replace("[Error]", "[ERROR]")
-                .replace("level=error", "level=ERROR")
-                .replace("[Fatal]", "[FATAL]")
-                .replace("level=fatal", "level=FATAL");
-            keywords.iter().any(|k| normalized.contains(k))
+            line_matches_keywords(&line, &keywords)
         };
 
         if matched {
@@ -432,5 +450,18 @@ mod tests {
         let wire = serde_json::json!({"type": kind, "content": appended.join("\n")});
         assert!(!wire["content"].as_str().unwrap().contains("<svg"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn line_matches_keywords_case_insensitive_and_aliases() {
+        let kw_warn = vec!["WARN".to_string()];
+        assert!(line_matches_keywords("This is a [WARNING] message", &kw_warn));
+        assert!(line_matches_keywords("This is a [warn] message", &kw_warn));
+        assert!(!line_matches_keywords("This is an info message", &kw_warn));
+
+        let kw_multi = vec!["error".to_string(), "fatal".to_string()];
+        assert!(line_matches_keywords("FATAL: core dumped", &kw_multi));
+        assert!(line_matches_keywords("Error: timeout", &kw_multi));
+        assert!(!line_matches_keywords("debug: all ok", &kw_multi));
     }
 }

@@ -248,8 +248,9 @@ async fn download_with_client(
     client: &reqwest::Client, url: &str, proxies: &[String], tmp_path: &Path,
 ) -> Result<DownloadResult, String> {
     async fn load(r: reqwest::Response, path: &Path, source: &str) -> Option<DownloadResult> {
+        const DISK_SPOOL_THRESHOLD: usize = 2 * 1024 * 1024;
         let size = r.content_length().unwrap_or(0) as usize;
-        let (mut stream, is_disk) = (r.bytes_stream(), size > 50 * 1024 * 1024);
+        let (mut stream, mut is_disk) = (r.bytes_stream(), size > DISK_SPOOL_THRESHOLD);
         let mut file = if is_disk {
             Some(fs::File::create(path).await.ok()?)
         } else {
@@ -258,7 +259,7 @@ async fn download_with_client(
         let mut buf = if is_disk {
             Vec::new()
         } else {
-            Vec::with_capacity(if size > 0 { size } else { 5 * 1024 * 1024 })
+            Vec::with_capacity(size)
         };
 
         loop {
@@ -270,6 +271,17 @@ async fn download_with_client(
                             _ = fs::remove_file(path);
                             return None;
                         }
+                    } else if buf.len() + chunk.len() > DISK_SPOOL_THRESHOLD {
+                        let mut f = fs::File::create(path).await.ok()?;
+                        if f.write_all(&buf).await.is_err() || f.write_all(&chunk).await.is_err() {
+                            log("WARN", format!("Ошибка записи на диск ({})", source));
+                            _ = fs::remove_file(path);
+                            return None;
+                        }
+                        buf.clear();
+                        buf.shrink_to_fit();
+                        file = Some(f);
+                        is_disk = true;
                     } else {
                         buf.extend_from_slice(&chunk);
                     }
@@ -766,6 +778,32 @@ mod tests {
         let (url, server) = download_server(Duration::ZERO, Duration::from_secs(6)).await;
         let result = download(&url, &[], &download_test_path()).await.unwrap();
         assert!(matches!(result, DownloadResult::Ram(ref bytes) if bytes == b"abcdefgh"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_spools_large_payload_to_disk() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/large");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let chunk = vec![b'x'; 256 * 1024];
+            let total_chunks = 10;
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", total_chunks * chunk.len());
+            let _ = socket.write_all(header.as_bytes()).await;
+            for _ in 0..total_chunks {
+                let _ = socket.write_all(&chunk).await;
+            }
+        });
+        let target_path = download_test_path();
+        let result = download(&url, &[], &target_path).await.unwrap();
+        assert!(matches!(result, DownloadResult::Disk(ref p) if p == &target_path));
+        assert_eq!(std::fs::metadata(&target_path).unwrap().len(), 2560 * 1024);
+        let _ = std::fs::remove_file(&target_path);
         server.await.unwrap();
     }
 

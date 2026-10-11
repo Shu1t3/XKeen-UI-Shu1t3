@@ -250,6 +250,18 @@ fn list_backups_sync(tz: i32) -> Result<Vec<BackupItem>, String> {
     list_backups_sync_with_paths(&BackupPaths::default(), tz)
 }
 
+type BackupCacheKey = (PathBuf, Option<SystemTime>, u64);
+
+static BACKUP_CONTENT_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<BackupCacheKey, BackupContentFiles>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::with_capacity(32)));
+
+pub(crate) fn invalidate_backup_cache() {
+    if let Ok(mut cache) = BACKUP_CONTENT_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 fn list_backups_sync_with_paths(paths: &BackupPaths, tz: i32) -> Result<Vec<BackupItem>, String> {
     ensure_dir(&paths.backup_dir).map_err(io_error)?;
     let entries = fs::read_dir(&paths.backup_dir).map_err(io_error)?;
@@ -272,14 +284,34 @@ fn list_backups_sync_with_paths(paths: &BackupPaths, tz: i32) -> Result<Vec<Back
             }
         };
 
-        let content = match inspect_backup_content_with_paths(&path, paths) {
-            Ok(res) => res,
-            Err(e) => {
-                log(
-                    "WARN",
-                    format!("Не удалось прочитать содержимое бэкапа {}: {}", path.display(), e),
-                );
-                BackupContentFiles::default()
+        let mtime = metadata.modified().ok();
+        let size = metadata.len();
+        let cache_key = (path.clone(), mtime, size);
+
+        let cached_content = {
+            let cache = BACKUP_CONTENT_CACHE.lock().unwrap();
+            cache.get(&cache_key).cloned()
+        };
+
+        let content = match cached_content {
+            Some(c) => c,
+            None => {
+                let parsed = match inspect_backup_content_with_paths(&path, paths) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        log(
+                            "WARN",
+                            format!("Не удалось прочитать содержимое бэкапа {}: {}", path.display(), e),
+                        );
+                        BackupContentFiles::default()
+                    }
+                };
+                let mut cache = BACKUP_CONTENT_CACHE.lock().unwrap();
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+                cache.insert(cache_key, parsed.clone());
+                parsed
             }
         };
 
@@ -726,6 +758,7 @@ fn delete_backup_sync_with_paths(name: &str, paths: &BackupPaths) -> Result<(), 
     let backup_path = resolve_backup_path_with_paths(name, paths)?;
     fs::remove_file(&backup_path).map_err(io_error)?;
     let _ = sync_dir(&paths.backup_dir);
+    invalidate_backup_cache();
     log("INFO", format!("Бэкап конфигураций удалён: {}", backup_path.display()));
     Ok(())
 }
@@ -751,6 +784,7 @@ fn rename_backup_sync_with_paths(name: &str, new_name: &str, paths: &BackupPaths
     }
     fs::rename(&backup_path, &new_path).map_err(io_error)?;
     let _ = sync_dir(&paths.backup_dir);
+    invalidate_backup_cache();
     log(
         "INFO",
         format!(
@@ -1719,5 +1753,31 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&outside_dir);
+    }
+
+    #[test]
+    fn backup_content_caching_and_invalidation() {
+        let fixture = TestFixture::new();
+        fs::write(fixture.paths.xray_dir.join("01_main.json"), b"{\"v\": 1}").unwrap();
+        let backup = create_backup_sync_with_paths(&fixture.paths, 0).unwrap();
+
+        invalidate_backup_cache();
+        assert_eq!(BACKUP_CONTENT_CACHE.lock().unwrap().len(), 0);
+
+        let list1 = list_backups_sync_with_paths(&fixture.paths, 0).unwrap();
+        assert_eq!(list1.len(), 1);
+        assert_eq!(list1[0].name, backup.name);
+        assert_eq!(list1[0].content.xray, vec!["01_main.json"]);
+        assert_eq!(BACKUP_CONTENT_CACHE.lock().unwrap().len(), 1);
+
+        // Second list should hit cache
+        let list2 = list_backups_sync_with_paths(&fixture.paths, 0).unwrap();
+        assert_eq!(list2.len(), 1);
+        assert_eq!(list2[0].name, backup.name);
+        assert_eq!(list2[0].content.xray, vec!["01_main.json"]);
+
+        // Delete should invalidate cache
+        delete_backup_sync_with_paths(&backup.name, &fixture.paths).unwrap();
+        assert_eq!(BACKUP_CONTENT_CACHE.lock().unwrap().len(), 0);
     }
 }
