@@ -540,22 +540,21 @@ fn parse_mihomo_api_creds(yaml_content: &str) -> MihomoApiCreds {
     let Some(doc) = docs.first() else { return creds };
     if let Some(unix_val) = yaml_value_to_string(&doc["external-controller-unix"]) {
         let trimmed = unix_val.trim();
-        if !trimmed.is_empty() {
-            if let Some(name) = Path::new(trimmed)
+        if !trimmed.is_empty()
+            && let Some(name) = Path::new(trimmed)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .filter(|n| !n.is_empty())
-            {
-                creds.unix_path = Some(format!("{}/{}", MIHOMO_CONF_DIR, name));
-            }
+        {
+            creds.unix_path = Some(format!("{}/{}", MIHOMO_CONF_DIR, name));
         }
     }
-    if let Some(controller) = yaml_value_to_string(&doc["external-controller"]) {
-        if let Some(port_str) = controller.trim().rsplit(':').next() {
-            let port_str = port_str.trim().trim_matches(|c| c == '"' || c == '\'');
-            if let Ok(port) = port_str.parse::<u16>() {
-                creds.port = Some(port);
-            }
+    if let Some(controller) = yaml_value_to_string(&doc["external-controller"])
+        && let Some(port_str) = controller.trim().rsplit(':').next()
+    {
+        let port_str = port_str.trim().trim_matches(|c| c == '"' || c == '\'');
+        if let Ok(port) = port_str.parse::<u16>() {
+            creds.port = Some(port);
         }
     }
     if let Some(secret) = yaml_value_to_string(&doc["secret"]) {
