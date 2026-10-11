@@ -25,6 +25,8 @@ import {
   IconDeviceFloppy,
   IconDotsFilled,
   IconExternalLinkFilled,
+  IconEye,
+  IconEyeOff,
   IconFilePlus,
   IconFileText,
   IconFileUpload,
@@ -41,13 +43,22 @@ import * as jsyaml from 'js-yaml'
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
 import { apiCall, capitalize, clashFetch, getFileLanguage } from '../../lib/api'
 import { LazyBoundary, lazyLoad, useLazyMount } from '../../lib/loader'
-import { runMassTask, summarizeFanOut, snapshotMassTargets, type RouterTarget, filterAuthBlockedTargets, REMOTE_AUTH_UNSUPPORTED } from '../../lib/multi-routers/actions'
+import {
+  runMassTask,
+  summarizeFanOut,
+  snapshotMassTargets,
+  type RouterTarget,
+  filterAuthBlockedTargets,
+  REMOTE_AUTH_UNSUPPORTED,
+} from '../../lib/multi-routers/actions'
 import { LOCAL_ROUTER_ID } from '../../lib/multi-routers/model'
 import { syncClashApiPort, useAppContext, useConnectionsSync, useModalContext, useSettings } from '../../lib/store'
 import type { Config } from '../../lib/types'
 import { cn } from '../../lib/utils'
 import { parse as parseJsonc } from 'jsonc-parser'
 import { MassConfirmDialog } from '../log/multi-routers/MassConfirmDialog'
+import { BackupsModal } from '../modals/Backups'
+import { ProvidersModal } from '../modals/Providers'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from '../ui/context-menu'
 import { InputGroup, InputGroupAddon, InputGroupInput, InputGroupText } from '../ui/input-group'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
@@ -56,17 +67,11 @@ import type { CodeMirrorRef } from './CodeMirror'
 const GuiRouting = lazyLoad(() => import('./xray/GuiRouting'), 'GuiRouting')
 const GuiLog = lazyLoad(() => import('./xray/GuiLog'), 'GuiLog')
 const ConnectionsPanel = lazyLoad(() => import('./mihomo/Connections'), 'ConnectionsPanel')
-const ProvidersModal = lazyLoad(() => import('../modals/Providers'), 'ProvidersModal')
-const BackupsModal = lazyLoad(() => import('../modals/Backups'), 'BackupsModal')
 const SelectorsPanel = lazyLoad(() => import('./mihomo/Selectors'), 'SelectorsPanel')
 import { DnsPanel } from './mihomo/DnsPanel'
 const CodeMirrorEditorLazy = lazyLoad(() => import('./CodeMirror'), 'CodeMirrorEditor')
 
-const BackupsModalContainer = memo(function BackupsModalContainer({
-  onRefreshConfigs,
-}: {
-  onRefreshConfigs: () => Promise<unknown>
-}) {
+const BackupsModalContainer = memo(function BackupsModalContainer({ onRefreshConfigs }: { onRefreshConfigs: () => Promise<unknown> }) {
   const { modals, dispatch } = useModalContext()
   const mounted = useLazyMount(modals.showBackupsModal)
   const handleOpenChange = useCallback(
@@ -74,17 +79,17 @@ const BackupsModalContainer = memo(function BackupsModalContainer({
     [dispatch]
   )
   if (!mounted) return null
-  return (
-    <LazyBoundary>
-      <BackupsModal open={modals.showBackupsModal} onOpenChange={handleOpenChange} onRefreshConfigs={onRefreshConfigs} />
-    </LazyBoundary>
-  )
+  return <BackupsModal open={modals.showBackupsModal} onOpenChange={handleOpenChange} onRefreshConfigs={onRefreshConfigs} />
 })
 
 type ClashMode = 'rule' | 'global' | 'direct'
+type ApiResult = { success: boolean; error?: string }
+
+const isXkeenFile = (file: string) => file.startsWith('/opt/etc/xkeen')
 type ProvidersModalKind = 'rules' | 'proxies'
 
 const TOGGLE_ALL_SELECTORS_EVENT = 'mihomo:toggle-all-selectors'
+const SHOW_HIDDEN_SELECTORS_KEY = 'showHiddenSelectors'
 
 interface Props {
   onOpenImport: () => void
@@ -130,7 +135,6 @@ function ConfigTab({ config, currentCore, showToast, onRefreshConfigs, withConte
   }
 
   const closeDialog = () => setPopoverOpen(false)
-
 
   const fileExt = useMemo(() => {
     if (!dialogData || dialogData.type === 'delete') return ''
@@ -188,7 +192,12 @@ function ConfigTab({ config, currentCore, showToast, onRefreshConfigs, withConte
     )
 
   return (
-    <Popover open={popoverOpen} onOpenChange={(open) => { if (!open) setPopoverOpen(false) }}>
+    <Popover
+      open={popoverOpen}
+      onOpenChange={(open) => {
+        if (!open) setPopoverOpen(false)
+      }}
+    >
       <ContextMenu>
         <ContextMenuTrigger className="contents">
           <Tooltip>
@@ -234,11 +243,7 @@ function ConfigTab({ config, currentCore, showToast, onRefreshConfigs, withConte
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
-      <PopoverContent
-        align="start"
-        className="w-auto min-w-64"
-        avoidCollisions={!isMobile}
-      >
+      <PopoverContent align="start" className="w-auto min-w-64" avoidCollisions={!isMobile}>
         {dialogData?.type === 'delete' ? (
           <>
             <p className="text-sm font-medium">Удалить «{config.file.split('/').pop()}»?</p>
@@ -283,12 +288,23 @@ function ConfigTab({ config, currentCore, showToast, onRefreshConfigs, withConte
   )
 }
 
-export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate, onOpenGeoScan, onOpenRouteTest, onOpenBackups, onRefreshConfigs, editorRef, configActionsRef }: Props) {
+export function ConfigPanel({
+  onOpenImport,
+  onOpenImportAmnezia,
+  onOpenTemplate,
+  onOpenGeoScan,
+  onOpenRouteTest,
+  onOpenBackups,
+  onRefreshConfigs,
+  editorRef,
+  configActionsRef,
+}: Props) {
   const { state, dispatch, showToast } = useAppContext({ includeConfigs: true })
   const { configs, isConfigsLoading, currentCore, serviceStatus, clashApiPort, clashApiSecret, clashApiUnix } = state
   const guiRouting = useSettings((s) => s.guiRouting)
   const guiLog = useSettings((s) => s.guiLog)
   const multiRouter = useSettings((s) => s.multiRouter)
+  const closeConnsOnApply = useSettings((s) => s.closeConnectionsOnApply)
 
   const isRunning = serviceStatus === 'running'
   const isPending = serviceStatus === 'pending'
@@ -313,6 +329,13 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   const [mountedPanels, setMountedPanels] = useState<Set<string>>(() => new Set(['selectors']))
   const [mode, setMode] = useState<ClashMode>('rule')
   const [allSelectorsCollapsed, setAllSelectorsCollapsed] = useState(false)
+  const [showHiddenSelectors, setShowHiddenSelectors] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SHOW_HIDDEN_SELECTORS_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
   const [providersModalKind, setProvidersModalKind] = useState<ProvidersModalKind | null>(null)
   const [isProvidersModalOpen, setIsProvidersModalOpen] = useState(false)
   const mountProvidersModal = useLazyMount(isProvidersModalOpen)
@@ -377,7 +400,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
         .then((data) => {
           if (data.mode) setMode(data.mode)
         })
-        .catch(() => { })
+        .catch(() => {})
     }, 200)
     return () => {
       cancelled = true
@@ -594,7 +617,8 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   }
 
   async function saveCurrentConfig(force = false) {
-    const cfg = configsRef.current[activeIndexRef.current]
+    const targetIndex = activeIndexRef.current
+    const cfg = configsRef.current[targetIndex]
     if (!cfg || !editorRef.current) return
     const content = editorRef.current.getValue()
     if (!content.trim() && !cfg.file.endsWith('.lst')) return showToast('Конфигурация пустая', 'error')
@@ -621,19 +645,9 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     await executeSave(targets, cfg, content)
   }
 
-  function buildApplyUrl(file: string, core: string) {
-    let url = 'configs'
-    if (!file.startsWith('/opt/etc/xkeen')) {
-      if (core === 'mihomo') url += '?validate=mihomo'
-      else if (core === 'xray') url += '?validate=xray'
-    }
-    return url
-  }
-
   function restartActionFor(cfg: Config, content: string) {
     const lang = getFileLanguage(cfg.file)
-    const isXkeen = cfg.file.startsWith('/opt/etc/xkeen')
-    return !isXkeen && (lang === 'json' || lang === 'yaml') && !hasCriticalChanges(cfg.savedContent, content, lang)
+    return !isXkeenFile(cfg.file) && (lang === 'json' || lang === 'yaml') && !hasCriticalChanges(cfg.savedContent, content, lang)
       ? 'softRestart'
       : 'hardRestart'
   }
@@ -649,22 +663,36 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
       }
     }
 
-    const saveResult = await apiCall<{ success: boolean; error?: string }>(
+    const isHotReload = core === 'mihomo' && !isXkeenFile(cfg.file)
+
+    let validate = ''
+    if (!isXkeenFile(cfg.file) && (core === 'mihomo' || core === 'xray')) {
+      validate = `?validate=${core}`
+      if (core === 'mihomo' && closeConnsOnApply) validate += '&closeConns=true'
+    }
+    const saveResult = await apiCall<ApiResult>(
       'PUT',
-      buildApplyUrl(cfg.file, core),
+      `configs${validate}`,
       { file: cfg.file, content },
       { baseUrl, token }
     )
     if (!saveResult.success) {
       throw new Error(
         saveResult.error === 'Validation failed'
-          ? `Ошибка валидации ${capitalize(currentCore)}: проверьте журнал`
+          ? `Ошибка валидации ${capitalize(core)}: проверьте журнал`
           : saveResult.error || 'Ошибка сохранения'
       )
     }
-    const action = restartActionFor(cfg, content)
-    const r = await apiCall<{ success: boolean; error?: string }>('POST', 'control', { action, core }, { baseUrl, token })
-    if (!r?.success) throw new Error(r?.error || 'ошибка перезапуска')
+    const action = isHotReload
+      ? hasCriticalChanges(cfg.savedContent, content, 'yaml')
+        ? 'hardRestart'
+        : null
+      : restartActionFor(cfg, content)
+    if (!action) return false
+
+    const restartResult = await apiCall<ApiResult>('POST', 'control', { action, core }, { baseUrl, token })
+    if (!restartResult?.success) throw new Error(restartResult?.error || 'ошибка перезапуска')
+    return true
   }
 
   async function executeApply(targets: readonly RouterTarget[], cfg: Config, content: string) {
@@ -672,8 +700,11 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     const saveRevision = currentCfg.revision ?? 0
 
     dispatch({ type: 'SET_SERVICE_STATUS', status: 'pending', pendingText: 'Применение...' })
-    const results = await runMassTask(targets, async (_id, baseUrl, target) => {
-      await applyToHost(baseUrl, cfg, content, target?.token)
+    const isMihomoHotReload = currentCore === 'mihomo' && !isXkeenFile(cfg.file)
+    let localRestarted = false
+    const results = await runMassTask(targets, async (id, baseUrl, target) => {
+      const restarted = await applyToHost(baseUrl, cfg, content, target?.token)
+      if (id === LOCAL_ROUTER_ID) localRestarted = restarted
     })
 
     const localTarget = targets.find((t) => t.id === LOCAL_ROUTER_ID)
@@ -700,10 +731,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
 
     const summary = summarizeFanOut(results)
     if (results.length <= 1) {
-      showToast(
-        summary.fail === 0 ? 'Изменения применены' : errorToastText(summary.body),
-        summary.fail === 0 ? 'success' : 'error'
-      )
+      showToast(summary.fail === 0 ? 'Изменения применены' : errorToastText(summary.body), summary.fail === 0 ? 'success' : 'error')
     } else {
       showToast(
         {
@@ -715,9 +743,15 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     }
 
     if (localTarget) {
+      const nextStatus =
+        localResult?.ok === false && !(isMihomoHotReload && !localRestarted)
+          ? 'stopped'
+          : isRunning || localResult?.ok
+          ? 'running'
+          : 'stopped'
       dispatch({
         type: 'SET_SERVICE_STATUS',
-        status: localResult?.ok === false ? 'stopped' : isRunning || localResult?.ok ? 'running' : 'stopped',
+        status: nextStatus,
       })
       if (localResult?.ok) syncClashApiPort(200)
     } else {
@@ -726,7 +760,8 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
   }
 
   async function saveAndApply(force = false) {
-    const cfg = configsRef.current[activeIndexRef.current]
+    const targetIndex = activeIndexRef.current
+    const cfg = configsRef.current[targetIndex]
     if (!cfg || !editorRef.current) return
     const content = editorRef.current.getValue()
     if (!content.trim() && !cfg.file.endsWith('.lst')) return showToast('Файл пустой', 'error')
@@ -760,10 +795,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
     })
     const summary = summarizeFanOut(results)
     if (results.length <= 1) {
-      showToast(
-        summary.fail === 0 ? 'Быстрый бэкап создан' : errorToastText(summary.body),
-        summary.fail === 0 ? 'success' : 'error'
-      )
+      showToast(summary.fail === 0 ? 'Быстрый бэкап создан' : errorToastText(summary.body), summary.fail === 0 ? 'success' : 'error')
     } else {
       showToast(
         {
@@ -822,8 +854,8 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
 
   const isAnyGui = isRoutingGui || isLogGui
 
-  const coreConfigs = configs.filter((c) => !c.file.startsWith('/opt/etc/xkeen'))
-  const xkeenConfigs = configs.filter((c) => c.file.startsWith('/opt/etc/xkeen'))
+  const coreConfigs = configs.filter((c) => !isXkeenFile(c.file))
+  const xkeenConfigs = configs.filter((c) => isXkeenFile(c.file))
 
   const isMihomo = isCoreMihomo && (!!activeClashApiPort || !!activeClashApiUnix)
   const isMobile = typeof window !== 'undefined' && window.innerWidth < 768
@@ -875,7 +907,11 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
             {isMihomo && currentPanel === 'connections' && (
               <div className="ml-auto flex items-center gap-2">
                 <span className="text-muted-foreground text-xs">Режим маршрутизации</span>
-                <Select value={mode} items={{ direct: 'DIRECT', rule: 'RULE', global: 'GLOBAL' }} onValueChange={(value) => changeMode(value as ClashMode)}>
+                <Select
+                  value={mode}
+                  items={{ direct: 'DIRECT', rule: 'RULE', global: 'GLOBAL' }}
+                  onValueChange={(value) => changeMode(value as ClashMode)}
+                >
                   <SelectTrigger className="w-30">
                     <SelectValue />
                   </SelectTrigger>
@@ -901,18 +937,48 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
                   Рулсеты
                 </Button>
                 <Tooltip>
-                  <TooltipTrigger render={
-                    <Button
-                      variant="outline"
-                      size="icon"
-                      aria-label={allSelectorsCollapsed ? 'Развернуть все селекторы' : 'Свернуть все селекторы'}
-                      onClick={() =>
-                        window.dispatchEvent(new CustomEvent(TOGGLE_ALL_SELECTORS_EVENT, { detail: { collapsed: !allSelectorsCollapsed } }))
-                      }
-                    >
-                      {allSelectorsCollapsed ? <IconChevronDown /> : <IconChevronUp />}
-                    </Button>
-                  } />
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        aria-label={showHiddenSelectors ? 'Скрыть скрытые селекторы' : 'Показывать скрытые селекторы'}
+                        aria-pressed={showHiddenSelectors}
+                        className={cn(showHiddenSelectors && 'border-[#60a5fa] text-blue-400')}
+                        onClick={() => {
+                          setShowHiddenSelectors((prev) => {
+                            try {
+                              localStorage.setItem(SHOW_HIDDEN_SELECTORS_KEY, prev ? '0' : '1')
+                            } catch {
+                              /* */
+                            }
+                            return !prev
+                          })
+                        }}
+                      >
+                        {showHiddenSelectors ? <IconEyeOff /> : <IconEye />}
+                      </Button>
+                    }
+                  />
+                  <TooltipContent>{showHiddenSelectors ? 'Скрыть скрытые' : 'Показывать скрытые'}</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        aria-label={allSelectorsCollapsed ? 'Развернуть все селекторы' : 'Свернуть все селекторы'}
+                        onClick={() =>
+                          window.dispatchEvent(
+                            new CustomEvent(TOGGLE_ALL_SELECTORS_EVENT, { detail: { collapsed: !allSelectorsCollapsed } })
+                          )
+                        }
+                      >
+                        {allSelectorsCollapsed ? <IconChevronDown /> : <IconChevronUp />}
+                      </Button>
+                    }
+                  />
                   <TooltipContent>{allSelectorsCollapsed ? 'Развернуть все' : 'Свернуть все'}</TooltipContent>
                 </Tooltip>
               </div>
@@ -986,6 +1052,7 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
                         mode={mode}
                         clashApiSecret={clashApiSecret ?? null}
                         clashApiUnix={activeClashApiUnix ?? null}
+                        showHiddenSelectors={showHiddenSelectors}
                         onCollapsedStateChange={setAllSelectorsCollapsed}
                       />
                     </LazyBoundary>
@@ -1060,31 +1127,41 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
                 ) : (
                   <>
                     <Tooltip>
-                      <TooltipTrigger render={
-                        <Button
-                          size="default"
-                          disabled={!canApply}
-                          className="bg-green-600 text-white hover:bg-green-700"
-                          onClick={() => saveAndApply()}
-                        >
-                          <IconRefresh data-icon="inline-start" /> Применить
-                        </Button>
-                      } />
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            size="default"
+                            disabled={!canApply}
+                            className="bg-green-600 text-white hover:bg-green-700"
+                            onClick={() => saveAndApply()}
+                          >
+                            <IconRefresh data-icon="inline-start" /> Применить
+                          </Button>
+                        }
+                      />
                       <TooltipContent>Сохранить и перезапустить</TooltipContent>
                     </Tooltip>
                     <Button size="default" disabled={!canSave} onClick={() => saveCurrentConfig()}>
                       <IconDeviceFloppy data-icon="inline-start" /> Сохранить
                     </Button>
                     <Tooltip>
-                      <TooltipTrigger render={
-                        <Button variant="outline" disabled={!canFormat} onClick={() => editorRef.current?.format()}>
-                          <IconCode data-icon="inline-start" /> <span className="hidden sm:inline">Формат</span>
-                        </Button>
-                      } />
+                      <TooltipTrigger
+                        render={
+                          <Button variant="outline" disabled={!canFormat} onClick={() => editorRef.current?.format()}>
+                            <IconCode data-icon="inline-start" /> <span className="hidden sm:inline">Формат</span>
+                          </Button>
+                        }
+                      />
                       <TooltipContent>Форматировать файл</TooltipContent>
                     </Tooltip>
                     <DropdownMenu>
-                      <DropdownMenuTrigger render={<Button variant="outline"><IconDotsFilled data-icon="inline-start" /> <span className="hidden sm:inline">Утилиты</span></Button>} />
+                      <DropdownMenuTrigger
+                        render={
+                          <Button variant="outline">
+                            <IconDotsFilled data-icon="inline-start" /> <span className="hidden sm:inline">Утилиты</span>
+                          </Button>
+                        }
+                      />
                       <DropdownMenuContent align="end" className="min-w-64">
                         <DropdownMenuGroup>
                           <DropdownMenuLabel>Утилиты</DropdownMenuLabel>
@@ -1159,16 +1236,14 @@ export function ConfigPanel({ onOpenImport, onOpenImportAmnezia, onOpenTemplate,
           )}
         </div>
         {providersModalKind && mountProvidersModal && (
-          <LazyBoundary>
-            <ProvidersModal
-              open={isProvidersModalOpen}
-              kind={providersModalKind}
-              clashApiPort={activeClashApiPort ?? ''}
-              clashApiSecret={clashApiSecret ?? null}
-              clashApiUnix={activeClashApiUnix ?? null}
-              onOpenChange={handleProvidersModalOpenChange}
-            />
-          </LazyBoundary>
+          <ProvidersModal
+            open={isProvidersModalOpen}
+            kind={providersModalKind}
+            clashApiPort={activeClashApiPort ?? ''}
+            clashApiSecret={clashApiSecret ?? null}
+            clashApiUnix={activeClashApiUnix ?? null}
+            onOpenChange={handleProvidersModalOpenChange}
+          />
         )}
         <BackupsModalContainer onRefreshConfigs={refreshConfigsAndEditor} />
         {massConfirm && (
@@ -1199,7 +1274,9 @@ function hasCriticalChanges(oldContent: string, newContent: string, language: st
     if (language === 'yaml') {
       const o = jsyaml.load(oldContent) as Record<string, unknown>
       const n = jsyaml.load(newContent) as Record<string, unknown>
-      return ['listeners', 'redir-port', 'tproxy-port'].some((f) => JSON.stringify(o?.[f]) !== JSON.stringify(n?.[f]))
+      return ['listeners', 'redir-port', 'tproxy-port', 'external-controller', 'external-controller-tls', 'external-controller-unix', 'external-controller-pipe', 'external-controller-cors', 'external-controller-routing-mark', 'external-ui', 'external-ui-url', 'external-ui-name', 'external-doh-server', 'secret', 'tls'].some(
+        (f) => JSON.stringify(o?.[f]) !== JSON.stringify(n?.[f])
+      )
     }
     if (language === 'json') {
       const o = parseJsonc(oldContent)

@@ -21,7 +21,7 @@ use crate::route_test::cidr::{Cidr, Range};
 use crate::route_test::dns::Resolver;
 use crate::route_test::idle_cache::IdleCache;
 use crate::route_test::mihomo::{EvalState, RuleKind, Verdict, parse_predicate};
-use crate::ruleset_inspector;
+use crate::provider_inspector;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -628,7 +628,7 @@ pub(crate) fn parse_provider_defs(rule_providers: &Yaml, base_dir: &Path) -> Has
                 }
             }
             "file" => match get("path") {
-                Some(p) => match ruleset_inspector::resolve_provider_path_in(
+                Some(p) => match provider_inspector::resolve_provider_path_in(
                     &p,
                     &base_dir.to_string_lossy(),
                 ) {
@@ -641,7 +641,7 @@ pub(crate) fn parse_provider_defs(rule_providers: &Yaml, base_dir: &Path) -> Has
                 let url = get("url");
                 let path = get("path");
                 match (path, url) {
-                    (Some(p), _) => match ruleset_inspector::resolve_provider_path_in(
+                    (Some(p), _) => match provider_inspector::resolve_provider_path_in(
                         &p,
                         &base_dir.to_string_lossy(),
                     ) {
@@ -710,7 +710,7 @@ pub(crate) async fn load_from_path(path: &str, behavior: Behavior, format: Provi
     }
 
     let content = if format.is_mrs() {
-        ruleset_inspector::convert_mrs(path, behavior.as_mihomo_str()).await?
+        provider_inspector::convert_mrs(path, behavior.as_mihomo_str()).await?
     } else {
         tokio::fs::read_to_string(&key.path)
             .await

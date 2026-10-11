@@ -1,10 +1,11 @@
 use crate::logger::log;
 use crate::types::*;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Json};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,6 +42,19 @@ pub struct DnsDeleteReq {
     pub config_file: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct DnsStatusQuery {
+    #[serde(default, rename = "noDelay")]
+    pub no_delay: Option<String>,
+}
+
+fn is_no_delay_requested(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|v| {
+        let v = v.to_ascii_lowercase();
+        matches!(v.as_str(), "" | "1" | "true" | "yes")
+    })
+}
+
 fn default_true() -> bool {
     true
 }
@@ -51,7 +65,10 @@ pub struct DnsStatusFields {
     pub dns_override: bool,
     pub dns_mihomo: bool,
     pub provider_ignored: bool,
+    pub has_provider_nameservers: bool,
     pub has_snapshot: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_listener: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,12 +179,31 @@ pub fn check_dns_mihomo() -> bool {
     false
 }
 
-fn parse_dns_status(output: &str) -> DnsStatusFields {
+fn parse_dns_status(output: &str, has_provider_nameservers: bool, port_listener: Option<String>) -> DnsStatusFields {
     DnsStatusFields {
         dns_override: output.contains("opkg dns-override"),
         dns_mihomo: check_dns_mihomo(),
         provider_ignored: output.contains("ip no name-servers"),
+        has_provider_nameservers,
         has_snapshot: load_dns_snapshot().is_some(),
+        port_listener,
+    }
+}
+
+fn has_dhcp_nameserver(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map
+                .get("service")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s.starts_with("Dhcp"))
+            {
+                return true;
+            }
+            map.values().any(has_dhcp_nameserver)
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_dhcp_nameserver),
+        _ => false,
     }
 }
 
@@ -520,6 +556,80 @@ async fn run_rci_step(
     }
 }
 
+#[allow(dead_code)]
+async fn post_rci_batch(state: &AppState, commands: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    let mut req = state
+        .http_client
+        .post("http://127.0.0.1:79/rci/")
+        .json(commands)
+        .timeout(Duration::from_secs(10));
+
+    let token = state.rci_token.read().unwrap().clone();
+    if let Some(ref token) = token {
+        req = req.header("X-Ndma-Tkn", token);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Ошибка POST RCI batch: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let err = response.text().await.unwrap_or_default();
+        return Err(format!("RCI batch вернул {status}, ответ: {err}"));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| format!("Ошибка парсинга RCI batch: {e}"))
+}
+
+#[allow(dead_code)]
+fn find_batch_error(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(items) = map.get("status").and_then(|s| s.as_array()) {
+                for item in items {
+                    if item.get("status").and_then(|s| s.as_str()) == Some("error") {
+                        let msg = item
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("неизвестная ошибка RCI");
+                        let extra = format!(
+                            "{} {}",
+                            item.get("ident").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("code").and_then(|v| v.as_str()).unwrap_or("")
+                        )
+                        .trim()
+                        .to_string();
+                        if extra.is_empty() {
+                            return Some(msg.to_string());
+                        }
+                        return Some(format!("{msg} ({extra})"));
+                    }
+                }
+            }
+            for v in map.values() {
+                if let Some(e) = find_batch_error(v) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(e) = find_batch_error(item) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub async fn reload_or_restart_mihomo(_state: &AppState, config_path: &Path) -> Result<(), String> {
     #[cfg(test)]
     if let Ok(override_fn) = TEST_RELOAD_OVERRIDE.try_with(|f| f.clone()) {
@@ -698,13 +808,95 @@ pub async fn rollback_dns(
     Ok(())
 }
 
-pub async fn get_dns(State(state): State<AppState>) -> impl IntoResponse {
-    match fetch_running_config(&state).await {
-        Ok(output) => Json(DnsResponse {
-            success: true,
-            error: None,
-            status: Some(parse_dns_status(&output)),
-        }),
+#[allow(dead_code)]
+fn check_batch_response(resp: &serde_json::Value, steps: &[&str], ignore: &[(usize, &str)]) -> Result<(), String> {
+    let items = resp
+        .as_array()
+        .ok_or_else(|| "Некорректный ответ RCI batch".to_string())?;
+    for (i, item) in items.iter().enumerate() {
+        let step = steps.get(i).copied().unwrap_or("?");
+        if let Some(err) = find_batch_error(item) {
+            if let Some((_, component)) = ignore.iter().find(|(idx, _)| *idx == i) {
+                log(
+                    "WARN",
+                    format!("Не удалось очистить {component} (компонент не установлен?)"),
+                );
+                continue;
+            }
+            log("ERROR", format!("DNS: '{step}' — ошибка: {err}"));
+            return Err(format!("{step}: {err}"));
+        }
+    }
+    Ok(())
+}
+
+fn port_53_inodes(table: &str, protocol: &str) -> Vec<u64> {
+    let only_listening = protocol.starts_with("tcp");
+    table
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|fields| fields.len() >= 10 && fields[1].ends_with(":0035") && (!only_listening || fields[3] == "0A"))
+        .filter_map(|fields| fields[9].parse::<u64>().ok())
+        .filter(|inode| *inode != 0)
+        .collect()
+}
+
+fn port_53_listener() -> Option<String> {
+    let mut sockets = HashSet::new();
+    for protocol in ["tcp", "udp", "tcp6", "udp6"] {
+        let table = std::fs::read_to_string(format!("/proc/net/{protocol}")).unwrap_or_default();
+        sockets.extend(port_53_inodes(&table, protocol).into_iter().map(|inode| format!("socket:[{inode}]")));
+    }
+    if sockets.is_empty() {
+        return None;
+    }
+
+    let mut names = BTreeSet::new();
+    for process in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else { continue };
+        let is_listener = descriptors.flatten().any(|descriptor| {
+            std::fs::read_link(descriptor.path()).is_ok_and(|link| sockets.contains(link.to_string_lossy().as_ref()))
+        });
+        if is_listener {
+            let name = std::fs::read_to_string(process.path().join("comm")).unwrap_or_default();
+            names.insert(name.trim().to_string());
+        }
+    }
+    if names.is_empty() {
+        names.insert("unknown".to_string());
+    }
+    Some(names.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+pub async fn get_dns(State(state): State<AppState>, Query(params): Query<DnsStatusQuery>) -> impl IntoResponse {
+    let (running, name_servers) = tokio::join!(fetch_running_config(&state), fetch_rci(&state, "ip/name-server"));
+    match running {
+        Ok(output) => {
+            let has_provider_nameservers = match &name_servers {
+                Ok(data) => has_dhcp_nameserver(data),
+                Err(e) => {
+                    log("WARN", format!("Не удалось получить ip name-server: {e}"));
+                    true
+                }
+            };
+            if !is_no_delay_requested(&params.no_delay) {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let mut port_listener = tokio::task::spawn_blocking(port_53_listener).await.ok().flatten();
+            for delay_ms in [1000, 2000] {
+                if port_listener.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                port_listener = tokio::task::spawn_blocking(port_53_listener).await.ok().flatten();
+            }
+            Json(DnsResponse {
+                success: true,
+                error: None,
+                status: Some(parse_dns_status(&output, has_provider_nameservers, port_listener)),
+            })
+        }
         Err(e) => Json(DnsResponse {
             success: false,
             error: Some(e),
@@ -826,7 +1018,7 @@ pub async fn post_dns(State(state): State<AppState>, Json(req): Json<DnsEnableRe
 
     match write_result {
         Ok(Ok(())) => {
-            crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+            crate::provider_inspector::invalidate_mihomo_yaml_cache();
         }
         Ok(Err(e)) => {
             return Json(DnsResponse {
@@ -858,7 +1050,7 @@ pub async fn post_dns(State(state): State<AppState>, Json(req): Json<DnsEnableRe
                 .map_err(|e| e.to_string())?
             })
             .await;
-            crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+            crate::provider_inspector::invalidate_mihomo_yaml_cache();
             let _ = reload_or_restart_mihomo(&state, &config_path).await;
         }
         return Json(DnsResponse {
@@ -954,9 +1146,6 @@ pub async fn post_dns(State(state): State<AppState>, Json(req): Json<DnsEnableRe
                 error: Some(format!("Ошибка применения настроек роутера ({step}: {e}). Выполнен откат настроек.")),
                 status: None,
             });
-        }
-        if step.contains("dns-override") {
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -1708,5 +1897,128 @@ opkg dns-override
             .await;
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn batch_payload_enable_with_filter_shape() {
+        let br0_ip = "192.168.1.1";
+        let payload = vec![
+            json!({"dns-proxy": {"https": {"upstream": [{"no": true}]}}}),
+            json!({"dns-proxy": {"tls": {"upstream": [{"no": true}]}}}),
+            json!({"ip": {"name-server": [{"no": true}]}}),
+            json!({"ip": {"name-server": [{"address": br0_ip}]}}),
+            json!({"opkg": {"dns-override": {}}}),
+            json!({"system": {"configuration": {"save": {}}}}),
+        ];
+        assert_eq!(payload.len(), 6);
+        assert_eq!(payload[3]["ip"]["name-server"][0]["address"], json!(br0_ip));
+        assert_eq!(payload[5]["system"]["configuration"]["save"], json!({}));
+    }
+
+    #[test]
+    fn finds_nested_batch_error() {
+        let ok = json!([{}, {"status": [{"status": "message", "message": "saving (http/rci)."}]}]);
+        assert!(find_batch_error(&ok[0]).is_none());
+        assert!(find_batch_error(&ok[1]).is_none());
+
+        let nested = json!({"system": {"configuration": {"save": {"status": [{"status": "error", "code": "1", "ident": "X", "message": "boom"}]}}}});
+        assert_eq!(find_batch_error(&nested), Some("boom (X 1)".to_string()));
+    }
+
+    #[test]
+    fn check_ignores_optional_components() {
+        let steps = ["DoH", "DoT", "save"];
+        let one_error = json!([
+            {"status": [{"status": "error", "message": "no such command"}]},
+            {},
+            {},
+        ]);
+        assert!(check_batch_response(&one_error, &steps, &[]).is_err());
+        assert!(check_batch_response(&one_error, &steps, &[(0, "DoH")]).is_ok());
+
+        let two_errors = json!([
+            {"status": [{"status": "error", "message": "absent"}]},
+            {"status": [{"status": "error", "message": "absent"}]},
+            {},
+        ]);
+        assert!(check_batch_response(&two_errors, &steps, &[(0, "DoH")]).is_err());
+        assert!(check_batch_response(&two_errors, &steps, &[(0, "DoH"), (1, "DoT")]).is_ok());
+    }
+
+    #[test]
+    fn handles_real_missing_component_response() {
+        let resp = json!([
+            {"ip": {"name-server": [{"status": [{"status": "message", "code": "22544390", "ident": "Dns::Manager", "message": "static IPv4 name server list cleared."}]}]}},
+            {"dns-proxy": {"tlss": {"upstream": [{}], "status": [{"status": "error", "code": "1179781", "ident": "Core::Configurator", "message": "not found: \"dns-proxy/tlss/upstream\" [admin]."}]}}},
+            {"dns-proxy": {"https": {"upstream": [{"status": [{"status": "message", "code": "22610920", "ident": "Dns::Secure::ManagerDoh", "message": "DNS-over-HTTPS name servers cleared."}]}]}}},
+            {"system": {"configuration": {"save": {"status": [{"status": "message", "code": "8912996", "ident": "Core::System::StartupConfig", "message": "saving (http/rci)."}]}}}}
+        ]);
+        let steps = ["name-server", "tls-upstream", "https-upstream", "save"];
+
+        assert!(check_batch_response(&resp, &steps, &[(1, "DoT")]).is_ok());
+
+        let err = check_batch_response(&resp, &steps, &[]).unwrap_err();
+        assert!(err.contains("tls-upstream"), "unexpected: {err}");
+        assert!(err.contains("not found"), "unexpected: {err}");
+    }
+
+    const TABLE_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+    fn table_row(local: &str, state: &str, inode: u64) -> String {
+        format!("   0: {local} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000     0        0 {inode} 1 0000000000000000 100 0 0 10 0\n")
+    }
+
+    #[test]
+    fn parses_tcp_listening_port_53() {
+        let table = [
+            TABLE_HEADER.to_string(),
+            table_row("00000000:0035", "0A", 12345),
+            table_row("0100007F:0035", "0A", 0),
+            table_row("0100007F:01BB", "0A", 99999),
+            table_row("0100007F:0035", "01", 555),
+        ]
+        .concat();
+        assert_eq!(port_53_inodes(&table, "tcp"), vec![12345]);
+    }
+
+    #[test]
+    fn parses_udp_ignores_state() {
+        let table = [TABLE_HEADER.to_string(), table_row("00000000:0035", "07", 777), table_row("00000000:0035", "01", 888)].concat();
+        assert_eq!(port_53_inodes(&table, "udp6"), vec![777, 888]);
+    }
+
+    #[test]
+    fn no_delay_flag_parsing() {
+        assert!(!is_no_delay_requested(&None));
+        assert!(!is_no_delay_requested(&Some("0".into())));
+        assert!(!is_no_delay_requested(&Some("false".into())));
+        assert!(is_no_delay_requested(&Some(String::new())));
+        assert!(is_no_delay_requested(&Some("1".into())));
+        assert!(is_no_delay_requested(&Some("true".into())));
+        assert!(is_no_delay_requested(&Some("TRUE".into())));
+        assert!(is_no_delay_requested(&Some("yes".into())));
+    }
+
+    #[test]
+    fn detects_dhcp_nameservers() {
+        let resp = json!([{"show": {"ip": {"name-server": {"server": [
+            {"address": "192.168.1.1", "domain": "", "global": 0, "service": "Dns::Manager", "interface": ""},
+            {"address": "62.112.106.130", "domain": "", "global": 65280, "service": "Dhcp::Client-GigabitEthernet1", "interface": "GigabitEthernet1"},
+            {"address": "62.112.113.170", "domain": "", "global": 65280, "service": "Dhcp::Client-GigabitEthernet1", "interface": "GigabitEthernet1"},
+        ]}}}}]);
+        assert!(has_dhcp_nameserver(&resp));
+
+        let static_only = json!([{"show": {"ip": {"name-server": {"server": [
+            {"address": "192.168.1.1", "domain": "", "global": 0, "service": "Dns::Manager", "interface": ""},
+            {"address": "77.88.8.8", "domain": "", "global": 0, "service": "Dns::Manager", "interface": ""},
+        ]}}}}]);
+        assert!(!has_dhcp_nameserver(&static_only));
+
+        assert!(!has_dhcp_nameserver(&json!([])));
+        assert!(!has_dhcp_nameserver(&json!({})));
+        assert!(!has_dhcp_nameserver(&json!([{"show": {"ip": {}}}])));
+
+        // service не строка — не считаем
+        assert!(!has_dhcp_nameserver(&json!([{"service": 42}])));
     }
 }

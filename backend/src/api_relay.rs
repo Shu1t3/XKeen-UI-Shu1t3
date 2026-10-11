@@ -347,7 +347,7 @@ pub(crate) async fn resolve_clash_target(
 
     if let Some(port) = port_override {
         let port = parse_clash_port(&port)?;
-        let docs = crate::ruleset_inspector::load_mihomo_yaml().await?;
+        let docs = crate::provider_inspector::load_mihomo_yaml().await?;
         let configured = docs
             .first()
             .and_then(|doc| doc["external-controller"].as_str())

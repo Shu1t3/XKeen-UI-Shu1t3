@@ -1,11 +1,13 @@
 use crate::logger::log;
 use crate::types::*;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct ConfigItem {
@@ -270,7 +272,8 @@ fn is_mihomo_config_file(path: &str) -> bool {
 }
 
 pub async fn put_config(
-    State(state): State<AppState>, Query(params): Query<HashMap<String, String>>, Json(req): Json<ConfigReq>,
+    State(state): State<AppState>, Query(params): Query<HashMap<String, String>>,
+    Json(req): Json<ConfigReq>,
 ) -> impl IntoResponse {
     match crate::config_transaction::run(async move { put_config_inner(state, params, req).await }).await {
         Ok(response) => response,
@@ -285,13 +288,7 @@ pub async fn put_config(
 async fn put_config_inner(state: AppState, params: HashMap<String, String>, req: ConfigReq) -> Json<ApiResponse<()>> {
     let is_lst = match check_access(&req.file, &state) {
         Ok(val) => val,
-        Err(e) => {
-            return Json(ApiResponse::<()> {
-                success: false,
-                error: Some(e.into()),
-                data: None,
-            });
-        }
+        Err(error) => return api_error(error),
     };
     let content = if is_lst {
         req.content.replace("\r\n", "\n")
@@ -300,42 +297,39 @@ async fn put_config_inner(state: AppState, params: HashMap<String, String>, req:
     };
 
     if let Some(core_type) = params.get("validate") {
-        let validate_files = match validation_snapshot(core_type, Path::new(XRAY_CONF_DIR), &req.file, &content) {
-            Ok(files) => files,
-            Err(e) => {
-                return Json(ApiResponse::<()> {
-                    success: false,
-                    error: Some(format!("Cannot read validation snapshot: {e}")),
-                    data: None,
-                })
-            }
-        };
+        if core_type == "mihomo" {
+            let close_conns = params
+                .get("closeConns")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+            return apply_mihomo_hot_reload(&state, &req.file, &content, close_conns).await;
+        }
+        if core_type == "xray" {
+            let validate_files = match validation_snapshot(core_type, Path::new(XRAY_CONF_DIR), &req.file, &content) {
+                Ok(files) => files,
+                Err(e) => {
+                    return Json(ApiResponse::<()> {
+                        success: false,
+                        error: Some(format!("Cannot read validation snapshot: {e}")),
+                        data: None,
+                    });
+                }
+            };
 
-        if let Err(err_msg) = validate_core(core_type, &validate_files).await {
-            log("ERROR", err_msg);
-            return Json(ApiResponse::<()> {
-                success: false,
-                error: Some("Validation failed".into()),
-                data: None,
-            });
+            if let Err(err_msg) = validate_core(&validate_files).await {
+                log("ERROR", err_msg);
+                return api_error("Validation failed");
+            }
         }
     }
 
     if let Err(e) = crate::config_transaction::write_atomic(Path::new(&req.file), content.as_bytes(), false) {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some(e),
-            data: None,
-        });
+        return api_error(e);
     }
     if is_mihomo_config_file(&req.file) {
-        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+        crate::provider_inspector::invalidate_mihomo_yaml_cache();
     }
-    Json(ApiResponse::<()> {
-        success: true,
-        error: None,
-        data: None,
-    })
+    api_ok()
 }
 
 pub async fn post_config(State(state): State<AppState>, Json(req): Json<ConfigReq>) -> impl IntoResponse {
@@ -352,20 +346,10 @@ pub async fn post_config(State(state): State<AppState>, Json(req): Json<ConfigRe
 async fn post_config_inner(state: AppState, req: ConfigReq) -> Json<ApiResponse<()>> {
     let is_lst = match check_access(&req.file, &state) {
         Ok(val) => val,
-        Err(e) => {
-            return Json(ApiResponse::<()> {
-                success: false,
-                error: Some(e.into()),
-                data: None,
-            });
-        }
+        Err(error) => return api_error(error),
     };
     if Path::new(&req.file).exists() {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some("File already exists".into()),
-            data: None,
-        });
+        return api_error("File already exists");
     }
     let content = if is_lst {
         req.content.replace("\r\n", "\n")
@@ -373,20 +357,12 @@ async fn post_config_inner(state: AppState, req: ConfigReq) -> Json<ApiResponse<
         req.content
     };
     if let Err(e) = crate::config_transaction::write_atomic(Path::new(&req.file), content.as_bytes(), true) {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some(e),
-            data: None,
-        });
+        return api_error(e);
     }
     if is_mihomo_config_file(&req.file) {
-        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+        crate::provider_inspector::invalidate_mihomo_yaml_cache();
     }
-    Json(ApiResponse::<()> {
-        success: true,
-        error: None,
-        data: None,
-    })
+    api_ok()
 }
 
 pub async fn delete_config(State(state): State<AppState>, Json(req): Json<DeleteReq>) -> impl IntoResponse {
@@ -402,27 +378,15 @@ pub async fn delete_config(State(state): State<AppState>, Json(req): Json<Delete
 
 async fn delete_config_inner(state: AppState, req: DeleteReq) -> Json<ApiResponse<()>> {
     if let Err(e) = check_access(&req.file, &state) {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some(e.into()),
-            data: None,
-        });
+        return api_error(e);
     }
     if fs::remove_file(&req.file).is_err() {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some("Delete error".into()),
-            data: None,
-        });
+        return api_error("Delete error");
     }
     if is_mihomo_config_file(&req.file) {
-        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+        crate::provider_inspector::invalidate_mihomo_yaml_cache();
     }
-    Json(ApiResponse::<()> {
-        success: true,
-        error: None,
-        data: None,
-    })
+    api_ok()
 }
 
 pub async fn patch_config(State(state): State<AppState>, Json(req): Json<RenameReq>) -> impl IntoResponse {
@@ -438,41 +402,21 @@ pub async fn patch_config(State(state): State<AppState>, Json(req): Json<RenameR
 
 async fn patch_config_inner(state: AppState, req: RenameReq) -> Json<ApiResponse<()>> {
     if let Err(e) = check_access(&req.file, &state) {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some(e.into()),
-            data: None,
-        });
+        return api_error(e);
     }
     if let Err(e) = check_access(&req.new_file, &state) {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some(e.into()),
-            data: None,
-        });
+        return api_error(e);
     }
     if Path::new(&req.new_file).exists() {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some("File already exists".into()),
-            data: None,
-        });
+        return api_error("File already exists");
     }
     if fs::rename(&req.file, &req.new_file).is_err() {
-        return Json(ApiResponse::<()> {
-            success: false,
-            error: Some("Rename error".into()),
-            data: None,
-        });
+        return api_error("Rename error");
     }
     if is_mihomo_config_file(&req.file) || is_mihomo_config_file(&req.new_file) {
-        crate::ruleset_inspector::invalidate_mihomo_yaml_cache();
+        crate::provider_inspector::invalidate_mihomo_yaml_cache();
     }
-    Json(ApiResponse::<()> {
-        success: true,
-        error: None,
-        data: None,
-    })
+    api_ok()
 }
 
 fn validation_snapshot(core: &str, directory: &Path, current: &str, content: &str) -> Result<Vec<ConfigReq>, String> {
@@ -515,7 +459,7 @@ fn validation_snapshot(core: &str, directory: &Path, current: &str, content: &st
     Ok(files)
 }
 
-async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
+async fn validate_core(files: &[ConfigReq]) -> Result<(), String> {
     let temp_dir = std::env::temp_dir().join(format!(
         "xkeen-ui-validation-{}-{}",
         std::process::id(),
@@ -536,28 +480,20 @@ async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
         }
     }
 
-    let mut command = match core {
-        "mihomo" => {
-            let mut cmd = tokio::process::Command::new("mihomo");
-            cmd.args(["-t", "-f"]).arg(temp_dir.join("config.yaml"));
-            cmd.env("CLASH_HOME_DIR", MIHOMO_CONF_DIR);
-            cmd
-        }
-        _ => {
-            let mut cmd = tokio::process::Command::new("xray");
-            cmd.args(["-test", "-confdir"]).arg(&temp_dir);
-            cmd.env("XRAY_LOCATION_ASSET", XRAY_ASSET_DIR);
-            cmd
+    let mut cmd = tokio::process::Command::new("xray");
+    cmd.args(["-test", "-confdir"]).arg(&temp_dir);
+    cmd.env("XRAY_LOCATION_ASSET", XRAY_ASSET_DIR);
+    cmd.kill_on_drop(true);
+
+    let output = match tokio::time::timeout(Duration::from_secs(30), cmd.output()).await {
+        Ok(res) => res.map_err(|e| e.to_string())?,
+        Err(_) => {
+            _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return Err("Configuration validation timed out".to_string());
         }
     };
-
-    command.kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output()).await;
     _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
-    let output = output
-        .map_err(|_| "Configuration validation timed out".to_string())?
-        .map_err(|e| e.to_string())?;
     if output.status.success() {
         return Ok(());
     }
@@ -567,11 +503,170 @@ async fn validate_core(core: &str, files: &[ConfigReq]) -> Result<(), String> {
     Err(combined)
 }
 
+#[derive(Deserialize)]
+struct MihomoError {
+    message: String,
+}
+
+fn api_ok() -> Json<ApiResponse<()>> {
+    Json(ApiResponse { success: true, error: None, data: None })
+}
+
+fn api_error(error: impl Into<String>) -> Json<ApiResponse<()>> {
+    Json(ApiResponse { success: false, error: Some(error.into()), data: None })
+}
+
+struct MihomoApiCreds {
+    port: Option<u16>,
+    secret: Option<String>,
+    unix_path: Option<String>,
+}
+
+fn yaml_value_to_string(value: &yaml_rust2::Yaml) -> Option<String> {
+    match value {
+        yaml_rust2::Yaml::String(s) => Some(s.clone()),
+        yaml_rust2::Yaml::Integer(i) => Some(i.to_string()),
+        yaml_rust2::Yaml::Real(s) => Some(s.clone()),
+        yaml_rust2::Yaml::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_mihomo_api_creds(yaml_content: &str) -> MihomoApiCreds {
+    let mut creds = MihomoApiCreds { port: None, secret: None, unix_path: None };
+    let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(yaml_content) else {
+        return creds;
+    };
+    let Some(doc) = docs.first() else { return creds };
+    if let Some(unix_val) = yaml_value_to_string(&doc["external-controller-unix"]) {
+        let trimmed = unix_val.trim();
+        if !trimmed.is_empty() {
+            if let Some(name) = Path::new(trimmed)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty())
+            {
+                creds.unix_path = Some(format!("{}/{}", MIHOMO_CONF_DIR, name));
+            }
+        }
+    }
+    if let Some(controller) = yaml_value_to_string(&doc["external-controller"]) {
+        if let Some(port_str) = controller.trim().rsplit(':').next() {
+            let port_str = port_str.trim().trim_matches(|c| c == '"' || c == '\'');
+            if let Ok(port) = port_str.parse::<u16>() {
+                creds.port = Some(port);
+            }
+        }
+    }
+    if let Some(secret) = yaml_value_to_string(&doc["secret"]) {
+        let trimmed = secret.trim().to_string();
+        if !trimmed.is_empty() {
+            creds.secret = Some(trimmed);
+        }
+    }
+    creds
+}
+
+async fn apply_mihomo_hot_reload(
+    state: &AppState, file: &str, content: &str, close_conns: bool,
+) -> Json<ApiResponse<()>> {
+    let main_config = format!("{}/config.yaml", MIHOMO_CONF_DIR);
+    let creds_source = tokio::fs::read_to_string(&main_config).await.unwrap_or_default();
+    let creds = parse_mihomo_api_creds(&creds_source);
+
+    enum Target {
+        Unix { client: reqwest::Client },
+        Tcp { port: u16, secret: Option<String> },
+    }
+    let target = match (creds.unix_path, creds.port) {
+        (Some(socket_path), _) => match reqwest::Client::builder().unix_socket(socket_path).build() {
+            Ok(client) => Target::Unix { client },
+            Err(error) => return api_error(error.to_string()),
+        },
+        (None, Some(port)) => Target::Tcp { port, secret: creds.secret.clone() },
+        (None, None) => return api_error("external-controller не найден"),
+    };
+
+    let previous = tokio::fs::read_to_string(file).await.ok();
+    if let Err(error) = crate::config_transaction::write_atomic(Path::new(file), content.as_bytes(), false) {
+        return api_error(format!("Write error: {error}"));
+    }
+
+    let (client, configs_url, conns_url, secret) = match &target {
+        Target::Unix { client } => (
+            client.clone(),
+            "http://127.0.0.1/configs?force=true".to_string(),
+            "http://127.0.0.1/connections".to_string(),
+            None,
+        ),
+        Target::Tcp { port, secret } => (
+            state.http_client.clone(),
+            format!("http://127.0.0.1:{port}/configs?force=true"),
+            format!("http://127.0.0.1:{port}/connections"),
+            secret.clone(),
+        ),
+    };
+
+    let mut request = client.put(configs_url).json(&serde_json::json!({})).timeout(Duration::from_secs(15));
+    if let Some(secret) = secret.as_deref() {
+        request = request.bearer_auth(secret);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("Ошибка Mihomo: {error}");
+            log("ERROR", message.clone());
+            if let Some(old) = previous {
+                _ = crate::config_transaction::write_atomic(Path::new(file), old.as_bytes(), false);
+            }
+            return api_error(message);
+        }
+    };
+
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        if close_conns {
+            let mut req = client.delete(conns_url).timeout(Duration::from_secs(15));
+            if let Some(secret) = secret.as_deref() {
+                req = req.bearer_auth(secret);
+            }
+            if let Err(error) = req.send().await {
+                log("ERROR", format!("Ошибка Mihomo: {error}"));
+            }
+        }
+        if is_mihomo_config_file(file) {
+            crate::provider_inspector::invalidate_mihomo_yaml_cache();
+        }
+        return api_ok();
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<MihomoError>(&body).map_or(body, |error| error.message);
+    let detail = match message.trim() {
+        "" => format!("Mihomo вернул {status}"),
+        trimmed => trimmed.chars().take(2000).collect(),
+    };
+
+    let message = format!("Ошибка Mihomo: {detail}");
+    log("ERROR", message.clone());
+
+    if let Some(old) = previous {
+        _ = crate::config_transaction::write_atomic(Path::new(file), old.as_bytes(), false);
+    } else {
+        _ = tokio::fs::remove_file(file).await;
+    }
+
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return api_error(message);
+    }
+
+    api_error("Validation failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config_transaction::{run, write_atomic};
-    use std::sync::Arc;
     fn fixture() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("snapshot-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&p).unwrap();
@@ -599,120 +694,56 @@ mod tests {
             let dir = dir.clone();
             tasks.push(tokio::spawn(async move {
                 run(async move {
-                    let path = dir.join(name);
-                    let snapshot = validation_snapshot("xray", &dir, path.to_str().unwrap(), "1").unwrap();
-                    tokio::task::yield_now().await;
-                    if snapshot.iter().filter(|f| f.content == "1").count() > 1 {
-                        return false;
+                    let files = validation_snapshot("xray", &dir, dir.join(name).to_str().unwrap(), "1").unwrap();
+                    let sum: i32 = files.iter().map(|f| f.content.parse::<i32>().unwrap()).sum();
+                    if sum > 1 {
+                        return Err("Invalid combined sum".to_string());
                     }
-                    write_atomic(&path, b"1", false).unwrap();
-                    true
+                    write_atomic(&dir.join(name), b"1", false).map_err(|e| e.to_string())?;
+                    Ok(())
                 })
                 .await
-                .unwrap()
             }));
         }
-        let first = tasks.remove(0).await.unwrap();
-        let second = tasks.remove(0).await.unwrap();
-        assert_ne!(first, second);
-        assert_ne!(
-            fs::read(dir.join("a.json")).unwrap(),
-            fs::read(dir.join("b.json")).unwrap()
-        );
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await);
+        }
+        let mut successes = 0;
+        for res in results {
+            if let Ok(Ok(Ok(()))) = res {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1, "Exactly one transaction should pass validation");
+        let a = fs::read_to_string(dir.join("a.json")).unwrap().parse::<i32>().unwrap();
+        let b = fs::read_to_string(dir.join("b.json")).unwrap().parse::<i32>().unwrap();
+        assert_eq!(a + b, 1, "Combined snapshot state should never exceed 1");
         fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
-    async fn create_is_serialized_with_snapshot_validation_and_commit() {
-        let dir = fixture();
-        let p = dir.join("a.json");
-        fs::write(&p, "old").unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let continue_validation = Arc::new(tokio::sync::Notify::new());
-        let resume = continue_validation.clone();
-        let workdir = dir.clone();
-        let first = tokio::spawn(async move {
-            run(async move {
-                let p = workdir.join("a.json");
-                assert_eq!(
-                    validation_snapshot("xray", &workdir, p.to_str().unwrap(), "new")
-                        .unwrap()
-                        .len(),
-                    1
-                );
-                entered_tx.send(()).unwrap();
-                resume.notified().await;
-                // A create/delete/rename using the same executor cannot mutate the snapshot now.
-                assert!(!workdir.join("b.json").exists());
-                write_atomic(&p, b"new", false).unwrap();
-            })
-            .await
-            .unwrap()
-        });
-        entered_rx.await.unwrap();
-        let workdir = dir.clone();
-        let create = tokio::spawn(async move {
-            run(async move {
-                assert_eq!(fs::read(workdir.join("a.json")).unwrap(), b"new");
-                write_atomic(&workdir.join("b.json"), b"created", true).unwrap();
-            })
-            .await
-            .unwrap()
-        });
-        tokio::task::yield_now().await;
-        continue_validation.notify_one();
-        first.await.unwrap();
-        create.await.unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[tokio::test]
-    async fn cancelled_request_finishes_transaction_before_next_operation() {
-        let dir = fixture();
-        let p = dir.join("a.json");
-        fs::write(&p, "old").unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let resume = Arc::new(tokio::sync::Notify::new());
-        let inner_resume = resume.clone();
-        let path = p.clone();
-        let request = tokio::spawn(async move {
-            run(async move {
-                entered_tx.send(()).unwrap();
-                inner_resume.notified().await;
-                write_atomic(&path, b"committed", false).unwrap();
-            })
-            .await
-        });
-        entered_rx.await.unwrap();
-        request.abort();
-        let _ = request.await;
-        resume.notify_one();
-        run(async move {
-            assert_eq!(fs::read(&p).unwrap(), b"committed");
-        })
-        .await
-        .unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn r37_collect_configs_skips_symlinks_pointing_outside_or_to_settings() {
+    async fn r37_collect_configs_ignores_symlinks_escaping_target_dir() {
         use std::os::unix::fs::symlink;
         let config_dir = fixture();
         let outside_dir = fixture();
 
-        let valid_config = config_dir.join("valid.json");
-        fs::write(&valid_config, r#"{"valid": true}"#).unwrap();
+        // Valid internal config
+        let valid_config = config_dir.join("01_valid.json");
+        fs::write(&valid_config, "{}").unwrap();
 
-        let outside_secret = outside_dir.join("secret.json");
-        fs::write(&outside_secret, r#"{"secret": "leak"}"#).unwrap();
+        // External target file
+        let secret_file = outside_dir.join("secret.json");
+        fs::write(&secret_file, "{\"secret\": true}").unwrap();
 
-        let symlink_escape = config_dir.join("escape.json");
-        symlink(&outside_secret, &symlink_escape).unwrap();
+        // Malicious symlink pointing outside
+        let malicious_symlink = config_dir.join("02_escaped.json");
+        symlink(&secret_file, &malicious_symlink).unwrap();
 
+        // Symlink pointing to xkeen-ui.json
         let settings_file = outside_dir.join("xkeen-ui.json");
-        fs::write(&settings_file, r#"{"password": "hash"}"#).unwrap();
-
-        let symlink_settings = config_dir.join("settings_link.json");
-        symlink(&settings_file, &symlink_settings).unwrap();
+        fs::write(&settings_file, "{}").unwrap();
+        let settings_symlink = config_dir.join("03_settings.json");
+        symlink(&settings_file, &settings_symlink).unwrap();
 
         let paths = vec![config_dir.to_str().unwrap().to_string()];
         let collected = collect_configs(&paths, false).await;

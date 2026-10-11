@@ -12,6 +12,7 @@ pub const DEFAULT_ERROR_LOG: &str = opt_path!("/var/log/xray/error.log");
 pub const DNS_SNAPSHOT_FILE: &str = opt_path!("/etc/xkeen/dns-snapshot.json");
 pub const MIHOMO_CONF_DIR: &str = opt_path!("/etc/mihomo");
 pub const MIHOMO_CONFIG_FILE: &str = opt_path!("/etc/mihomo/config.yaml");
+pub const MIHOMO_CONF: &str = MIHOMO_CONFIG_FILE;
 pub const S24XRAY: &str = opt_path!("/etc/init.d/S24xray");
 pub const S99XKEEN: &str = opt_path!("/etc/init.d/S99xkeen");
 pub const S99XKEEN_UI: &str = opt_path!("/etc/init.d/S99xkeen-ui");
@@ -201,6 +202,7 @@ pub struct ClashApiSettings {
     pub hide_unavailable_proxies_counter: u32,
     pub proxy_sort_order: String,
     pub auto_dns: String,
+    pub close_connections_on_apply: bool,
 }
 
 impl Default for ClashApiSettings {
@@ -213,6 +215,7 @@ impl Default for ClashApiSettings {
             hide_unavailable_proxies_counter: 3,
             proxy_sort_order: "default".into(),
             auto_dns: "disabled".into(),
+            close_connections_on_apply: false,
         }
     }
 }

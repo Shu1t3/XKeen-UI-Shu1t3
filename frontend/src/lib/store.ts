@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/react/shallow'
-import { clashFetch } from './api'
+import { apiCall, clashFetch } from './api'
 import { getStoredTheme } from './theme'
 import {
   DEFAULT_MIHOMO_REPO,
@@ -12,9 +12,11 @@ import {
   type AppSettings,
   type AppState,
   type Connection,
+  type ProxyProvider,
+  type RuleProvider,
   type ToastMessage,
 } from './types'
-import { parseClashApiCredentials } from './utils'
+import { ALLOWED_PROXY_VEHICLE_TYPES, normalizeVehicleType, parseClashApiCredentials } from './utils'
 import { clashWsUrl } from './websocket'
 
 // ─── Zustand store ─────────────────────────────────────────────────────────────
@@ -33,6 +35,7 @@ const initialSettings: AppSettings = {
   pingTestUrl: DEFAULT_PING_TEST_URL,
   pingTestTimeout: DEFAULT_PING_TEST_TIMEOUT,
   showSourceName: false,
+  closeConnectionsOnApply: false,
   hideUnavailableProxies: false,
   hideUnavailableProxiesCounter: 3,
   proxySortOrder: 'default',
@@ -201,7 +204,10 @@ const useStore = create<StoreState>((set) => ({
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
-export type ShowToastFn = (message: string | { title: string; body: string; persistent?: boolean; id?: string; action?: { url: string } }, type?: 'success' | 'error') => void
+export type ShowToastFn = (
+  message: string | { title: string; body: string; persistent?: boolean; id?: string; action?: { url: string } },
+  type?: 'success' | 'error' | 'warning'
+) => void
 
 type CoreState = Omit<
   AppState,
@@ -271,14 +277,25 @@ const selectCoreStateWithConfigsAndSettings = (s: StoreState): CoreStateWithConf
 
 // ─── Hooks & Utilities ─────────────────────────────────────────────────────────
 
-export function showToast(message: string | { title: string; body: string; persistent?: boolean; id?: string; action?: { url: string } }, type: 'success' | 'error' = 'success') {
+export function showToast(
+  message: string | { title: string; body: string; persistent?: boolean; id?: string; action?: { url: string } },
+  type: 'success' | 'error' | 'warning' = 'success'
+) {
   const dispatch = useStore.getState().dispatch
   const id = typeof message === 'string' ? Math.random().toString(36).slice(2) : (message.id ?? Math.random().toString(36).slice(2))
   if (typeof message !== 'string' && message.id) dispatch({ type: 'REMOVE_TOAST', id: message.id })
+  const defaultTitle = type === 'error' ? 'Ошибка' : type === 'warning' ? 'Предупреждение' : 'Успех'
   const toast: ToastMessage =
     typeof message === 'string'
-      ? { id, title: type === 'error' ? 'Ошибка' : 'Успех', body: message, type }
-      : { id, title: message.title, body: message.body, type, ...(message.persistent && { persistent: true }), ...(message.action && { action: message.action }) }
+      ? { id, title: defaultTitle, body: message, type }
+      : {
+          id,
+          title: message.title,
+          body: message.body,
+          type,
+          ...(message.persistent && { persistent: true }),
+          ...(message.action && { action: message.action }),
+        }
 
   dispatch({ type: 'ADD_TOAST', toast })
   if (!toast.persistent) setTimeout(() => dispatch({ type: 'REMOVE_TOAST', id }), 5000)
@@ -324,23 +341,21 @@ export const getAppState = () => useStore.getState()
 
 export function useModalContext() {
   const modals = useStore(
-    useShallow(
-      (s): ModalState => ({
-        showDirtyModal: s.showDirtyModal,
-        showCoreManageModal: s.showCoreManageModal,
-        showUpdateModal: s.showUpdateModal,
-        showImportModal: s.showImportModal,
-        showImportAmneziaModal: s.showImportAmneziaModal,
-        showTemplateModal: s.showTemplateModal,
-        showSettingsModal: s.showSettingsModal,
-        showCommentsWarningModal: s.showCommentsWarningModal,
-        showGeoScanModal: s.showGeoScanModal,
-        showRouteTestModal: s.showRouteTestModal,
-        showBackupsModal: s.showBackupsModal,
-        updateModalCore: s.updateModalCore,
-        pendingSaveAction: s.pendingSaveAction,
-      })
-    )
+    useShallow((s): ModalState => ({
+      showDirtyModal: s.showDirtyModal,
+      showCoreManageModal: s.showCoreManageModal,
+      showUpdateModal: s.showUpdateModal,
+      showImportModal: s.showImportModal,
+      showImportAmneziaModal: s.showImportAmneziaModal,
+      showTemplateModal: s.showTemplateModal,
+      showSettingsModal: s.showSettingsModal,
+      showCommentsWarningModal: s.showCommentsWarningModal,
+      showGeoScanModal: s.showGeoScanModal,
+      showRouteTestModal: s.showRouteTestModal,
+      showBackupsModal: s.showBackupsModal,
+      updateModalCore: s.updateModalCore,
+      pendingSaveAction: s.pendingSaveAction,
+    }))
   )
   return { modals, dispatch: useStore((s) => s.dispatch) }
 }
@@ -453,6 +468,10 @@ export function useConnectionsSync(
 
 interface ProxiesStore {
   proxies: Record<string, any>
+  proxyProviders: ProxyProvider[]
+  ruleProviders: RuleProvider[]
+  proxyProvidersLoaded: boolean
+  ruleProvidersLoaded: boolean
   testingAll: Record<string, boolean>
   testingSingle: Record<string, boolean>
   loading: boolean
@@ -461,6 +480,10 @@ interface ProxiesStore {
 
 export const useProxiesStore = create<ProxiesStore>(() => ({
   proxies: {},
+  proxyProviders: [],
+  ruleProviders: [],
+  proxyProvidersLoaded: false,
+  ruleProvidersLoaded: false,
   testingAll: {},
   testingSingle: {},
   loading: false,
@@ -513,7 +536,9 @@ export async function fetchClashProxies(port: string, secret?: string | null, si
   try {
     const [proxiesData, providersData] = await Promise.all([
       clashFetch<{ proxies?: Record<string, unknown> }>(port, 'proxies', { secret, unix }),
-      clashFetch<{ providers?: Record<string, { proxies?: unknown[] }> }>(port, 'providers/proxies', { secret, unix }).catch(() => ({ providers: undefined })),
+      clashFetch<{ providers?: Record<string, ProxyProvider> }>(port, 'providers/proxies', { secret, unix }).catch(() => ({
+        providers: undefined,
+      })),
     ])
 
     if (proxiesData.proxies) {
@@ -536,7 +561,16 @@ export async function fetchClashProxies(port: string, secret?: string | null, si
         }
       }
 
-      useProxiesStore.setState({ proxies, ...(!silent && { loading: false }) })
+      useProxiesStore.setState({
+        proxies,
+        ...(providersData.providers && {
+          proxyProviders: Object.values(providersData.providers).filter((provider) =>
+            ALLOWED_PROXY_VEHICLE_TYPES.has(normalizeVehicleType(provider.vehicleType))
+          ),
+          proxyProvidersLoaded: true,
+        }),
+        ...(!silent && { loading: false }),
+      })
       if (urlsToFetch.size > 0) preloadIcons(Array.from(urlsToFetch))
     } else if (!silent) {
       useProxiesStore.setState({ loading: false, error: true })
@@ -546,6 +580,11 @@ export async function fetchClashProxies(port: string, secret?: string | null, si
   }
 }
 
+export async function fetchClashRuleProviders(port: string, secret?: string | null, unix?: string | null): Promise<void> {
+  const data = await clashFetch<{ providers?: Record<string, RuleProvider> }>(port, 'providers/rules', { secret, unix }).catch(() => null)
+  if (data) useProxiesStore.setState({ ruleProviders: Object.values(data.providers ?? {}), ruleProvidersLoaded: true })
+}
+
 export function syncClashApiPort(delayMs = 0): void {
   const { configs, currentCore, dispatch } = useStore.getState()
   const yamlConfig = configs.find((c) => c.file.endsWith('/config.yaml') || c.file === 'config.yaml')
@@ -553,7 +592,10 @@ export function syncClashApiPort(delayMs = 0): void {
 
   dispatch({ type: 'SET_DASHBOARD_PORT', port, secret, unix } as any)
   if ((port || unix) && currentCore === 'mihomo' && useStore.getState().serviceStatus === 'running') {
-    const fetchFn = () => fetchClashProxies(port ?? '', secret, true, unix)
+    const fetchFn = () => {
+      fetchClashProxies(port ?? '', secret, true, unix)
+      fetchClashRuleProviders(port ?? '', secret, unix)
+    }
     if (delayMs > 0) setTimeout(fetchFn, delayMs)
     else fetchFn()
   }
@@ -564,7 +606,10 @@ export function syncClashApiPort(delayMs = 0): void {
 export interface DnsStatus {
   dnsOverride: boolean
   dnsMihomo: boolean
-  providerIgnored: boolean
+  hasProviderNameservers: boolean
+  providerIgnored?: boolean
+  hasSnapshot?: boolean
+  portListener?: string
 }
 
 interface DnsStatusStore {
@@ -585,6 +630,33 @@ export function setDnsStatus(status: DnsStatus | null): void {
 
 export function setDnsStatusLoading(loading: boolean): void {
   useDnsStatusStore.setState({ loading })
+}
+
+export async function fetchDnsStatus(options?: { noDelay?: boolean }): Promise<void> {
+  setDnsStatusLoading(true)
+  try {
+    const data = await apiCall<{ success: boolean; status?: DnsStatus }>('GET', options?.noDelay ? 'dns?noDelay=true' : 'dns')
+    if (data.success && data.status) {
+      setDnsStatus(data.status)
+      const s = data.status
+      const listener = (s.portListener ?? '').toLowerCase()
+      if (s.dnsOverride && s.dnsMihomo && !listener.includes('mihomo')) {
+        showToast(
+          {
+            title: 'Предупреждение',
+            body: 'Mihomo не является слушателем 53 порта, проверьте настройки DNS и перезапустите XKeen',
+            id: 'dns-port-listener-warning',
+            persistent: true,
+          },
+          'warning'
+        )
+      } else {
+        useStore.getState().dispatch({ type: 'REMOVE_TOAST', id: 'dns-port-listener-warning' })
+      }
+    }
+  } finally {
+    setDnsStatusLoading(false)
+  }
 }
 
 export function bumpDnsRefresh(): void {

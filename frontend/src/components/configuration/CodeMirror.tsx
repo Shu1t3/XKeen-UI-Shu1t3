@@ -1,21 +1,21 @@
 import { historyField, indentWithTab } from '@codemirror/commands'
 import { foldedRanges, foldEffect, syntaxHighlighting, unfoldEffect } from '@codemirror/language'
-import { setDiagnostics, type Diagnostic } from '@codemirror/lint'
+import { setDiagnostics } from '@codemirror/lint'
 import { selectSelectionMatches } from '@codemirror/search'
 import { Compartment, EditorSelection, EditorState, Prec, type Extension } from '@codemirror/state'
 import { EditorView, keymap, lineNumbers } from '@codemirror/view'
 import { indentationMarkers } from '@replit/codemirror-indentation-markers'
-import * as jsyaml from 'js-yaml'
-import { parse as parseJsonc, printParseErrorCode, type ParseError } from 'jsonc-parser'
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { getFileLanguage } from '../../lib/api'
 import { configAutocompletion } from './editor/completion'
 import { editorHighlight, editorTheme, getLanguageExtension } from './editor/highlighting'
 import { SearchPanel } from './editor/search/SearchPanel'
-import { createSearchExtension, type SearchBridge, type SearchPanelHandle } from './editor/search/searchExtension'
+import { createSearchExtension } from './editor/search/searchExtension'
 import { baseSetup } from './editor/setup'
+import { useEditorSearch } from './editor/useEditorSearch'
 import type { EditorLanguage } from './editor/types'
+import { clamp, validateByLanguage } from './editor/validation'
 
 interface SavedViewState {
   anchor: number
@@ -52,12 +52,6 @@ interface Props {
   onSave?: () => void
 }
 
-interface ValidationResult {
-  diagnostics: Diagnostic[]
-  isValid: boolean
-  error?: string
-}
-
 function normalizeLanguage(language: string): EditorLanguage {
   if (language === 'yaml') return 'yaml'
   if (language === 'json') return 'json'
@@ -67,74 +61,6 @@ function normalizeLanguage(language: string): EditorLanguage {
 function getLanguageFromFilename(filename: string, fallback: EditorLanguage): EditorLanguage {
   const fromFile = normalizeLanguage(getFileLanguage(filename))
   return fromFile === 'text' ? fallback : fromFile
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value))
-}
-
-function offsetToLine(content: string, offset: number) {
-  return content.slice(0, clamp(offset, 0, content.length)).split('\n').length
-}
-
-function lineColumnToOffset(content: string, line: number, column: number) {
-  const lines = content.split('\n')
-  let offset = 0
-  for (let i = 0; i < Math.max(0, line - 1) && i < lines.length; i++) offset += lines[i].length + 1
-  return clamp(offset + Math.max(0, column - 1), 0, content.length)
-}
-
-function validateJson(content: string): ValidationResult {
-  const errors: ParseError[] = []
-  parseJsonc(content, errors, {
-    disallowComments: false,
-  })
-  if (!errors.length) return { diagnostics: [], isValid: true }
-
-  const first = errors[0]
-  const from = clamp(first.offset, 0, content.length)
-  const parsedTo = clamp(first.offset + Math.max(first.length, 1), 0, content.length)
-  const to = parsedTo > from ? parsedTo : from
-  const message = `${printParseErrorCode(first.error)
-    .replace(/([A-Z])/g, ' $1')
-    .trim()} [строка ${offsetToLine(content, from)}]`
-    .replace(/([A-Z])/g, ' $1')
-    .trim()
-  return {
-    diagnostics: [{ from, to, severity: 'error', message }],
-    isValid: false,
-    error: message,
-  }
-}
-
-function validateYaml(content: string): ValidationResult {
-  try {
-    jsyaml.load(content)
-    return { diagnostics: [], isValid: true }
-  } catch (error) {
-    const yamlError = error as {
-      message: string
-      reason?: string
-      mark?: { line: number; column: number }
-    }
-    const line = yamlError.mark ? yamlError.mark.line + 1 : 1
-    const column = yamlError.mark ? yamlError.mark.column + 1 : 1
-    const from = lineColumnToOffset(content, line, column)
-    const lineEnd = content.indexOf('\n', from)
-    const to = lineEnd === -1 ? content.length : lineEnd
-    const message = yamlError.mark ? `${yamlError.reason || yamlError.message} [строка ${line}]` : yamlError.message
-    return {
-      diagnostics: [{ from, to, severity: 'error', message }],
-      isValid: false,
-      error: message,
-    }
-  }
-}
-
-function validateByLanguage(content: string, language: EditorLanguage): ValidationResult {
-  if (language === 'json') return validateJson(content)
-  if (language === 'yaml') return validateYaml(content)
-  return { diagnostics: [], isValid: true }
 }
 
 export const CodeMirrorEditor = forwardRef<CodeMirrorRef, Props>(({ onContentChange, onValidationChange, onReady, onSave }, ref) => {
@@ -157,12 +83,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorRef, Props>(({ onContentCha
   const suppressRef = useRef(false)
   const lastValidationRef = useRef<{ isValid: boolean; error?: string } | null>(null)
   const extensionsRef = useRef<Extension[]>([])
-  const [searchPanel, setSearchPanel] = useState<SearchPanelHandle | null>(null)
-  const searchBridgeRef = useRef<SearchBridge>({
-    open: (handle) => setSearchPanel(handle),
-    // A stale destroy (e.g. tab switch replacing the state) must not clear a newer panel.
-    close: (handle) => setSearchPanel((prev) => (prev === handle ? null : prev)),
-  })
+  const { searchPanel, bridge: searchBridge } = useEditorSearch(viewRef)
 
   useLayoutEffect(() => {
     onContentChangeRef.current = onContentChange
@@ -185,7 +106,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorRef, Props>(({ onContentCha
     (darkTheme: boolean): Extension[] => [
       ...baseSetup,
       configAutocompletion(() => ({ file: filenameRef.current, language: languageRef.current })),
-      createSearchExtension(searchBridgeRef.current),
+      createSearchExtension(searchBridge),
       Prec.highest(
         lineNumbers({
           formatNumber: (n) => String(n).padStart(3, '\u00a0'),
@@ -251,7 +172,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorRef, Props>(({ onContentCha
         runValidationRef.current(update.view, filenameRef.current)
       }),
     ],
-    []
+    [searchBridge]
   )
 
   const emitValidation = useCallback((isValid: boolean, error?: string) => {
