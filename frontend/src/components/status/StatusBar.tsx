@@ -60,12 +60,14 @@ async function persistDnsEnabled(enabled: boolean) {
 }
 
 export function StatusBar({
+  xkeenInstalled,
   onOpenCoreManage,
   onOpenSettings,
   onRefreshStatus,
   onOpenUpdate,
   onLogout,
 }: {
+  xkeenInstalled: boolean
   onOpenCoreManage: () => void
   onOpenSettings: () => void
   onRefreshStatus: () => void
@@ -327,7 +329,7 @@ export function StatusBar({
                               variant="outline"
                               size="icon-sm"
                               className="text-emerald-500 hover:border-emerald-500/50 hover:text-emerald-400"
-                              onClick={startService}
+                              onClick={xkeenInstalled ? startService : onOpenCoreManage}
                               disabled={isPending}
                             >
                               {isPending ? (
@@ -338,7 +340,7 @@ export function StatusBar({
                             </Button>
                           }
                         />
-                        <TooltipContent>Запустить</TooltipContent>
+                        <TooltipContent>{xkeenInstalled ? 'Запустить' : 'Установить XKeen'}</TooltipContent>
                       </Tooltip>
                     )}
                     {isRunning && (
@@ -406,7 +408,7 @@ export function StatusBar({
                     </Button>
                   }
                 />
-                <TooltipContent>Управление ядром</TooltipContent>
+                <TooltipContent>XKeen и ядра</TooltipContent>
               </Tooltip>
             )}
             {isConfigsLoading || !version ? (

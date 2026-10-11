@@ -11,7 +11,7 @@ use std::path::Path;
 use tokio::fs;
 use tokio::process::Command;
 
-static CONTROL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static CONTROL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Deserialize)]
 pub struct ControlReq {
@@ -307,6 +307,12 @@ async fn confirm_started(
 }
 
 pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
+    // Keep the panel usable while the installer owns the mutation lock.
+    if crate::xkeen_install::is_running() {
+        return Json(serde_json::json!({"success": true, "cores": [],
+            "currentCore": state.core.read().unwrap().name, "running": false,
+            "xkeenInstalled": false}));
+    }
     let _control_guard = CONTROL_LOCK.lock().await;
 
     // Single-pass check of both cores in /proc avoids repeated scanning on weak MIPS CPUs.
@@ -361,7 +367,7 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
     let running_status = (xray_exists && xray_running) || (mihomo_exists && mihomo_running);
 
     Json(
-        serde_json::json!({ "success": true, "cores": available_cores, "currentCore": current_core.name, "running": running_status }),
+        serde_json::json!({ "success": true, "cores": available_cores, "currentCore": current_core.name, "running": running_status, "xkeenInstalled": crate::xkeen_install::is_installed() }),
     )
 }
 
@@ -408,6 +414,9 @@ async fn switch_core(state: &AppState, init_file: &str, old: &str, new: &str) ->
 }
 
 pub async fn post_control(State(state): State<AppState>, Json(req): Json<ControlReq>) -> impl IntoResponse {
+    if crate::xkeen_install::is_running() {
+        return Json(ApiResponse { success: false, error: Some("Дождитесь завершения установки XKeen".into()), data: None });
+    }
     // The detached task owns the guard and recovery even if the HTTP waiter disconnects.
     let result = crate::update_transaction::run_to_completion(async move {
         let _control_guard = CONTROL_LOCK.lock().await;

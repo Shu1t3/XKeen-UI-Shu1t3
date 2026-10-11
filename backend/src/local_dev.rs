@@ -24,6 +24,7 @@ pub fn prepare() -> std::io::Result<()> {
 fn requires_router(path: &str, method: &Method) -> bool {
     matches!(path, "/api/update" | "/api/system" | "/api/device-list")
         || (path == "/api/control" && method != Method::GET)
+        || (path == "/api/xkeen/install" && method != Method::GET)
 }
 
 pub async fn router_operations(req: Request, next: Next) -> Response {
@@ -45,6 +46,8 @@ mod tests {
     fn router_operations_leave_local_editing_available() {
         assert!(requires_router("/api/control", &Method::POST));
         assert!(requires_router("/api/update", &Method::POST));
+        assert!(requires_router("/api/xkeen/install", &Method::POST));
+        assert!(!requires_router("/api/xkeen/install", &Method::GET));
         assert!(requires_router("/api/system", &Method::GET));
         assert!(requires_router("/api/device-list", &Method::GET));
         assert!(!requires_router("/api/control", &Method::GET));

@@ -14,6 +14,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Separator } from '@/components/ui/separator'
 import { IconAlertCircle, IconCpu } from '@tabler/icons-react'
 import { useState } from 'react'
+import { XKeenInstall } from './XKeenInstall'
 import { useAppContext, useDnsStatusStore, useModalContext } from '../../lib/store'
 
 interface Props {
@@ -53,11 +54,12 @@ export function CoreManageModal({ onSwitchCore, onOpenUpdate }: Props) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 pb-3">
-              <IconCpu size={24} className="text-chart-2" /> Управление ядром
+              <IconCpu size={24} className="text-chart-2" /> XKeen и ядра
             </DialogTitle>
           </DialogHeader>
 
-          <div className="space-y-4">
+          <div className="max-h-[75vh] space-y-4 overflow-y-auto">
+            <XKeenInstall active={modals.showCoreManageModal} />
             {CORES.map((core, i) => {
               const isActive = currentCore === core.id
               const isInstalled = availableCores.includes(core.id)

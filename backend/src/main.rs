@@ -28,6 +28,7 @@ mod update_transaction;
 mod updater;
 mod version;
 mod websocket;
+mod xkeen_install;
 use crate::logger::{log, ts};
 use crate::types::*;
 use axum::http::StatusCode;
@@ -529,6 +530,7 @@ async fn main() {
         )
         .route("/api/device-list", get(api_relay::get_device_list))
         .route("/api/update", post(updater::post_update))
+        .route("/api/xkeen/install", get(xkeen_install::get_status).post(xkeen_install::post_install))
         .route("/api/geo", get(geo::get_geo))
         .route("/api/geo/install", post(geo_install::post_install))
         .route("/api/geo/site", get(geo::get_geosite))

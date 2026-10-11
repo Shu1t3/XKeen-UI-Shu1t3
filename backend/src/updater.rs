@@ -214,6 +214,13 @@ async fn download_verified(repo: &str, tag: &str, name: &str, proxies: &[String]
     download_with_trusted_asset(trusted, proxies, path).await
 }
 
+pub(crate) async fn download_xkeen(proxies: &[String], path: &Path) -> Result<(), String> {
+    match download_verified("jameszeroX/XKeen", "latest", "xkeen.tar.gz", proxies, path).await? {
+        DownloadResult::Ram(bytes) => fs::write(path, bytes).await.map_err(|e| e.to_string()),
+        DownloadResult::Disk(_) => Ok(()),
+    }
+}
+
 async fn download_with_trusted_asset(trusted: crate::release_integrity::TrustedAsset, proxies: &[String], path: &Path) -> Result<DownloadResult, String> {
     let result = download(&trusted.url, proxies, path).await?;
     match &result {

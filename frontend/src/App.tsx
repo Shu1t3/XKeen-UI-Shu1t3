@@ -113,6 +113,7 @@ const ModalManager = memo(function ModalManager({
 
 function AppContent({ onLogout }: { onLogout: () => void }) {
   const { dispatch, showToast } = useAppActions()
+  const [xkeenInstalled, setXkeenInstalled] = useState(true)
   const multiRouter = useSettings((s) => s.multiRouter)
   const editorRef = useRef<CodeMirrorRef | null>(null)
   const configActionsRef = useRef<{ switchTab: (index: number) => void; getActiveIndex: () => number }>({
@@ -123,6 +124,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
   const checkStatus = useCallback(async () => {
     const data = await apiCall<any>('GET', 'control')
     if (!data.success) return null
+    setXkeenInstalled(data.xkeenInstalled !== false)
     const currentCore = data.currentCore || 'xray'
     dispatch({
       type: 'SET_CORE_INFO',
@@ -546,6 +548,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
       <main className="flex flex-1 flex-col">
         <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col gap-3 px-3 py-3">
           <StatusBar
+            xkeenInstalled={xkeenInstalled}
             onOpenCoreManage={() => openModal('showCoreManageModal')}
             onOpenSettings={() => openModal('showSettingsModal')}
             onRefreshStatus={() => void checkStatus()}
