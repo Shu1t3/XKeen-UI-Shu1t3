@@ -23,11 +23,13 @@ import {
   IconRefresh,
   IconSettings,
   IconAlertCircle,
+  IconShieldCheck,
+  IconShieldX,
 } from '@tabler/icons-react'
 import { useEffect, useRef, useState } from 'react'
 import { apiCall, capitalize, clashFetch } from '../../lib/api'
 import { ensureDnsEnabled, setDnsEnabled, DEFAULT_DNS_CONFIG } from '../configuration/mihomo/DnsPanel'
-import { syncClashApiPort, getAppState, useAppContext, bumpDnsRefresh, fetchDnsStatus, useDnsStatusStore } from '../../lib/store'
+import { syncClashApiPort, getAppState, useAppContext, bumpDnsRefresh, fetchDnsStatus, useDnsStatusStore, resetKillswitch } from '../../lib/store'
 import { cn } from '../../lib/utils'
 
 type SystemStats = { memoryUsed: number; memoryTotal: number; cpuUsage: number }
@@ -75,7 +77,7 @@ export function StatusBar({
   onLogout: () => void
 }) {
   const { state, dispatch, showToast } = useAppContext({ includeSettings: true })
-  const { serviceStatus, pendingText, currentCore, coreVersions, isConfigsLoading, version, isOutdatedUI, isOutdatedCore, settings } = state
+  const { serviceStatus, pendingText, currentCore, coreVersions, isConfigsLoading, version, isOutdatedUI, isOutdatedCore, settings, killswitchEngaged, killswitchReason } = state
   const authEnabled = settings.authEnabled
 
   const isRunning = serviceStatus === 'running'
@@ -255,6 +257,16 @@ export function StatusBar({
     onRefreshStatus()
   }
 
+  async function handleEmergencyReset() {
+    const ok = await resetKillswitch()
+    if (ok) {
+      showToast('Блокировка Kill Switch снята', 'success')
+      onRefreshStatus()
+    } else {
+      showToast('Ошибка сброса Kill Switch', 'error')
+    }
+  }
+
   const statusText =
     serviceStatus === 'running' ? 'Сервис запущен' : serviceStatus === 'stopped' ? 'Сервис остановлен' : pendingText || 'Загрузка...'
 
@@ -363,6 +375,45 @@ export function StatusBar({
                           }
                         />
                         <TooltipContent>Остановить</TooltipContent>
+                      </Tooltip>
+                    )}
+                    {settings.killswitchEnabled && (
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={
+                            <Button
+                              variant="outline"
+                              size="icon-sm"
+                              className={cn(
+                                'transition-colors',
+                                killswitchEngaged
+                                  ? 'relative border-red-500/50 bg-red-500/10 text-red-500 hover:bg-red-500/20 hover:text-red-400'
+                                  : 'border-emerald-500/30 text-emerald-500/80 hover:border-emerald-500/50 hover:text-emerald-400'
+                              )}
+                              onClick={killswitchEngaged ? handleEmergencyReset : onOpenSettings}
+                              disabled={isPending}
+                            >
+                              {killswitchEngaged ? (
+                                <>
+                                  <span className="absolute -top-0.5 -right-0.5 flex size-2">
+                                    <span className="absolute inline-flex size-full animate-ping rounded-full bg-red-400 opacity-75" />
+                                    <span className="relative inline-flex size-2 rounded-full bg-red-500" />
+                                  </span>
+                                  <IconShieldX className="size-4" />
+                                </>
+                              ) : (
+                                <IconShieldCheck className="size-4" />
+                              )}
+                            </Button>
+                          }
+                        />
+                        <TooltipContent>
+                          {killswitchEngaged
+                            ? killswitchReason
+                              ? `Kill Switch активен (${killswitchReason}): трафик заблокирован. Нажмите для сброса`
+                              : 'Kill Switch активен: трафик заблокирован. Нажмите для сброса'
+                            : 'Kill Switch: защита от утечек активна'}
+                        </TooltipContent>
                       </Tooltip>
                     )}
                   </>

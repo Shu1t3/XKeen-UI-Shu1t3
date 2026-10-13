@@ -40,6 +40,15 @@ export interface AppSettings {
   timezone: number
   authEnabled: boolean
   multiRouter: boolean
+  killswitchEnabled: boolean
+  killswitchMode: string
+}
+
+export interface KillswitchStatus {
+  enabled: boolean
+  engaged: boolean
+  mode: string
+  trigger_reason?: string | null
 }
 
 export interface ProxySubscriptionInfo {
@@ -154,6 +163,8 @@ export interface AppState {
   updateModalCore: string
   toasts: ToastMessage[]
   pendingSaveAction: (() => void) | null
+  killswitchEngaged: boolean
+  killswitchReason: string | null
 }
 
 export type AppAction =
@@ -195,3 +206,4 @@ export type AppAction =
   | { type: 'ADD_TOAST'; toast: ToastMessage }
   | { type: 'REMOVE_TOAST'; id: string }
   | { type: 'SET_PENDING_SAVE_ACTION'; action: (() => void) | null }
+  | { type: 'SET_KILLSWITCH_STATUS'; engaged: boolean; reason?: string | null }

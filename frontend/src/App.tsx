@@ -24,6 +24,7 @@ import { listMihomoTakenNames, replaceMihomoProvider, replaceMihomoProxy } from 
 import {
   fetchClashProxies,
   fetchClashRuleProviders,
+  fetchKillswitchStatus,
   getAppState,
   syncClashApiPort,
   useAppActions,
@@ -133,6 +134,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
       availableCores: data.cores || [],
     })
     dispatch({ type: 'SET_SERVICE_STATUS', status: data.running ? 'running' : 'stopped' })
+    void fetchKillswitchStatus()
     return currentCore
   }, [dispatch])
 
@@ -260,6 +262,8 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
             timezone: data.log.timezone,
             authEnabled: !!data.auth?.enabled,
             multiRouter: data.plugins?.multi_router ?? false,
+            killswitchEnabled: data.killswitch?.enabled ?? false,
+            killswitchMode: data.killswitch?.mode ?? 'blackhole',
           },
         })
         if (Array.isArray(data.plugins?.routers)) {
@@ -274,6 +278,7 @@ function AppContent({ onLogout }: { onLogout: () => void }) {
         const currentCore = await checkStatus()
         if (currentCore) loadConfigs(currentCore)
         checkVersion(true)
+        void fetchKillswitchStatus()
       } catch {
         showToast('Ошибка инициализации', 'error')
       }

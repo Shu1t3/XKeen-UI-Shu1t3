@@ -43,6 +43,8 @@ const initialSettings: AppSettings = {
   timezone: 0,
   authEnabled: false,
   multiRouter: false,
+  killswitchEnabled: false,
+  killswitchMode: 'blackhole',
 }
 
 const initialState: AppState = {
@@ -76,6 +78,8 @@ const initialState: AppState = {
   updateModalCore: '',
   toasts: [],
   pendingSaveAction: null,
+  killswitchEngaged: false,
+  killswitchReason: null,
 }
 
 interface StoreState extends AppState {
@@ -196,6 +200,8 @@ const useStore = create<StoreState>((set) => ({
           return { toasts: state.toasts.filter((t) => t.id !== action.id) }
         case 'SET_PENDING_SAVE_ACTION':
           return { pendingSaveAction: action.action }
+        case 'SET_KILLSWITCH_STATUS':
+          return { killswitchEngaged: action.engaged, killswitchReason: action.reason ?? null }
         default:
           return {}
       }
@@ -265,6 +271,8 @@ const selectCoreState = (s: StoreState): CoreState => ({
   clashApiPort: s.clashApiPort,
   clashApiSecret: s.clashApiSecret,
   clashApiUnix: s.clashApiUnix,
+  killswitchEngaged: s.killswitchEngaged,
+  killswitchReason: s.killswitchReason,
 })
 
 const selectCoreStateWithSettings = (s: StoreState): CoreStateWithSettings => ({ ...selectCoreState(s), settings: s.settings })
@@ -667,3 +675,50 @@ export function bumpDnsRefresh(): void {
 
 export const useNowStore = create<{ tick: number }>(() => ({ tick: 0 }))
 setInterval(() => useNowStore.setState((s) => ({ tick: s.tick + 1 })), 1000)
+
+// ─── Killswitch helpers ──────────────────────────────────────────────────────
+
+export async function fetchKillswitchStatus(): Promise<void> {
+  try {
+    const data = await apiCall<{
+      success: boolean
+      enabled: boolean
+      engaged: boolean
+      mode: string
+      trigger_reason?: string
+    }>('GET', 'killswitch')
+    if (data.success) {
+      useStore.getState().dispatch({
+        type: 'SET_KILLSWITCH_STATUS',
+        engaged: !!data.engaged,
+        reason: data.trigger_reason ?? null,
+      })
+      useStore.getState().dispatch({
+        type: 'SET_SETTINGS',
+        settings: {
+          killswitchEnabled: !!data.enabled,
+          killswitchMode: data.mode ?? 'blackhole',
+        },
+      })
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+export async function resetKillswitch(): Promise<boolean> {
+  try {
+    const data = await apiCall<{ success: boolean; error?: string }>('POST', 'killswitch/reset')
+    if (data.success) {
+      useStore.getState().dispatch({
+        type: 'SET_KILLSWITCH_STATUS',
+        engaged: false,
+        reason: null,
+      })
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}

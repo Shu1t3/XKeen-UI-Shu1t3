@@ -9,10 +9,10 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { IconAlertCircle, IconChevronDown, IconChevronUp, IconSettings, IconX, IconArrowBackUp } from '@tabler/icons-react'
+import { IconAlertCircle, IconChevronDown, IconChevronUp, IconSettings, IconX, IconArrowBackUp, IconShieldLock } from '@tabler/icons-react'
 import { Fragment, memo, useCallback, useState } from 'react'
 import { apiCall } from '../../lib/api'
-import { useAppContext, useModalContext } from '../../lib/store'
+import { useAppContext, useModalContext, fetchKillswitchStatus } from '../../lib/store'
 import type { AppSettings, AutoDnsMode, ProxySortOrder, ThemeMode } from '../../lib/types'
 
 type BooleanSettingKey = {
@@ -575,7 +575,7 @@ export function SettingsModal() {
       const [section, key] = path.split('.')
       try {
         const body: Record<string, unknown> = {}
-        if (['gui', 'updater', 'log', 'auth', 'clash_api', 'plugins'].includes(section)) body[section] = key ? { [key]: value } : value
+        if (['gui', 'updater', 'log', 'auth', 'clash_api', 'plugins', 'killswitch'].includes(section)) body[section] = key ? { [key]: value } : value
         const result = await apiCall<any>('PATCH', 'settings', body)
         if (!result.success) {
           showToast('Ошибка: ' + result.error, 'error')
@@ -611,6 +611,24 @@ export function SettingsModal() {
       if (ok) dispatch({ type: 'SET_SETTINGS', settings: { authEnabled: value } })
     },
     [dispatch, saveSetting]
+  )
+
+  const toggleKillswitch = useCallback(
+    async (value: boolean) => {
+      try {
+        const result = await apiCall<{ success: boolean; error?: string }>('POST', 'killswitch', { enabled: value })
+        if (result.success) {
+          dispatch({ type: 'SET_SETTINGS', settings: { killswitchEnabled: value } })
+          void fetchKillswitchStatus()
+          showToast(value ? 'Kill Switch включен' : 'Kill Switch отключен', 'success')
+        } else {
+          showToast('Ошибка: ' + (result.error ?? 'не удалось изменить настройку'), 'error')
+        }
+      } catch (e: any) {
+        showToast(e.message, 'error')
+      }
+    },
+    [dispatch, showToast]
   )
 
   const addProxy = useCallback(
@@ -787,6 +805,23 @@ export function SettingsModal() {
                         </SelectGroup>
                       </SelectContent>
                     </Select>
+                  </Field>
+                  <Separator className="my-2" />
+                  <p className="text-muted-foreground pt-3 pb-1 text-xs font-medium tracking-wider uppercase">Сетевая безопасность</p>
+                  <Field orientation="horizontal" className="px-0 py-3">
+                    <FieldContent>
+                      <FieldLabel className="flex items-center gap-1.5">
+                        <IconShieldLock size={16} className="text-chart-2" /> Аварийная блокировка (Kill Switch)
+                      </FieldLabel>
+                      <FieldDescription className="text-[13px]">
+                        Блокирует выход в интернет через WAN при падении или остановке прокси. Доступ к роутеру (192.168.1.1, веб-интерфейс, SSH) гарантированно сохраняется.
+                      </FieldDescription>
+                    </FieldContent>
+                    <Switch
+                      checked={settings.killswitchEnabled}
+                      onCheckedChange={toggleKillswitch}
+                      aria-label="Аварийная блокировка (Kill Switch)"
+                    />
                   </Field>
                 </FieldGroup>
               </TabsContent>

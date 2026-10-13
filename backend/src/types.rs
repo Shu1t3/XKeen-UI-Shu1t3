@@ -270,6 +270,22 @@ pub struct DnsSettings {
     pub corporate_fallback: Vec<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct KillswitchSettings {
+    pub enabled: bool,
+    pub mode: String,
+}
+
+impl Default for KillswitchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "blackhole".into(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Default)]
 pub struct AppSettings {
     pub gui: GuiSettings,
@@ -281,6 +297,8 @@ pub struct AppSettings {
     pub plugins: PluginsSettings,
     #[serde(default)]
     pub dns: DnsSettings,
+    #[serde(default)]
+    pub killswitch: KillswitchSettings,
 }
 
 impl<'de> Deserialize<'de> for AppSettings {
@@ -306,6 +324,8 @@ impl<'de> Deserialize<'de> for AppSettings {
             plugins: PluginsSettings,
             #[serde(default)]
             dns: DnsSettings,
+            #[serde(default)]
+            killswitch: KillswitchSettings,
             #[serde(rename = "timezoneOffset")]
             legacy_tz: Option<i32>,
         }
@@ -322,6 +342,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             auth: raw.auth,
             plugins: raw.plugins,
             dns: raw.dns,
+            killswitch: raw.killswitch,
         })
     }
 }

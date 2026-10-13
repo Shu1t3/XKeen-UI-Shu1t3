@@ -15,6 +15,7 @@ mod dns;
 mod frontend_embedder;
 mod geo;
 mod geo_install;
+mod killswitch;
 mod local_dev;
 mod logger;
 mod release_source;
@@ -469,6 +470,11 @@ async fn main() {
         version::start_update_checker(state.clone());
     }
 
+    let initial_ks = state.settings.read().unwrap().killswitch.clone();
+    let initial_core = state.core.read().unwrap().name.clone();
+    let is_running = !controller::get_pid(&initial_core).is_empty();
+    killswitch::sync_settings(&initial_ks, is_running).await;
+
     if let Some(ref _token) = *state.rci_token.read().unwrap() {
         log("INFO", "RCI токен успешно загружен".into());
     } else if !cfg!(feature = "local-dev") {
@@ -540,6 +546,11 @@ async fn main() {
             "/api/dns",
             get(dns::get_dns).post(dns::post_dns).delete(dns::delete_dns),
         )
+        .route(
+            "/api/killswitch",
+            get(killswitch::get_killswitch_status).post(killswitch::post_killswitch),
+        )
+        .route("/api/killswitch/reset", post(killswitch::reset_killswitch))
         .route("/api/auth/logout", post(auth::post_logout))
         .route("/api/auth/reset", post(auth::post_auth_reset))
         .route("/clash/{*path}", any(api_relay::proxy_http))

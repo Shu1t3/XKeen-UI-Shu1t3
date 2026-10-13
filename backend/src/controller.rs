@@ -438,6 +438,10 @@ pub async fn get_control(State(state): State<AppState>) -> impl IntoResponse {
     }
     let running_status = (xray_exists && xray_running) || (mihomo_exists && mihomo_running);
 
+    if !running_status && crate::killswitch::is_killswitch_enabled() && !crate::killswitch::is_killswitch_engaged() {
+        _ = crate::killswitch::engage("Служба прокси не запущена").await;
+    }
+
     Json(
         serde_json::json!({ "success": true, "cores": available_cores, "currentCore": current_core.name, "running": running_status, "xkeenInstalled": crate::xkeen_install::is_installed() }),
     )
@@ -556,6 +560,9 @@ async fn post_control_inner(state: AppState, req: ControlReq) -> Json<ApiRespons
                     data: None,
                 });
             }
+            if crate::killswitch::is_killswitch_engaged() {
+                _ = crate::killswitch::disengage().await;
+            }
         }
         a if ["start", "stop", "hardRestart"].contains(&a) => {
             let arg = match a {
@@ -594,6 +601,14 @@ async fn post_control_inner(state: AppState, req: ControlReq) -> Json<ApiRespons
                     error: Some(e),
                     data: None,
                 });
+            }
+
+            if a == "start" || a == "hardRestart" {
+                if crate::killswitch::is_killswitch_engaged() {
+                    _ = crate::killswitch::disengage().await;
+                }
+            } else if a == "stop" && crate::killswitch::is_killswitch_enabled() {
+                _ = crate::killswitch::engage("Остановка службы по запросу пользователя").await;
             }
         }
         _ => {

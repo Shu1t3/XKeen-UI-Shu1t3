@@ -77,7 +77,7 @@ pub fn parse_settings(content: &str, path: &str) -> AppSettings {
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let s = state.settings.read().unwrap();
     Json(
-        serde_json::json!({ "success": true, "gui": s.gui, "updater": s.updater, "log": s.log, "clash_api": s.clash_api, "auth": { "enabled": s.auth.enabled }, "plugins": s.plugins, "dns": s.dns }),
+        serde_json::json!({ "success": true, "gui": s.gui, "updater": s.updater, "log": s.log, "clash_api": s.clash_api, "auth": { "enabled": s.auth.enabled }, "plugins": s.plugins, "dns": s.dns, "killswitch": s.killswitch }),
     )
 }
 
@@ -157,6 +157,9 @@ pub async fn patch_settings_at(
             return Json(serde_json::json!({"success": false, "error": format!("Некорректный IP-адрес DNS-сервера: '{ip}'")}));
         }
     }
+    if settings.killswitch.mode != "firewall" {
+        settings.killswitch.mode = "blackhole".into();
+    }
     settings.normalize_proxies();
 
     if let Ok(updater_val) = serde_json::to_value(&settings.updater) {
@@ -167,6 +170,9 @@ pub async fn patch_settings_at(
     }
     if let Ok(dns_val) = serde_json::to_value(&settings.dns) {
         file_json["dns"] = dns_val;
+    }
+    if let Ok(killswitch_val) = serde_json::to_value(&settings.killswitch) {
+        file_json["killswitch"] = killswitch_val;
     }
 
     if let Err(e) = tokio::fs::create_dir_all(conf_dir).await {
@@ -188,8 +194,14 @@ pub async fn patch_settings_at(
     }
 
     // Disk commit confirmed: publish to in-memory state and notify subscribers
-    *state.settings.write().unwrap() = settings;
+    *state.settings.write().unwrap() = settings.clone();
     state.auth_changes.send_modify(|version| *version = version.wrapping_add(1));
+
+    let core_name = state.core.read().unwrap().name.clone();
+    let is_running = tokio::task::spawn_blocking(move || !crate::controller::get_pid(&core_name).is_empty())
+        .await
+        .unwrap_or(false);
+    crate::killswitch::sync_settings(&settings.killswitch, is_running).await;
 
     Json(serde_json::json!({"success": true}))
 }
